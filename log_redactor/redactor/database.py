@@ -34,6 +34,7 @@ CREATE TABLE IF NOT EXISTS jobs (
     stats_json TEXT NOT NULL,
     output_filename TEXT NOT NULL,
     output_format TEXT NOT NULL,
+    top_level_is_array INTEGER NOT NULL DEFAULT 1,
     key_fingerprint TEXT NOT NULL
 );
 CREATE TABLE IF NOT EXISTS audit (
@@ -84,6 +85,11 @@ class Database:
     def _init(self) -> None:
         with self._conn() as conn:
             conn.executescript(_SCHEMA)
+            cols = {r["name"] for r in conn.execute("PRAGMA table_info(jobs)")}
+            if "top_level_is_array" not in cols:
+                conn.execute(
+                    "ALTER TABLE jobs ADD COLUMN top_level_is_array INTEGER NOT NULL DEFAULT 1"
+                )
 
     # ---------- 写入 ----------
 
@@ -99,6 +105,7 @@ class Database:
         needs_review: bool,
         output_filename: str,
         output_format: str,
+        top_level_is_array: bool,
         key_fingerprint: str,
         audit: list[AuditEntry],
         risks: list[RiskFinding],
@@ -108,8 +115,9 @@ class Database:
             conn.execute(
                 """INSERT INTO jobs (id, idempotency_key, created_at, format,
                    strategy_name, strategy_version, record_count, needs_review,
-                   stats_json, output_filename, output_format, key_fingerprint)
-                   VALUES (?,?,?,?,?,?,?,?,?,?,?,?)""",
+                   stats_json, output_filename, output_format,
+                   top_level_is_array, key_fingerprint)
+                   VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)""",
                 (
                     job_id,
                     idempotency_key,
@@ -122,6 +130,7 @@ class Database:
                     result_stats.model_dump_json(),
                     output_filename,
                     output_format,
+                    int(top_level_is_array),
                     key_fingerprint,
                 ),
             )
@@ -213,6 +222,8 @@ class Database:
             needs_review=bool(row["needs_review"]),
             stats=RunStats(**json.loads(row["stats_json"])),
             output_filename=row["output_filename"],
+            top_level_is_array=bool(row.keys().count("top_level_is_array")
+                                    and row["top_level_is_array"]),
             key_fingerprint=row["key_fingerprint"],
         )
 

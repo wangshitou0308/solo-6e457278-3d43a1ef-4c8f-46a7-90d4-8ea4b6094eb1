@@ -83,9 +83,6 @@ class Rule(BaseModel):
     mask_char: str = Field(default="*", description="mask 动作的替换字符")
     keep_prefix: int = Field(default=0, ge=0, description="mask 时保留的前缀长度")
     keep_suffix: int = Field(default=0, ge=0, description="mask 时保留的后缀长度")
-    token_namespace: str | None = Field(
-        default=None, description="tokenize 的命名空间，默认取规则 id"
-    )
 
     @field_validator("id")
     @classmethod
@@ -226,6 +223,7 @@ class JobModel(BaseModel):
     needs_review: bool
     stats: RunStats
     output_filename: str
+    top_level_is_array: bool
     key_fingerprint: str
 
 

@@ -155,7 +155,33 @@ def test_download_json_format_for_json_job(client):
     job_id = r.json()["job"]["id"]
     dl = client.get(f"/api/v1/jobs/{job_id}/download")
     assert "application/json" in dl.headers["content-type"]
-    assert json.loads(dl.text)  # 合法 JSON
+    assert isinstance(json.loads(dl.text), dict)  # 顶层对象仍为对象
+
+
+def test_single_element_json_array_preserved_on_download(client):
+    # 回归：单元素顶层 JSON 数组下载时必须仍是数组，不能解包成对象
+    single = json.dumps([{"user": {"email": "a@b.com"}, "phone": "13800001234"}])
+    payload = _payload(fmt="json", content=single)
+    r = _create_job(client, key="single-array", payload=payload)
+    job_id = r.json()["job"]["id"]
+    assert r.json()["job"]["top_level_is_array"] is True
+
+    dl = client.get(f"/api/v1/jobs/{job_id}/download")
+    parsed = json.loads(dl.text)
+    assert isinstance(parsed, list) and len(parsed) == 1
+    assert "@" not in parsed[0]["user"]["email"]
+
+    recs = client.get(f"/api/v1/jobs/{job_id}/records").json()
+    assert recs["top_level_is_array"] is True
+    assert len(recs["records"]) == 1
+
+
+def test_ndjson_job_top_level_flag(client):
+    r = _create_job(client, key="ndjson-flag")
+    job_id = r.json()["job"]["id"]
+    assert r.json()["job"]["top_level_is_array"] is True
+    recs = client.get(f"/api/v1/jobs/{job_id}/records").json()
+    assert recs["top_level_is_array"] is True
 
 
 def test_idempotency_key_replays_same_job(client):

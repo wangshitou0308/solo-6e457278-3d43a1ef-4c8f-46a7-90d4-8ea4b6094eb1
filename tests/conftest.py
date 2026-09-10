@@ -1,12 +1,14 @@
-"""共享 fixtures：临时数据目录、隔离密钥与数据库。"""
-import os
+"""共享 fixtures：临时数据目录、隔离密钥与数据库。
+
+不使用 importlib.reload，避免重加载后类身份分裂；直接重建 settings 并替换
+app 模块级单例（db / master_key）。
+"""
 import sys
-import tempfile
 from pathlib import Path
 
 import pytest
 
-ROOT = Path(__file__).resolve().parents[1]
+ROOT = Path(__file__).resolve().parents[1] / "log_redactor"
 sys.path.insert(0, str(ROOT))
 
 
@@ -15,27 +17,22 @@ def isolated_data(tmp_path, monkeypatch):
     monkeypatch.setenv("REDACTOR_DATA_DIR", str(tmp_path / "data"))
     monkeypatch.delenv("REDACTOR_MASTER_KEY", raising=False)
 
-    # 重新加载 settings 与 app 级单例
-    import importlib
+    from redactor import config, database, crypto, app as app_mod
 
-    from redactor import config
-    importlib.reload(config)
-
-    from redactor import crypto, database, app as app_mod
-    importlib.reload(crypto)
-    importlib.reload(database)
-    importlib.reload(app_mod)
+    config.reset_settings_cache()
+    new_settings = config.get_settings()
+    # 用惰性单例的同一缓存对象，保证 app/config 各处引用一致
+    monkeypatch.setattr(config, "settings", config._LazySettings())
+    new_db = database.Database(new_settings.db_path)
+    new_key = crypto.MasterKey.load()
+    monkeypatch.setattr(app_mod, "db", new_db)
+    monkeypatch.setattr(app_mod, "master_key", new_key)
+    # app 的 getter 已被注入实例，直接返回
+    monkeypatch.setattr(app_mod, "get_db", lambda: new_db)
+    monkeypatch.setattr(app_mod, "get_master_key", lambda: new_key)
 
     yield {
-        "data_dir": config.settings.data_dir,
+        "data_dir": new_settings.data_dir,
         "app": app_mod.app,
-        "settings": config.settings,
+        "settings": new_settings,
     }
-
-
-@pytest.fixture()
-def fixed_key(monkeypatch):
-    """固定测试密钥，保证令牌可预测。"""
-    monkeypatch.setenv("REDACTOR_MASTER_KEY", "unit-test-master-key-0123456789")
-    from redactor.crypto import MasterKey
-    return MasterKey.load()

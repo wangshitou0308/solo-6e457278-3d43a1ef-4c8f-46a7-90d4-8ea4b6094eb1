@@ -26,7 +26,7 @@ from fastapi import FastAPI, Header, HTTPException, Query, Request
 from fastapi.responses import JSONResponse, Response
 from fastapi.openapi.utils import get_openapi
 
-from .config import settings
+from . import config
 from .crypto import MasterKey, key_fingerprint
 from .database import Database
 from .engine import run_strategy
@@ -40,7 +40,7 @@ from .models import (
     RunResult,
     Strategy,
 )
-from .parsing import PayloadError, parse_batch
+from .parsing import ParsedBatch, PayloadError, parse_batch
 from .samples import sample_ndjson, sample_strategy_dict
 
 MAX_BODY_BYTES = 10 * 1024 * 1024  # 10 MiB，本地工具足够，同时防止误提交巨型文件
@@ -56,13 +56,28 @@ app = FastAPI(
     contact={"name": "platform-security"},
 )
 
-db = Database()
-master_key = MasterKey.load()
+# 惰性初始化：导入模块时不在文件系统生成任何数据；测试也可直接替换这两个全局
+db: Database | None = None
+master_key: MasterKey | None = None
 
 
-def _execute(payload: BatchPayload, *, is_ndjson: bool | None = None) -> tuple[list[Any], RunResult]:
+def get_db() -> Database:
+    global db
+    if db is None:
+        db = Database()
+    return db
+
+
+def get_master_key() -> MasterKey:
+    global master_key
+    if master_key is None:
+        master_key = MasterKey.load()
+    return master_key
+
+
+def _execute(payload: BatchPayload) -> tuple[ParsedBatch, RunResult]:
     try:
-        records = parse_batch(payload.content, payload.format)
+        parsed = parse_batch(payload.content, payload.format)
     except PayloadError as exc:
         detail = {"message": str(exc)}
         if exc.line is not None:
@@ -70,11 +85,11 @@ def _execute(payload: BatchPayload, *, is_ndjson: bool | None = None) -> tuple[l
         raise HTTPException(status_code=422, detail=detail) from exc
     result = run_strategy(
         payload.strategy,
-        records,
-        master_key,
-        is_ndjson=(payload.format == "ndjson" if is_ndjson is None else is_ndjson),
+        parsed.records,
+        get_master_key(),
+        is_ndjson=(payload.format == "ndjson"),
     )
-    return records, result
+    return parsed, result
 
 
 def _run_response(result: RunResult) -> dict[str, Any]:
@@ -100,7 +115,7 @@ async def _limit_body(request: Request, call_next):
 
 @app.get("/healthz", tags=["meta"], summary="健康检查")
 def healthz() -> dict[str, str]:
-    return {"status": "ok", "key_fingerprint": key_fingerprint(master_key)}
+    return {"status": "ok", "key_fingerprint": key_fingerprint(get_master_key())}
 
 
 @app.get("/api/v1/sample/strategy", tags=["samples"], summary="示例脱敏策略")
@@ -141,17 +156,18 @@ def check_strategy(strategy: Strategy) -> dict[str, Any]:
 
 def _output_path(job_id: str, fmt: str) -> Path:
     suffix = "ndjson" if fmt == "ndjson" else "json"
-    return settings.data_dir / "jobs" / f"{job_id}.{suffix}"
+    return config.settings.data_dir / "jobs" / f"{job_id}.{suffix}"
 
 
-def _write_output(path: Path, records: list[Any], fmt: str) -> None:
+def _write_output(path: Path, records: list[Any], fmt: str, *, as_array: bool) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     if fmt == "ndjson":
         text = "".join(json.dumps(r, ensure_ascii=False) + "\n" for r in records)
+    elif as_array:
+        # 保留提交时的顶层数组结构，单元素数组也不能解包成对象
+        text = json.dumps(records, ensure_ascii=False, indent=2) + "\n"
     else:
-        text = json.dumps(records[0] if len(records) == 1 else records,
-                          ensure_ascii=False, indent=2)
-        text += "\n"
+        text = json.dumps(records[0], ensure_ascii=False, indent=2) + "\n"
     path.write_text(text, encoding="utf-8")
 
 
@@ -170,18 +186,19 @@ def create_job(
         idempotency_key = idempotency_key.strip()
         if len(idempotency_key) > 128:
             raise HTTPException(status_code=400, detail="Idempotency-Key 最长 128 字符")
-        existing_id = db.get_idempotent(idempotency_key)
+        existing_id = get_db().get_idempotent(idempotency_key)
         if existing_id:
-            existing = db.get_job(existing_id)
+            existing = get_db().get_job(existing_id)
             return JSONResponse(status_code=200, content={"replayed": True,
                                                           "job": _job_dict(existing)})  # type: ignore[arg-type]
 
-    _records, result = _execute(req)
+    parsed, result = _execute(req)
     job_id = uuid.uuid4().hex
     filename = f"{job_id}.{req.format}"
-    _write_output(_output_path(job_id, req.format), result.records, req.format)
+    _write_output(_output_path(job_id, req.format), result.records, req.format,
+                  as_array=parsed.top_level_is_array)
     try:
-        job = db.save_job(
+        job = get_db().save_job(
             job_id=job_id,
             idempotency_key=idempotency_key,
             fmt=req.format,
@@ -191,17 +208,18 @@ def create_job(
             needs_review=result.needs_review,
             output_filename=filename,
             output_format=req.format,
+            top_level_is_array=parsed.top_level_is_array,
             key_fingerprint=result.key_fingerprint,
             audit=result.audit,
             risks=result.risks,
         )
     except sqlite3.IntegrityError:
         # 并发提交相同幂等键：对方先落库，回放其作业（清理本请求的冗余文件）
-        winner = db.get_idempotent(idempotency_key) if idempotency_key else None
+        winner = get_db().get_idempotent(idempotency_key) if idempotency_key else None
         _output_path(job_id, req.format).unlink(missing_ok=True)
         if winner:
             return JSONResponse(status_code=200,
-                                content={"replayed": True, "job": _job_dict(db.get_job(winner))})  # type: ignore[arg-type]
+                                content={"replayed": True, "job": _job_dict(get_db().get_job(winner))})  # type: ignore[arg-type]
         raise
     return JSONResponse(
         status_code=201,
@@ -221,12 +239,12 @@ def list_jobs(
     offset: int = Query(default=0, ge=0),
     needs_review: bool | None = Query(default=None),
 ) -> JobList:
-    items, total = db.list_jobs(limit=limit, offset=offset, needs_review=needs_review)
+    items, total = get_db().list_jobs(limit=limit, offset=offset, needs_review=needs_review)
     return JobList(items=items, total=total)
 
 
 def _require_job(job_id: str) -> JobModel:
-    job = db.get_job(job_id)
+    job = get_db().get_job(job_id)
     if not job:
         raise HTTPException(status_code=404, detail=f"作业不存在: {job_id}")
     return job
@@ -235,7 +253,7 @@ def _require_job(job_id: str) -> JobModel:
 @app.get("/api/v1/jobs/{job_id}", response_model=JobDetail, tags=["jobs"],
          summary="查询作业结果（含审计与残留风险）")
 def get_job(job_id: str) -> JobDetail:
-    detail = db.get_job_detail(job_id)
+    detail = get_db().get_job_detail(job_id)
     if not detail:
         raise HTTPException(status_code=404, detail=f"作业不存在: {job_id}")
     return detail
@@ -251,16 +269,22 @@ def get_job_records(job_id: str) -> dict[str, Any]:
     text = path.read_text("utf-8")
     if job.format == "ndjson":
         records = [json.loads(line) for line in text.splitlines() if line.strip()]
+        as_array = True
     else:
-        records = json.loads(text)
-        if not isinstance(records, list):
-            records = [records]
-    return {"job_id": job_id, "format": job.format, "records": records}
+        parsed_file = json.loads(text)
+        if isinstance(parsed_file, list):
+            records = parsed_file
+            as_array = True
+        else:
+            records = [parsed_file]
+            as_array = False
+    return {"job_id": job_id, "format": job.format,
+            "top_level_is_array": as_array, "records": records}
 
 
 @app.get("/api/v1/jobs/{job_id}/audit", tags=["jobs"], summary="仅取审计清单")
 def get_job_audit(job_id: str) -> dict[str, Any]:
-    detail = db.get_job_detail(job_id)
+    detail = get_db().get_job_detail(job_id)
     if not detail:
         raise HTTPException(status_code=404, detail=f"作业不存在: {job_id}")
     return {"job_id": job_id, "count": len(detail.audit), "audit": detail.audit}

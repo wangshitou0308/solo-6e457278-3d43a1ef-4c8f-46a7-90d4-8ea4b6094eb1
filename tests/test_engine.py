@@ -144,15 +144,61 @@ def test_deterministic_token_same_value_same_token_across_batch():
     assert res.records[2]["phone"] != t1
 
 
-def test_token_namespace_separates_same_value():
+def test_same_value_same_token_even_when_hitting_different_rules():
+    # 回归：同一值即使命中不同规则（字段规则 vs 内容规则、不同规则 id），
+    # 整批中也必须使用同一替身
     s = strat([
-        {"id": "rule-a", "name": "a", "match": {"key_names": ["phone"]},
-         "action": "tokenize"},
-        {"id": "rule-b", "name": "b", "match": {"key_names": ["order_tail"]},
+        {"id": "rule-field", "name": "字段令牌化",
+         "match": {"key_names": ["phone"]}, "action": "tokenize"},
+        {"id": "rule-text", "name": "文本识别令牌化",
+         "match": {"detectors": ["phone"]}, "action": "tokenize"},
+    ])
+    data = [
+        {"phone": "13800001234"},
+        {"message": "call 13800001234"},
+        {"deep": [{"phone": "13800001234"}]},
+    ]
+    res = run_strategy(s, data, KEY)
+    t1 = res.records[0]["phone"]
+    t2 = res.records[1]["message"].split()[-1]
+    t3 = res.records[2]["deep"][0]["phone"]
+    assert t1 == t2 == t3
+    assert t1.startswith("T-")
+    # 审计中确实是两条不同规则命中的
+    rule_ids = {a.rule_id for a in res.audit}
+    assert rule_ids == {"rule-field", "rule-text"}
+
+
+def test_tokenization_preserves_value_type():
+    # 回归：令牌化后必须保留原值类型
+    s = strat([
+        {"id": "tok", "name": "t",
+         "match": {"key_names": ["phone", "amount", "ratio", "flag", "empty"]},
          "action": "tokenize"},
     ])
-    res = run_strategy(s, [{"phone": "13800001234", "order_tail": "13800001234"}], KEY)
-    assert res.records[0]["phone"] != res.records[0]["order_tail"]
+    data = [{"phone": 13800001234, "amount": -4200, "ratio": 0.25,
+             "flag": True, "empty": None}]
+    res = run_strategy(s, data, KEY)
+    r = res.records[0]
+    assert isinstance(r["phone"], int)
+    assert len(str(abs(r["phone"]))) == len("13800001234")
+    assert str(r["amount"]).startswith("-")
+    assert isinstance(r["amount"], int)
+    assert isinstance(r["ratio"], float)
+    assert r["flag"] is True       # bool 不令牌化
+    assert r["empty"] is None      # None 不令牌化
+
+
+def test_numeric_token_deterministic_across_batch():
+    s = strat([
+        {"id": "a", "name": "a", "match": {"key_names": ["phone"]},
+         "action": "tokenize"},
+        {"id": "b", "name": "b", "match": {"key_patterns": ["mobile"]},
+         "action": "tokenize"},
+    ])
+    res = run_strategy(s, [{"phone": 13800001234}, {"mobile": 13800001234}], KEY)
+    assert res.records[0]["phone"] == res.records[1]["mobile"]
+    assert isinstance(res.records[0]["phone"], int)
 
 
 def test_content_rules_only_replace_hit_spans():
@@ -199,7 +245,79 @@ def test_value_regex_rule():
     ])
     res = run_strategy(s, [{"m": "code 1234 ok"}], KEY)
     assert "1234" not in res.records[0]["m"]
-    assert res.audit[0].hit_by == [r"regex:\d{4}"]
+    # 审计只记录序号，不包含原始正则文本
+    assert res.audit[0].hit_by == ["value_pattern#1"]
+
+
+def test_audit_hit_by_never_leaks_regex_source():
+    # 回归：审计不得通过 hit_by 写入原始正则文本
+    secret_pattern = r"SECRET-\d{3}-[A-Z]+"
+    s = strat([
+        {"id": "pat", "name": "p",
+         "match": {"value_patterns": [secret_pattern]}, "action": "delete"},
+    ])
+    res = run_strategy(s, [{"m": "x SECRET-123-ABC y"}], KEY)
+    blob = repr(res.audit)
+    assert secret_pattern not in blob
+    assert "SECRET-123-ABC" not in blob
+    assert res.audit[0].hit_by == ["value_pattern#1"]
+
+
+def test_content_replacements_no_offset_leftovers():
+    # 回归：多条内容规则、替换长度不一致时，
+    # 统一按起点降序替换，不能因位置偏移留下已命中的原文
+    s = strat([
+        {"id": "ip", "name": "ip", "match": {"detectors": ["ipv4"]},
+         "action": "mask"},  # 等长替换
+        {"id": "mail", "name": "mail", "match": {"detectors": ["email"]},
+         "action": "delete"},  # 缩短替换
+        {"id": "ph", "name": "ph", "match": {"detectors": ["phone"]},
+         "action": "tokenize"},  # 变长替换
+    ])
+    text = "a a@b.com 10.0.0.1 13800001234 z c@d.org 255.1.2.3"
+    res = run_strategy(s, [{"m": text}], KEY)
+    out = res.records[0]["m"]
+    for leftover in ["a@b.com", "c@d.org", "10.0.0.1", "255.1.2.3", "13800001234"]:
+        assert leftover not in out, f"残留原文: {leftover} -> {out}"
+    # 安全上下文前缀 a / z 仍保留，IP 被等宽掩码
+    assert out.startswith("a ")
+    assert out.rstrip("*").rstrip().endswith("z")
+    assert "********" in out
+
+
+def test_content_replacements_with_different_lengths_and_ordering():
+    # 相邻命中 + 变长/缩短替换混合，逐字符核对输出，专门防止位移缺陷
+    s = strat([
+        {"id": "mail", "name": "mail", "match": {"detectors": ["email"]},
+         "action": "tokenize"},  # 变长（29 字符）
+        {"id": "ip", "name": "ip", "match": {"detectors": ["ipv4"]},
+         "action": "delete"},   # 缩短
+        {"id": "ph", "name": "ph", "match": {"detectors": ["phone"]},
+         "action": "mask"},     # 等长
+    ])
+    text = "x a@b.com|10.0.0.1|13800001234|y"
+    res = run_strategy(s, [{"m": text}], KEY)
+    out = res.records[0]["m"]
+    assert "a@b.com" not in out and "10.0.0.1" not in out and "13800001234" not in out
+    assert out.startswith("x T-")
+    assert out.endswith("||" + "*" * 11 + "|y")
+    # 三条审计，occurrences 各 1
+    by_rule = {a.rule_id: a.occurrences for a in res.audit}
+    assert by_rule == {"mail": 1, "ip": 1, "ph": 1}
+
+
+def test_same_span_same_token_field_and_content():
+    # 同一段文字被字段规则与内容规则令牌化时替身一致（已在
+    # test_same_value_same_token_even_when_hitting_different_rules 覆盖跨记录，
+    # 这里再覆盖字符串确定性）
+    s = strat([
+        {"id": "f", "name": "f", "match": {"key_names": ["p"]},
+         "action": "tokenize"},
+        {"id": "c", "name": "c", "match": {"detectors": ["phone"]},
+         "action": "tokenize"},
+    ])
+    res = run_strategy(s, [{"p": "13800001234"}, {"m": "x13800001234y"}], KEY)
+    assert res.records[0]["p"] in res.records[1]["m"]
 
 
 def test_audit_never_contains_raw_value():

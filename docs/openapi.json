@@ -669,6 +669,10 @@
             "type": "string",
             "title": "Output Filename"
           },
+          "top_level_is_array": {
+            "type": "boolean",
+            "title": "Top Level Is Array"
+          },
           "key_fingerprint": {
             "type": "string",
             "title": "Key Fingerprint"
@@ -700,6 +704,7 @@
           "needs_review",
           "stats",
           "output_filename",
+          "top_level_is_array",
           "key_fingerprint",
           "audit",
           "risks"
@@ -914,18 +919,6 @@
             "title": "Keep Suffix",
             "description": "mask 时保留的后缀长度",
             "default": 0
-          },
-          "token_namespace": {
-            "anyOf": [
-              {
-                "type": "string"
-              },
-              {
-                "type": "null"
-              }
-            ],
-            "title": "Token Namespace",
-            "description": "tokenize 的命名空间，默认取规则 id"
           }
         },
         "type": "object",

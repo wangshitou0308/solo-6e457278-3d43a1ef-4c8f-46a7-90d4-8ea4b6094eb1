@@ -5,7 +5,12 @@ import re
 from dataclasses import dataclass, field
 from typing import Any
 
-from .crypto import MasterKey, deterministic_token, key_fingerprint
+from .crypto import (
+    MasterKey,
+    deterministic_number_token,
+    deterministic_token,
+    key_fingerprint,
+)
 from .detectors import scan, _merge_spans
 from .models import (
     AuditEntry,
@@ -176,15 +181,6 @@ def _mask_whole(value: Any, char: str, prefix: int, suffix: int) -> Any:
     )
 
 
-def _mask_span(text: str, start: int, end: int, char: str, prefix: int, suffix: int) -> str:
-    chunk = text[start:end]
-    kept_p = chunk[:prefix]
-    kept_s = chunk[len(chunk) - suffix:] if suffix else ""
-    middle_len = max(1, len(chunk) - prefix - suffix)
-    replacement = kept_p + char * middle_len + kept_s
-    return text[:start] + replacement + text[end:]
-
-
 # ---------- 引擎 ----------
 
 
@@ -201,18 +197,33 @@ class RedactionEngine:
         self.fields_scanned = 0
         self.by_rule: dict[str, int] = {}
         self.by_action: dict[str, int] = {}
-        self._tokens: dict[tuple[str, str], str] = {}
+        # 整批共享的替身表：键为原始值（含类型前缀），与命中规则无关，
+        # 因此同一值即使被不同规则命中也恒为同一替身。
+        self._text_tokens: dict[str, str] = {}
+        self._int_tokens: dict[str, int] = {}
+        self._float_tokens: dict[str, float] = {}
         # (record_index, field_path)：被整字段规则处理过的叶子，
         # 残留风险扫描时整体跳过（掩码前缀可能形似原数据，如 z***@example.com）
         self._fully_handled: set[tuple[int, str]] = set()
 
-    # -- token 缓存：同一命名空间下同一明文，整批恒等替身 --
-    def _token(self, namespace: str, raw: str) -> str:
-        cache_key = (namespace, raw)
-        token = self._tokens.get(cache_key)
+    def _token_str(self, raw: str) -> str:
+        token = self._text_tokens.get(raw)
         if token is None:
-            token = deterministic_token(self.key, namespace, raw)
-            self._tokens[cache_key] = token
+            token = deterministic_token(self.key, raw)
+            self._text_tokens[raw] = token
+        return token
+
+    def _token_number(self, value: int | float) -> int | float:
+        if isinstance(value, int):
+            token = self._int_tokens.get(str(value))
+            if token is None:
+                token = deterministic_number_token(self.key, value)  # type: ignore[arg-type]
+                self._int_tokens[str(value)] = token
+            return token
+        token = self._float_tokens.get(str(value))
+        if token is None:
+            token = deterministic_number_token(self.key, value)  # type: ignore[assignment]
+            self._float_tokens[str(value)] = token
         return token
 
     def _record_audit(self, idx: int, path: str, key: str | None, cr: CompiledRule,
@@ -257,14 +268,15 @@ class RedactionEngine:
             return None
         if action == "mask":
             return _mask_whole(value, cr.rule.mask_char, cr.rule.keep_prefix, cr.rule.keep_suffix)
-        # tokenize
+        # tokenize：保留原值类型（str/int/float），bool/None 不处理
         if isinstance(value, bool) or value is None:
             return value
-        ns = cr.rule.token_namespace or cr.rule.id
-        return self._token(ns, str(value))
+        if isinstance(value, (int, float)):
+            return self._token_number(value)
+        return self._token_str(str(value))
 
     def _apply_content_rules(self, text: str, idx: int, path: str, key: str | None) -> str:
-        # 候选区间按规则顺序贪心占位，重叠片段归先定义的规则
+        # 候选片段按规则定义顺序贪心占位，重叠片段归先定义的规则
         taken: list[tuple[int, int]] = []
 
         def _free(spans: list[tuple[int, int]]) -> list[tuple[int, int]]:
@@ -282,17 +294,19 @@ class RedactionEngine:
                     out.append((cur_s, e))
             return _merge_spans(out)
 
-        jobs: list[tuple[CompiledRule, list[tuple[int, int]], list[str]]] = []
+        # edits: (start, end, replacement)，同一规则的命中信息另外审计
+        edits: list[tuple[int, int, str]] = []
         for cr in self.content_rules:
             if cr.rule.match.has_field_dimension() and not cr.field_matches(path, key):
                 continue
             candidates: list[tuple[int, int]] = []
             labels: list[str] = []
-            for pat in cr.value_pat_res:
+            for pat_i, pat in enumerate(cr.value_pat_res):
                 spans = [(m.start(), m.end()) for m in pat.finditer(text)]
                 if spans:
                     candidates.extend(spans)
-                    labels.append(f"regex:{pat.pattern}")
+                    # 只记录序号，绝不把原始正则文本写入审计
+                    labels.append(f"value_pattern#{pat_i + 1}")
             if cr.rule.match.detectors:
                 found = scan(text, cr.rule.match.detectors)
                 for det_name, spans in found.items():
@@ -304,28 +318,35 @@ class RedactionEngine:
             if not spans:
                 continue
             taken.extend(spans)
-            jobs.append((cr, spans, labels))
-
-        if not jobs:
-            return text
-
-        # 从后向前替换，避免位移；审计先到先写
-        for cr, spans, labels in jobs:
             self._record_audit(
                 idx, path, key, cr, "content", labels, occurrences=len(spans)
             )
-        for cr, spans, _labels in reversed(jobs):
-            for s, e in reversed(spans):
+            # 替换串在任何改写之前基于原文计算，避免读到已被改写的文本
+            for s, e in spans:
+                original = text[s:e]
                 if cr.rule.action == "delete":
-                    text = text[:s] + text[e:]
+                    replacement = ""
                 elif cr.rule.action == "mask":
-                    text = _mask_span(text, s, e, cr.rule.mask_char,
-                                      cr.rule.keep_prefix, cr.rule.keep_suffix)
+                    middle_len = max(1, len(original) - cr.rule.keep_prefix - cr.rule.keep_suffix)
+                    replacement = (
+                        original[: cr.rule.keep_prefix]
+                        + cr.rule.mask_char * middle_len
+                        + (original[len(original) - cr.rule.keep_suffix:]
+                           if cr.rule.keep_suffix else "")
+                    )
                 else:
-                    ns = cr.rule.token_namespace or cr.rule.id
-                    token = self._token(ns, text[s:e])
-                    text = text[:s] + token + text[e:]
-        return text
+                    replacement = self._token_str(original)
+                edits.append((s, e, replacement))
+
+        if not edits:
+            return text
+
+        # 全部命中按起点统一降序替换：只依赖自身起点之前的文本长度，
+        # 不会因为别的替换改变长度而发生位置偏移、留下或截断已命中原文
+        out = text
+        for s, e, replacement in sorted(edits, key=lambda x: (x[0], x[1]), reverse=True):
+            out = out[:s] + replacement + out[e:]
+        return out
 
     # -- 递归遍历 --
     def _walk(self, node: Any, idx: int, path: str, key: str | None) -> Any:

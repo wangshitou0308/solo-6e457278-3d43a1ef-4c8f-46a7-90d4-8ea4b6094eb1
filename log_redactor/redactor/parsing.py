@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import json
+from dataclasses import dataclass
 from typing import Any
 
 
@@ -11,19 +12,30 @@ class PayloadError(ValueError):
         self.line = line
 
 
-def parse_batch(content: str, fmt: str) -> list[Any]:
+@dataclass(frozen=True)
+class ParsedBatch:
+    records: list[Any]
+    # 提交的 JSON 顶层是否为数组；下载时需原样保留（单元素数组也不能解包成对象）
+    top_level_is_array: bool
+
+
+def parse_batch(content: str, fmt: str) -> ParsedBatch:
     if fmt == "json":
         try:
             data = json.loads(content)
         except json.JSONDecodeError as exc:
-            raise PayloadError(f"JSON 解析失败（第 {exc.lineno} 行第 {exc.colno} 列）：{exc.msg}") from exc
+            raise PayloadError(
+                f"JSON 解析失败（第 {exc.lineno} 行第 {exc.colno} 列）：{exc.msg}"
+            ) from exc
         if isinstance(data, list):
             records = data
+            is_array = True
         else:
             records = [data]
+            is_array = False
         if not records:
             raise PayloadError("日志批次为空")
-        return records
+        return ParsedBatch(records=records, top_level_is_array=is_array)
 
     if fmt == "ndjson":
         records: list[Any] = []
@@ -39,6 +51,6 @@ def parse_batch(content: str, fmt: str) -> list[Any]:
                 ) from exc
         if not records:
             raise PayloadError("日志批次为空（没有任何非空行）")
-        return records
+        return ParsedBatch(records=records, top_level_is_array=True)
 
     raise PayloadError(f"不支持的格式：{fmt}")

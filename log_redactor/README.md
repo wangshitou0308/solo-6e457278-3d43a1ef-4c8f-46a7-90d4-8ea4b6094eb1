@@ -20,7 +20,8 @@
 | 内容匹配 | 值正则（`value_patterns`）、内置识别器（`detectors`） |
 | 内置识别器 | 邮箱、中国大陆手机号、IPv4/IPv6、访问令牌（Bearer/JWT/`key=xxx`/长随机串）、身份证（校验码+日期校验）、银行卡（Luhn 校验） |
 | 动作 | `delete`（置空，保留键结构）、`mask`（可配置掩码字符与首尾保留位数，数字保留数值类型）、`tokenize`（基于本地密钥的确定性替身） |
-| 确定性 | 同一命名空间下同一敏感值，整批数据（跨记录、跨作业，密钥不变时）恒为同一令牌；不同规则命名空间互相隔离 |
+| 类型保留 | 令牌化保留原值类型：字符串→`T-xxxx` 字符串、整数→等宽整数、浮点→保留符号/小数点的浮点；`bool`/`null` 不处理 |
+| 确定性 | **同一值整批恒为同一替身，且与命中哪条规则无关**——同一敏感值即使被不同规则（字段规则/内容规则）命中，替身也完全一致（跨作业，密钥不变时同样一致）；数值按类型分别映射 |
 | 结构保留 | 只改标量值，嵌套对象/数组层级与非敏感字段原样保留；令牌输出为 `T-XXXX` 字符串 |
 | 审计 | 命中规则、记录序号、NDJSON 行号、字段路径、动作、命中维度、替换次数；**绝不记录原始值** |
 | 需复核 | 处理后仍被高风险识别器命中的内容写入风险清单，作业 `needs_review=true` |
@@ -89,8 +90,7 @@ print(json.dumps(json.load(r),ensure_ascii=False,indent=2))'
       "id": "tokenize-phone",
       "name": "令牌化手机号",
       "match": { "key_names": ["phone", "mobile"], "detectors": ["phone"] },
-      "action": "tokenize",
-      "token_namespace": "phone"
+      "action": "tokenize"
     },
     {
       "id": "mask-ip-in-text",
@@ -123,7 +123,7 @@ print(json.dumps(json.load(r),ensure_ascii=False,indent=2))'
 | `GET /api/v1/jobs/{id}` | 作业详情：元数据、统计、审计清单、残留风险 |
 | `GET /api/v1/jobs/{id}/records` | 脱敏后记录 |
 | `GET /api/v1/jobs/{id}/audit` | 仅审计清单 |
-| `GET /api/v1/jobs/{id}/download` | 下载脱敏文件，保持提交时的 JSON / NDJSON 格式 |
+| `GET /api/v1/jobs/{id}/download` | 下载脱敏文件，保持提交时的 JSON / NDJSON 格式；JSON 顶层数组（含单元素数组）原样保留，不会解包成对象 |
 | `GET /api/v1/sample/strategy` / `.../sample/logs.ndjson` | 可直接启动的示例 |
 | `GET /healthz` | 健康检查 + 主密钥指纹 |
 
@@ -153,8 +153,10 @@ print(json.dumps(json.load(r),ensure_ascii=False,indent=2))'
 
 ## 本地密钥
 
-- 默认：首次启动在数据目录生成 32 字节随机密钥 `data/master.key`（权限 `600`）；
-  删除该文件会让历史令牌全部换新，相当于轮换密钥。
+- 默认：首次启动在数据目录生成 **32 字节原始随机**密钥 `data/master.key`（以 0600 权限
+  创建）；删除该文件会让历史令牌全部换新，相当于轮换密钥。
+- 加载既有密钥时按原始字节读取（**不做 strip/解码**，长度必须为 32 字节），
+  并自动把文件权限收紧为 `0600`。
 - 推荐：通过环境变量注入密钥（不落盘）：
 
   ```bash
@@ -162,8 +164,10 @@ print(json.dumps(json.load(r),ensure_ascii=False,indent=2))'
   ```
 
 - `/healthz` 返回密钥指纹（HMAC 摘要前 8 字节），可用于确认两次运行是否同一密钥。
-- 令牌为 `HMAC-SHA256(key, namespace + '\\0' + value)` 的 Base32 截断（`T-XXXX`），
-  不可逆推原值；命名空间默认取规则 id，可显式指定 `token_namespace`。
+- 令牌源为 `HMAC-SHA256(key, 全局命名空间 + 类型前缀 + value)`：字符串取前 18 字节做 Base32
+  （`T-XXXX`），数值从 HMAC 数字流构造等宽替身；不可逆推原值，映射与规则无关。
+- 审计的 `hit_by` 只记录维度名（`field_match`、`detector:<名称>`、`value_pattern#<序号>`），
+  不写入原始正则文本或任何命中的原文。
 
 ## 数据与配置
 
