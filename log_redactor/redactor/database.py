@@ -79,6 +79,7 @@ CREATE TABLE IF NOT EXISTS stream_jobs (
     strategy_version TEXT NOT NULL,
     source_filename TEXT NOT NULL,
     content_sha256 TEXT NOT NULL,
+    strategy_sha256 TEXT NOT NULL DEFAULT '',
     bytes_total INTEGER NOT NULL DEFAULT 0,
     bytes_processed INTEGER NOT NULL DEFAULT 0,
     records_processed INTEGER NOT NULL DEFAULT 0,
@@ -150,6 +151,13 @@ class Database:
             if "top_level_is_array" not in cols:
                 conn.execute(
                     "ALTER TABLE jobs ADD COLUMN top_level_is_array INTEGER NOT NULL DEFAULT 1"
+                )
+            stream_cols = {
+                r["name"] for r in conn.execute("PRAGMA table_info(stream_jobs)")
+            }
+            if "strategy_sha256" not in stream_cols:
+                conn.execute(
+                    "ALTER TABLE stream_jobs ADD COLUMN strategy_sha256 TEXT NOT NULL DEFAULT ''"
                 )
 
     # ---------- 写入 ----------
@@ -366,6 +374,7 @@ class Database:
             output_bytes=row["output_bytes"] or 0,
             key_fingerprint=row["key_fingerprint"],
             content_sha256=row["content_sha256"],
+            strategy_sha256=row["strategy_sha256"],
             progress_pct=pct,
             download_url=(f"/api/v1/stream-jobs/{job_id}/download"
                           if status == "succeeded" and output_filename else None),
@@ -377,6 +386,7 @@ class Database:
         job_id: str,
         idempotency_key: str | None,
         strategy_json: str,
+        strategy_sha256: str,
         source_filename: str,
         content_sha256: str,
         bytes_total: int,
@@ -390,12 +400,14 @@ class Database:
             conn.execute(
                 """INSERT INTO stream_jobs (id, idempotency_key, created_at, updated_at,
                    status, format, strategy_json, strategy_name, strategy_version,
-                   source_filename, content_sha256, bytes_total, key_fingerprint)
-                   VALUES (?,?,?,?, 'queued', 'ndjson', ?,?,?,?,?,?,?)""",
+                   source_filename, content_sha256, strategy_sha256, bytes_total,
+                   key_fingerprint)
+                   VALUES (?,?,?,?, 'queued', 'ndjson', ?,?,?,?,?,?,?,?)""",
                 (
                     job_id, idempotency_key, now, now, strategy_json,
                     strategy.get("name", ""), str(strategy.get("version", "1")),
-                    source_filename, content_sha256, bytes_total, key_fingerprint,
+                    source_filename, content_sha256, strategy_sha256,
+                    bytes_total, key_fingerprint,
                 ),
             )
             row = conn.execute(
@@ -420,7 +432,8 @@ class Database:
     def get_stream_idempotent(self, key: str) -> sqlite3.Row | None:
         with self._conn() as conn:
             return conn.execute(
-                "SELECT id, content_sha256 FROM stream_jobs WHERE idempotency_key = ?",
+                "SELECT id, content_sha256, strategy_sha256 FROM stream_jobs "
+                "WHERE idempotency_key = ?",
                 (key,),
             ).fetchone()
 
@@ -493,6 +506,26 @@ class Database:
             conn.execute(
                 """UPDATE stream_jobs SET status='succeeded', updated_at=?,
                    cancel_requested=0, output_filename=? WHERE id=?""",
+                (utcnow_iso(), output_filename, job_id),
+            )
+            row = conn.execute(
+                "SELECT * FROM stream_jobs WHERE id = ?", (job_id,)
+            ).fetchone()
+        return self._stream_row_to_model(row) if row else None
+
+    def reconcile_published_stream_job(
+        self, job_id: str, *, output_filename: str
+    ) -> StreamJobModel | None:
+        """崩溃恢复对账：成品文件已发布但状态事务未提交时补登 succeeded。
+
+        仅对 queued/running 状态生效（终态作业不会被改写），与正常发布走同一条
+        UPDATE，保证状态与可下载文件一一对应。
+        """
+        with self._lock, self._conn() as conn:
+            conn.execute(
+                """UPDATE stream_jobs SET status='succeeded', updated_at=?,
+                   cancel_requested=0, output_filename=?
+                   WHERE id=? AND status IN ('queued','running')""",
                 (utcnow_iso(), output_filename, job_id),
             )
             row = conn.execute(

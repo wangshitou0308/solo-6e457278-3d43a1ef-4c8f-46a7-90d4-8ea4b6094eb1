@@ -2,8 +2,11 @@
   "openapi": "3.1.0",
   "info": {
     "title": "本地日志脱敏 API",
-    "description": "供后端团队提交故障样本前使用的本地日志脱敏服务。支持按字段路径/键名/正则/内置识别器（邮箱、手机号、IP、访问令牌、身份证、银行卡）命中，动作包括删除、掩码与基于本地密钥的确定性令牌化；生成不含原值的审计清单，并对残留高风险内容标记需复核。",
-    "version": "1.0.0"
+    "description": "供后端团队提交故障样本前使用的本地日志脱敏服务。支持按字段路径/键名/正则/内置识别器（邮箱、手机号、IP、访问令牌、身份证、银行卡）命中，动作包括删除、掩码与基于本地密钥的确定性令牌化；生成不含原值的审计清单，并对残留高风险内容标记需复核。\n\n## 大批量 NDJSON 流式作业（stream-jobs）\n通过 multipart/form-data 上传大文件，原始文件以 0600 权限临时落盘，服务逐行解析、脱敏并定期写入安全检查点（字节偏移/记录数/审计数/风险数），不把整包读入内存；支持 Idempotency-Key 内容校验（同键不同内容返回 409）、取消、服务重启后从检查点继续、格式错误记录行号并终止；成功后原子发布结果文件，未完成作业不可下载。",
+    "contact": {
+      "name": "platform-security"
+    },
+    "version": "1.1.0"
   },
   "paths": {
     "/healthz": {
@@ -461,6 +464,398 @@
           }
         }
       }
+    },
+    "/api/v1/stream-jobs": {
+      "post": {
+        "tags": [
+          "stream-jobs"
+        ],
+        "summary": "上传 NDJSON 大文件并创建流式脱敏作业",
+        "description": "以 `multipart/form-data` 上传：`file` 为 NDJSON 文件，`strategy` 为策略 JSON。原始文件以 **0600** 权限临时落盘，服务**逐行**解析脱敏（不把整包读入内存），并持续记录已处理字节数、记录数、审计数与残留风险数。\n\n携带 `Idempotency-Key` 时：相同键且**上传内容与策略的 SHA-256 均一致**才回放首个作业（200）；相同键但文件内容或策略不同返回 **409 冲突**，不会回放旧结果。作业可取消，服务重启后从安全检查点继续；格式错误记录行号并终止。完成后原始文件即被删除并原子发布结果文件。",
+        "operationId": "create_stream_job_api_v1_stream_jobs_post",
+        "parameters": [
+          {
+            "name": "Idempotency-Key",
+            "in": "header",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "description": "同一键只回放内容一致的上传；内容不同返回 409",
+              "title": "Idempotency-Key"
+            },
+            "description": "同一键只回放内容一致的上传；内容不同返回 409"
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "multipart/form-data": {
+              "schema": {
+                "$ref": "#/components/schemas/Body_create_stream_job_api_v1_stream_jobs_post"
+              }
+            }
+          }
+        },
+        "responses": {
+          "202": {
+            "description": "已接受上传，后台流式处理中",
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            }
+          },
+          "200": {
+            "description": "幂等命中，回放已有作业"
+          },
+          "409": {
+            "description": "Idempotency-Key 冲突（同键内容不同）"
+          },
+          "422": {
+            "description": "策略非法或文件内容为空"
+          }
+        }
+      },
+      "get": {
+        "tags": [
+          "stream-jobs"
+        ],
+        "summary": "流式作业列表（可按状态过滤、分页）",
+        "operationId": "list_stream_jobs_api_v1_stream_jobs_get",
+        "parameters": [
+          {
+            "name": "status",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "description": "queued/running/succeeded/failed/cancelled",
+              "title": "Status"
+            },
+            "description": "queued/running/succeeded/failed/cancelled"
+          },
+          {
+            "name": "limit",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "integer",
+              "maximum": 200,
+              "minimum": 1,
+              "default": 50,
+              "title": "Limit"
+            }
+          },
+          {
+            "name": "offset",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "integer",
+              "minimum": 0,
+              "default": 0,
+              "title": "Offset"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/stream-jobs/{job_id}": {
+      "get": {
+        "tags": [
+          "stream-jobs"
+        ],
+        "summary": "流式作业状态与实时进度",
+        "description": "返回作业状态、已处理字节数/记录数/审计数/风险数与进度百分比；失败时带格式错误行号。",
+        "operationId": "get_stream_job_api_v1_stream_jobs__job_id__get",
+        "parameters": [
+          {
+            "name": "job_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "title": "Job Id"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "additionalProperties": true,
+                  "title": "Response Get Stream Job Api V1 Stream Jobs  Job Id  Get"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/stream-jobs/{job_id}/cancel": {
+      "post": {
+        "tags": [
+          "stream-jobs"
+        ],
+        "summary": "取消流式作业",
+        "description": "取消意图同时写入内存与数据库（重启后仍生效）；worker 在检查点边界停止，状态置为 cancelled，原始文件与未完成输出被清理。",
+        "operationId": "cancel_stream_job_api_v1_stream_jobs__job_id__cancel_post",
+        "parameters": [
+          {
+            "name": "job_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "title": "Job Id"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "additionalProperties": true,
+                  "title": "Response Cancel Stream Job Api V1 Stream Jobs  Job Id  Cancel Post"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "作业已终结，无法取消"
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/stream-jobs/{job_id}/audit": {
+      "get": {
+        "tags": [
+          "stream-jobs"
+        ],
+        "summary": "分页查询流式作业的审计清单（不含原始值）",
+        "operationId": "get_stream_job_audit_api_v1_stream_jobs__job_id__audit_get",
+        "parameters": [
+          {
+            "name": "job_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "title": "Job Id"
+            }
+          },
+          {
+            "name": "limit",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "integer",
+              "maximum": 1000,
+              "minimum": 1,
+              "default": 100,
+              "title": "Limit"
+            }
+          },
+          {
+            "name": "offset",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "integer",
+              "minimum": 0,
+              "default": 0,
+              "title": "Offset"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/stream-jobs/{job_id}/risks": {
+      "get": {
+        "tags": [
+          "stream-jobs"
+        ],
+        "summary": "分页查询流式作业的残留风险",
+        "operationId": "get_stream_job_risks_api_v1_stream_jobs__job_id__risks_get",
+        "parameters": [
+          {
+            "name": "job_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "title": "Job Id"
+            }
+          },
+          {
+            "name": "limit",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "integer",
+              "maximum": 1000,
+              "minimum": 1,
+              "default": 100,
+              "title": "Limit"
+            }
+          },
+          {
+            "name": "offset",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "integer",
+              "minimum": 0,
+              "default": 0,
+              "title": "Offset"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/stream-jobs/{job_id}/download": {
+      "get": {
+        "tags": [
+          "stream-jobs"
+        ],
+        "summary": "下载已完成的 NDJSON 脱敏结果",
+        "description": "仅 succeeded 作业可下载（原子发布的结果文件）；排队/运行/失败/取消的作业返回 409。",
+        "operationId": "download_stream_job_api_v1_stream_jobs__job_id__download_get",
+        "parameters": [
+          {
+            "name": "job_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "title": "Job Id"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            }
+          },
+          "409": {
+            "description": "作业未完成，结果不可下载"
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
     }
   },
   "components": {
@@ -551,6 +946,27 @@
         ],
         "title": "AuditEntry",
         "description": "审计清单中的一条。按设计不含任何原始值。"
+      },
+      "Body_create_stream_job_api_v1_stream_jobs_post": {
+        "properties": {
+          "strategy": {
+            "type": "string",
+            "title": "Strategy",
+            "description": "脱敏策略 JSON（与小批量接口同一结构）"
+          },
+          "file": {
+            "type": "string",
+            "contentMediaType": "application/octet-stream",
+            "title": "File",
+            "description": "NDJSON 日志文件，每行一个 JSON 值"
+          }
+        },
+        "type": "object",
+        "required": [
+          "strategy",
+          "file"
+        ],
+        "title": "Body_create_stream_job_api_v1_stream_jobs_post"
       },
       "CreateJobRequest": {
         "properties": {

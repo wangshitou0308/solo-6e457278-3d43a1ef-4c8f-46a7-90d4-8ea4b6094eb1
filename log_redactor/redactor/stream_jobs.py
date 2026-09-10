@@ -23,7 +23,7 @@ from pathlib import Path
 from typing import Any, Callable
 
 from . import config
-from .crypto import MasterKey, key_fingerprint
+from .crypto import MasterKey
 from .database import Database
 from .engine import RedactionEngine
 from .models import AuditEntry, RiskFinding, Strategy
@@ -69,12 +69,25 @@ def tighten(path: Path) -> None:
         pass
 
 
+def _fsync_dir(path: Path) -> None:
+    """fsync 目录，保证 rename 发布本身落盘（失败时静默，属尽力而为）。"""
+    try:
+        fd = os.open(str(path), os.O_RDONLY)
+        try:
+            os.fsync(fd)
+        finally:
+            os.close(fd)
+    except OSError:
+        pass
+
+
 def atomic_publish(src: Path, dst: Path) -> None:
-    """同目录原子 rename 发布；目标继承 0600 权限。"""
+    """同目录原子 rename 发布；目标继承 0600 权限并 fsync 目录。"""
     dst.parent.mkdir(parents=True, exist_ok=True)
     tighten(src)
     os.replace(src, dst)
     tighten(dst)
+    _fsync_dir(dst.parent)
 
 
 def cleanup_stream_files(job_id: str, *, keep_output: bool) -> None:
@@ -177,6 +190,59 @@ def _parse_line(raw: bytes, line_no: int) -> Any:
 
 # 处理每条记录前回调 (job_id, line_no)；测试可注入用于制造取消/崩溃时序。
 on_record_hook: Callable[[str, int], None] | None = None
+# 成品文件已 rename 发布、数据库 succeeded 事务尚未写入时回调 (job_id)。
+# 测试注入后抛 BaseException 可精确模拟该窗口内的硬崩溃。
+on_publish_hook: Callable[[str], None] | None = None
+
+
+# ---------- 发布对账（崩溃恢复） ----------
+
+
+def _published_file_is_valid(path: Path, expected_records: int) -> bool:
+    """成品文件必须是可逐行解析的 NDJSON，且记录数与检查点一致。"""
+    if not path.is_file() or path.stat().st_size == 0:
+        return False
+    count = 0
+    try:
+        with open(path, "rb") as fh:
+            for raw in fh:
+                line = raw.strip()
+                if not line:
+                    return False
+                json.loads(line.decode("utf-8"))
+                count += 1
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError):
+        return False
+    return count == expected_records
+
+
+def reconcile_published_job(db: Database, job_id: str) -> bool:
+    """处理“成品已发布、succeeded 事务未提交”的崩溃窗口。
+
+    仅在数据库仍是 queued/running 时对账：成品存在且是完整可解析的 NDJSON
+    （记录数等于已检查点记录数）时补登 succeeded 并清理原始文件；否则不动，
+    交由正常检查点续跑逻辑处理。
+    """
+    job = db.get_stream_job(job_id)
+    if job is None or job.status not in ("queued", "running"):
+        return False
+    published = final_output_path(job_id)
+    if not published.is_file():
+        return False
+    if not _published_file_is_valid(published, job.records_processed):
+        # 成品意外存在但不可信：隔离，绝不让它与未完成状态并存
+        published.unlink(missing_ok=True)
+        return False
+    db.reconcile_published_stream_job(job_id, output_filename=published.name)
+    raw_path(job_id).unlink(missing_ok=True)
+    partial_output_path(job_id).unlink(missing_ok=True)
+    return True
+
+
+def cleanup_terminal_leftovers(db: Database, job_id: str) -> None:
+    """终态作业（正常路径或遗留线程）只允许保留已发布成品，其余临时文件清掉。"""
+    raw_path(job_id).unlink(missing_ok=True)
+    partial_output_path(job_id).unlink(missing_ok=True)
 
 
 # ---------- worker ----------
@@ -186,12 +252,17 @@ def run_stream_job(job_id: str, get_db: Callable[[], Database],
                    get_key: Callable[[], MasterKey]) -> None:
     """执行（或从安全检查点续跑）一个流式作业。"""
     db = get_db()
+    # 优先对账“成品已发布但状态未提交”的崩溃窗口：补登 succeeded 后直接退出
+    if reconcile_published_job(db, job_id):
+        registry._discard(job_id)
+        return
     job = db.get_stream_job(job_id)
     if job is None:
         registry._discard(job_id)
         return
-    # 已终结（并发终结竞争）或文件已不在：直接退出
+    # 已终结（并发终结竞争）：不重复处理，只清理遗留临时文件后退出
     if job.status not in ("queued", "running"):
+        cleanup_terminal_leftovers(db, job_id)
         registry._discard(job_id)
         return
 
@@ -236,6 +307,28 @@ def run_stream_job(job_id: str, get_db: Callable[[], Database],
 
     # 截断到已检查点字节：严格丢弃未随事务提交的输出（fsync 在提交之前完成，
     # 因此已提交的每个输出字节必然已在盘上）。
+    # 守卫：partial 缺失/小于检查点字节时，open(...,'a+b') + truncate 会产生
+    # NUL 填充的损坏文件；这种状态无法安全续跑，直接判失败并清理。
+    if partial.exists():
+        partial_size = partial.stat().st_size
+        if partial_size < job.output_bytes:
+            db.mark_stream_failed(
+                job_id,
+                message=(f"未完成输出文件损坏（{partial_size} 字节，少于检查点 "
+                         f"{job.output_bytes} 字节），无法从检查点继续"),
+                line=None,
+            )
+            cleanup_stream_files(job_id, keep_output=False)
+            registry._discard(job_id)
+            return
+    elif job.output_bytes:
+        db.mark_stream_failed(
+            job_id, message="未完成输出文件丢失，无法从检查点继续", line=None
+        )
+        cleanup_stream_files(job_id, keep_output=False)
+        registry._discard(job_id)
+        return
+
     out = open(partial, "a+b", buffering=0)
     out.truncate(job.output_bytes)
     out.seek(0, os.SEEK_END)
@@ -358,15 +451,20 @@ def run_stream_job(job_id: str, get_db: Callable[[], Database],
             write_checkpoint()
             out.flush()
             os.fsync(out.fileno())
+            out.close()
             published = final_output_path(job_id)
             atomic_publish(partial, published)
+            # 测试钩子：精确模拟“成品已发布、succeeded 事务未提交”的崩溃窗口
+            if on_publish_hook is not None:
+                on_publish_hook(job_id)
             db.mark_stream_succeeded(
                 job_id, output_filename=published.name
             )
             # 原始文件必须清理；已发布的成品保留
             raw_path(job_id).unlink(missing_ok=True)
     finally:
-        out.close()
+        if not out.closed:
+            out.close()
 
     registry._discard(job_id)
 
@@ -396,13 +494,18 @@ def recover_stream_jobs(get_db: Callable[[], Database],
         job_id = row["id"]
         if registry.is_running(job_id):
             continue
-        # 原始文件已丢失（如手工清理）：无法续跑，标记失败并清理残留输出
+        # 1) 先对账“成品已发布、状态未提交”的崩溃窗口：补登 succeeded，
+        #    绝不能在这种状态下再开一个会写 NUL partial 的 worker
+        if reconcile_published_job(db, job_id):
+            continue
+        # 2) 原始文件已丢失（如手工清理）：无法续跑，标记失败并清理残留输出
         if not raw_path(job_id).exists():
             db.mark_stream_failed(
                 job_id, message="服务重启后原始上传文件已丢失，无法继续处理", line=None
             )
             cleanup_stream_files(job_id, keep_output=False)
             continue
+        # 3) 正常从安全检查点续跑（含重启前已持久化的取消意图）
         registry.start(job_id, lambda jid=job_id: run_stream_job(jid, get_db, get_key))
 
 

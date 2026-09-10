@@ -18,8 +18,10 @@ def client(isolated_data):
     stream_jobs.reset_recovery()
     stream_jobs.registry.reset()
     stream_jobs.on_record_hook = None
+    stream_jobs.on_publish_hook = None
     yield TestClient(isolated_data["app"])
     stream_jobs.on_record_hook = None
+    stream_jobs.on_publish_hook = None
     stream_jobs.registry.reset()
     stream_jobs.reset_recovery()
 
@@ -463,3 +465,216 @@ def test_resume_with_missing_raw_marks_failed(client, isolated_data, monkeypatch
     final = _wait(client, job_id)
     assert final["status"] == "failed"
     assert "原始上传文件" in final["error_message"]
+
+
+# ---------- 回归：发布/状态之间的崩溃窗口 ----------
+
+
+@pytest.mark.filterwarnings("ignore::pytest.PytestUnhandledThreadExceptionWarning")
+def test_crash_between_publish_and_mark_reconciles_on_restart(client, isolated_data):
+    """成品已 rename 发布、succeeded 事务未提交时硬崩溃：重启必须补登状态且可下载。"""
+    crashed_jobs = set()
+
+    class _Crash(BaseException):
+        pass
+
+    def publish_hook(job_id):
+        if job_id not in crashed_jobs:
+            crashed_jobs.add(job_id)
+            raise _Crash("crash after publish, before mark succeeded")
+
+    stream_jobs.on_publish_hook = publish_hook
+    r = _upload(client, sample_ndjson(), key="publish-window")
+    job_id = r.json()["job"]["id"]
+    stream_jobs.registry._threads[job_id].join(timeout=10)
+
+    # 崩溃后的现场：状态仍 running，但成品已发布、partial 已被 rename、raw 还在
+    stuck = client.get(f"/api/v1/stream-jobs/{job_id}").json()
+    assert stuck["status"] == "running"
+    out = isolated_data["data_dir"] / "streams/out" / f"{job_id}.ndjson"
+    partial = isolated_data["data_dir"] / "streams/partial" / f"{job_id}.ndjson"
+    raw = isolated_data["data_dir"] / "streams/raw" / f"{job_id}.ndjson"
+    assert out.exists() and not partial.exists() and raw.exists()
+    published_bytes = out.read_bytes()
+
+    # “重启”：触发恢复扫描。对账应补登 succeeded，不得重跑 worker
+    stream_jobs.registry.reset()
+    stream_jobs.reset_recovery()
+    stream_jobs.on_publish_hook = None
+    client.get("/api/v1/stream-jobs")
+    final = _wait(client, job_id)
+    assert final["status"] == "succeeded"
+    assert final["records_processed"] == 3
+
+    # 成品字节级未被改动（没有被新建的 NUL partial 覆盖/重写）
+    assert out.read_bytes() == published_bytes
+    assert not partial.exists()  # 恢复对账路径绝不新建 partial
+    assert not raw.exists()      # 原始文件随对账清理
+
+    dl = client.get(f"/api/v1/stream-jobs/{job_id}/download")
+    assert dl.status_code == 200
+    lines = [json.loads(l) for l in dl.text.splitlines() if l.strip()]
+    assert len(lines) == 3
+    assert "zhangsan@example.com" not in dl.text
+
+
+@pytest.mark.filterwarnings("ignore::pytest.PytestUnhandledThreadExceptionWarning")
+def test_published_file_revalidated_against_checkpoint_records(client, isolated_data):
+    """成品存在但记录数与检查点不一致（不可信）时不能误判成功，也不能提供损坏下载。"""
+    from redactor.app import get_db
+
+    crashed_jobs = set()
+
+    class _Crash(BaseException):
+        pass
+
+    def publish_hook(job_id):
+        if job_id not in crashed_jobs:
+            crashed_jobs.add(job_id)
+            out = isolated_data["data_dir"] / "streams/out" / f"{job_id}.ndjson"
+            out.write_bytes(b'{"tampered": true}\n')  # 1 条，检查点是 3 条
+            raise _Crash("crash with bogus published file")
+
+    stream_jobs.on_publish_hook = publish_hook
+    r = _upload(client, sample_ndjson())
+    job_id = r.json()["job"]["id"]
+    stream_jobs.registry._threads[job_id].join(timeout=10)
+
+    # 对账不认可伪造成品：删除它并返回 False，状态保持 running
+    stream_jobs.registry.reset()
+    stream_jobs.reset_recovery()
+    stream_jobs.on_publish_hook = None
+    assert stream_jobs.reconcile_published_job(get_db(), job_id) is False
+    out = isolated_data["data_dir"] / "streams/out" / f"{job_id}.ndjson"
+    assert not out.exists()
+
+    # 触发恢复：partial 已在发布时被 rename 走、检查点 output_bytes>0，
+    # 安全守卫把作业判失败，而不是 NUL 填充或把损坏文件标成功
+    client.get("/api/v1/stream-jobs")
+    final = _wait(client, job_id)
+    assert final["status"] == "failed"
+    assert client.get(f"/api/v1/stream-jobs/{job_id}/download").status_code == 409
+    assert not out.exists()
+
+
+def test_missing_or_short_partial_checkpoint_fails_safely(isolated_data):
+    """partial 缺失/短于检查点字节时严禁 NUL 填充续跑，必须判失败并清理。"""
+    import redactor.stream_jobs as sj
+    from redactor.app import get_db, get_master_key
+    from redactor.database import Database
+
+    db: Database = get_db()
+    content = sample_ndjson().encode()
+    (isolated_data["data_dir"] / "streams/raw").mkdir(parents=True, exist_ok=True)
+
+    # 情形 A：partial 缺失
+    job_id = "partialmissing0000000000000000000001"
+    raw = sj.raw_path(job_id)
+    raw.write_bytes(content)
+    os.chmod(raw, 0o600)
+    db.create_stream_job(
+        job_id=job_id, idempotency_key=None,
+        strategy_json=json.dumps(SAMPLE_STRATEGY), strategy_sha256="x",
+        source_filename="a.ndjson", content_sha256="c1",
+        bytes_total=len(content), key_fingerprint="sha256:test",
+    )
+    db.checkpoint_stream_job(
+        job_id, bytes_processed=10, records_processed=1, audit_count=0,
+        risk_count=0, fields_scanned=1, by_action={}, by_rule={},
+        last_line_no=1, output_bytes=42, audit=[], risks=[],
+    )
+    sj.run_stream_job(job_id, get_db, get_master_key)
+    job = db.get_stream_job(job_id)
+    assert job.status == "failed"
+    assert "未完成输出文件丢失" in (job.error_message or "")
+    assert not raw.exists()
+    assert not sj.partial_output_path(job_id).exists()
+
+    # 情形 B：partial 短于检查点字节（旧的实现会 NUL 填充覆盖）
+    job_id2 = "partialshort0000000000000000000000002"
+    raw2 = sj.raw_path(job_id2)
+    raw2.write_bytes(content)
+    os.chmod(raw2, 0o600)
+    db.create_stream_job(
+        job_id=job_id2, idempotency_key=None,
+        strategy_json=json.dumps(SAMPLE_STRATEGY), strategy_sha256="x",
+        source_filename="a.ndjson", content_sha256="c2",
+        bytes_total=len(content), key_fingerprint="sha256:test",
+    )
+    db.checkpoint_stream_job(
+        job_id2, bytes_processed=10, records_processed=1, audit_count=0,
+        risk_count=0, fields_scanned=1, by_action={}, by_rule={},
+        last_line_no=1, output_bytes=100, audit=[], risks=[],
+    )
+    partial = sj.partial_output_path(job_id2)
+    partial.parent.mkdir(parents=True, exist_ok=True)
+    partial.write_bytes(b'{"a":1}\n')  # 远少于 100
+    sj.run_stream_job(job_id2, get_db, get_master_key)
+    job2 = db.get_stream_job(job_id2)
+    assert job2.status == "failed"
+    assert "损坏" in (job2.error_message or "")
+    assert not partial.exists() and not raw2.exists()
+
+
+# ---------- 回归：策略参与幂等一致性 ----------
+
+
+def test_same_key_same_file_different_strategy_is_409(client):
+    import copy
+
+    r1 = _upload(client, sample_ndjson(), key="strategy-key")
+    j1 = r1.json()["job"]["id"]
+    _wait(client, j1)
+
+    other = copy.deepcopy(SAMPLE_STRATEGY)
+    other["rules"][1]["keep_prefix"] = 3  # 改变脱敏语义
+    files = {"file": ("logs.ndjson", sample_ndjson(), "application/x-ndjson")}
+    r2 = client.post(
+        "/api/v1/stream-jobs",
+        files=files,
+        data={"strategy": json.dumps(other)},
+        headers={"Idempotency-Key": "strategy-key"},
+    )
+    assert r2.status_code == 409
+    assert "策略" in r2.json()["detail"]["message"]
+    assert r2.json()["detail"]["existing_job_id"] == j1
+    assert client.get("/api/v1/stream-jobs").json()["total"] == 1
+
+    # 同策略、仅 JSON 排版/键序不同：规范化后摘要一致，应回放而非冲突
+    r3 = client.post(
+        "/api/v1/stream-jobs",
+        files=files,
+        data={"strategy": json.dumps(other, indent=4, sort_keys=True)},
+        headers={"Idempotency-Key": "strategy-key-2"},
+    )
+    # 新键首次上传：202（不同排版在单次上传内不构成冲突）
+    assert r3.status_code == 202
+    j3 = _wait(client, r3.json()["job"]["id"])
+    # 用同一策略的另一种排版 + 同一键重放：必须 200 回放
+    r4 = client.post(
+        "/api/v1/stream-jobs",
+        files={"file": ("logs.ndjson", sample_ndjson(), "application/x-ndjson")},
+        data={"strategy": json.dumps(other, separators=(",", ":"))},
+        headers={"Idempotency-Key": "strategy-key-2"},
+    )
+    assert r4.status_code == 200
+    assert r4.json()["job"]["id"] == j3["id"]
+
+
+def test_openapi_documents_stream_routes(client):
+    spec = client.get("/openapi.json").json()
+    paths = spec["paths"]
+    for p in [
+        "/api/v1/stream-jobs",
+        "/api/v1/stream-jobs/{job_id}",
+        "/api/v1/stream-jobs/{job_id}/cancel",
+        "/api/v1/stream-jobs/{job_id}/audit",
+        "/api/v1/stream-jobs/{job_id}/risks",
+        "/api/v1/stream-jobs/{job_id}/download",
+    ]:
+        assert p in paths, p
+    # 409 冲突与未完成不可下载都写进了契约
+    create_responses = paths["/api/v1/stream-jobs"]["post"]["responses"]
+    assert "409" in create_responses
+    dl_responses = paths["/api/v1/stream-jobs/{job_id}/download"]["get"]["responses"]
+    assert "409" in dl_responses

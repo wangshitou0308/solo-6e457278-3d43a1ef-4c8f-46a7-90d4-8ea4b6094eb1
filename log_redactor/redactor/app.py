@@ -361,6 +361,16 @@ def _stream_job_dict(job) -> dict[str, Any]:
     return job.model_dump(mode="json")
 
 
+def _idempotency_conflict(job_id: str, reason: str) -> HTTPException:
+    return HTTPException(
+        status_code=409,
+        detail={
+            "message": f"Idempotency-Key 已用于{reason}不同的上传",
+            "existing_job_id": job_id,
+        },
+    )
+
+
 def _require_stream_job(job_id: str):
     job = get_db().get_stream_job(job_id)
     if not job:
@@ -376,8 +386,9 @@ def _require_stream_job(job_id: str):
         "以 `multipart/form-data` 上传：`file` 为 NDJSON 文件，`strategy` 为策略 JSON。"
         "原始文件以 **0600** 权限临时落盘，服务**逐行**解析脱敏（不把整包读入内存），"
         "并持续记录已处理字节数、记录数、审计数与残留风险数。\n\n"
-        "携带 `Idempotency-Key` 时：相同键且**内容 SHA-256 一致**直接回放首个作业（200）；"
-        "相同键但内容不同返回 **409 冲突**。作业可取消，服务重启后从安全检查点继续；"
+        "携带 `Idempotency-Key` 时：相同键且**上传内容与策略的 SHA-256 均一致**"
+        "才回放首个作业（200）；相同键但文件内容或策略不同返回 **409 冲突**，"
+        "不会回放旧结果。作业可取消，服务重启后从安全检查点继续；"
         "格式错误记录行号并终止。完成后原始文件即被删除并原子发布结果文件。"
     ),
     status_code=202,
@@ -408,6 +419,10 @@ async def create_stream_job(
         strategy_model = Strategy.model_validate_json(strategy)
     except ValueError as exc:
         raise HTTPException(status_code=422, detail={"message": f"策略校验失败：{exc}"}) from exc
+    # 规范化策略（Pydantic 规范序列化）后取摘要：键顺序/空白差异不算不同策略，
+    # 规则内容差异必然体现为不同摘要，并参与幂等一致性判断
+    strategy_canonical = strategy_model.model_dump_json()
+    strategy_sha = hashlib.sha256(strategy_canonical.encode("utf-8")).hexdigest()
 
     job_id = uuid.uuid4().hex
     ensure_stream_dirs()
@@ -438,20 +453,15 @@ async def create_stream_job(
     content_sha = digest.hexdigest()
     source_name = Path(file.filename or "upload.ndjson").name
 
-    # 幂等：同键同内容回放，同键异内容冲突（临时文件立即清理）
-    replayed = False
+    # 幂等：同键且文件+策略都一致才回放，任一不同返回冲突（临时文件立即清理）
     if idempotency_key:
         row = get_db().get_stream_idempotent(idempotency_key)
         if row is not None:
             staged.unlink(missing_ok=True)
             if row["content_sha256"] != content_sha:
-                raise HTTPException(
-                    status_code=409,
-                    detail={
-                        "message": "Idempotency-Key 已用于内容不同的上传",
-                        "existing_job_id": row["id"],
-                    },
-                )
+                raise _idempotency_conflict(row["id"], "文件内容")
+            if row["strategy_sha256"] != strategy_sha:
+                raise _idempotency_conflict(row["id"], "策略")
             existing = get_db().get_stream_job(row["id"])
             return JSONResponse(
                 status_code=200,
@@ -462,7 +472,8 @@ async def create_stream_job(
         job = get_db().create_stream_job(
             job_id=job_id,
             idempotency_key=idempotency_key,
-            strategy_json=strategy_model.model_dump_json(),
+            strategy_json=strategy_canonical,
+            strategy_sha256=strategy_sha,
             source_filename=source_name,
             content_sha256=content_sha,
             bytes_total=bytes_total,
@@ -476,16 +487,15 @@ async def create_stream_job(
         )
         if winner:
             existing = get_db().get_stream_job(winner["id"])
-            if winner["content_sha256"] == content_sha:
+            if (winner["content_sha256"] == content_sha
+                    and winner["strategy_sha256"] == strategy_sha):
                 return JSONResponse(
                     status_code=200,
                     content={"replayed": True, "job": _stream_job_dict(existing)},
                 )
-            raise HTTPException(
-                status_code=409,
-                detail={"message": "Idempotency-Key 已用于内容不同的上传",
-                        "existing_job_id": winner["id"]},
-            )
+            if winner["content_sha256"] != content_sha:
+                raise _idempotency_conflict(winner["id"], "文件内容")
+            raise _idempotency_conflict(winner["id"], "策略")
         raise
 
     stream_registry.start(

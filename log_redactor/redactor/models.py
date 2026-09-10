@@ -288,6 +288,7 @@ class StreamJobModel(BaseModel):
     output_bytes: int = 0
     key_fingerprint: str
     content_sha256: str = Field(description="上传内容 SHA-256，用于幂等冲突判定，不可逆推内容")
+    strategy_sha256: str = Field(default="", description="规范化策略 SHA-256，参与幂等一致性判定")
     progress_pct: float = 0.0
     download_url: str | None = None
 

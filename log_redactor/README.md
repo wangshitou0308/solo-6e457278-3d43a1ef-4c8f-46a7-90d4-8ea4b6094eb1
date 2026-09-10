@@ -26,6 +26,7 @@
 | 审计 | 命中规则、记录序号、NDJSON 行号、字段路径、动作、命中维度、替换次数；**绝不记录原始值** |
 | 需复核 | 处理后仍被高风险识别器命中的内容写入风险清单，作业 `needs_review=true` |
 | 幂等 | 请求头 `Idempotency-Key` 相同的重复提交直接回放首个作业 |
+| 大批量流式作业 | `POST /api/v1/stream-jobs` 以 multipart 上传 NDJSON 大文件：原始文件 **0600 临时落盘**、逐行脱敏（不读入整包）、安全检查点记录字节/记录/审计/风险进度，可取消、可在**重启后从检查点继续**，成功后原子发布结果；幂等键同时校验文件内容**与策略**摘要 |
 | 试运行 | `POST /strategies/validate` 即时返回脱敏结果，不写库、不落文件 |
 
 ## 快速开始
@@ -124,6 +125,11 @@ print(json.dumps(json.load(r),ensure_ascii=False,indent=2))'
 | `GET /api/v1/jobs/{id}/records` | 脱敏后记录 |
 | `GET /api/v1/jobs/{id}/audit` | 仅审计清单 |
 | `GET /api/v1/jobs/{id}/download` | 下载脱敏文件，保持提交时的 JSON / NDJSON 格式；JSON 顶层数组（含单元素数组）原样保留，不会解包成对象 |
+| `POST /api/v1/stream-jobs` | **大批量 NDJSON**：`multipart/form-data` 上传（`file` + `strategy`），返回 202 与作业 id；原始文件 0600 临时落盘，逐行脱敏、检查点推进 |
+| `GET /api/v1/stream-jobs` / `.../{id}` | 流式作业列表（按状态过滤、分页）与状态/实时进度（字节、记录、审计、风险、百分比） |
+| `POST /api/v1/stream-jobs/{id}/cancel` | 取消作业；停在检查点边界，原始文件与未完成输出被清理（取消意图跨重启生效） |
+| `GET /api/v1/stream-jobs/{id}/audit` / `.../risks` | 分页查询审计清单 / 残留风险（`limit`、`offset`） |
+| `GET /api/v1/stream-jobs/{id}/download` | 下载原子发布的 NDJSON 结果；**仅 succeeded 可下载**，未完成返回 409 |
 | `GET /api/v1/sample/strategy` / `.../sample/logs.ndjson` | 可直接启动的示例 |
 | `GET /healthz` | 健康检查 + 主密钥指纹 |
 
@@ -151,6 +157,76 @@ print(json.dumps(json.load(r),ensure_ascii=False,indent=2))'
   "detector": "bank_card", "length": 19 }
 ```
 
+## 大批量 NDJSON 流式作业（multipart 上传）
+
+超过小批量 10 MiB 请求体上限、或需要断点续跑的 NDJSON 文件，走流式接口。上传后立即
+返回 `202` 与作业 id，后台逐行处理，用状态接口轮询进度；成功后原子发布结果文件，未完成
+（queued/running/failed/cancelled）一律不能下载。
+
+```bash
+# 1) 上传（multipart：file 为 NDJSON，strategy 为策略 JSON 文本）
+curl -sS -X POST http://127.0.0.1:8080/api/v1/stream-jobs \
+  -H "Idempotency-Key: incident-20260910-big-001" \
+  -F "strategy=<examples/sample-strategy.json;type=application/json" \
+  -F "file=@big-logs.ndjson;type=application/x-ndjson"
+# -> 202 {"replayed": false, "job": {"id": "…", "status": "queued", "progress_pct": 0.0, …}}
+
+# 2) 轮询状态与实时进度（已处理字节/记录/审计/风险）
+curl -sS http://127.0.0.1:8080/api/v1/stream-jobs/$JOB_ID
+# -> {"status":"running","bytes_total":…,"bytes_processed":…,
+#     "records_processed":12000,"audit_count":…,"risk_count":…,"progress_pct":63.2}
+
+# 3) 需要时取消（停在下一检查点边界，清理原始文件与未完成输出）
+curl -sS -X POST http://127.0.0.1:8080/api/v1/stream-jobs/$JOB_ID/cancel
+
+# 4) 分页查看审计与残留风险
+curl -sS "http://127.0.0.1:8080/api/v1/stream-jobs/$JOB_ID/audit?limit=200&offset=0"
+curl -sS "http://127.0.0.1:8080/api/v1/stream-jobs/$JOB_ID/risks?limit=200&offset=0"
+
+# 5) succeeded 后下载；非 succeeded 返回 409
+curl -fS http://127.0.0.1:8080/api/v1/stream-jobs/$JOB_ID/download -o redacted.ndjson
+```
+
+Python（requests，流式友好）：
+
+```python
+import requests, time
+
+with open("big-logs.ndjson", "rb") as f:
+    r = requests.post(
+        "http://127.0.0.1:8080/api/v1/stream-jobs",
+        headers={"Idempotency-Key": "incident-20260910-big-001"},
+        files={"file": ("big-logs.ndjson", f, "application/x-ndjson")},
+        data={"strategy": open("examples/sample-strategy.json", encoding="utf-8").read()},
+        timeout=300,
+    )
+r.raise_for_status()  # 409=同键但文件/策略与上次不一致
+job = r.json()["job"]
+while job["status"] in ("queued", "running"):
+    time.sleep(2)
+    job = requests.get(f"http://127.0.0.1:8080/api/v1/stream-jobs/{job['id']}").json()
+assert job["status"] == "succeeded", job
+with open("redacted.ndjson", "wb") as out:
+    with requests.get(f"http://127.0.0.1:8080/api/v1/stream-jobs/{job['id']}/download",
+                      stream=True) as dl:
+        for chunk in dl.iter_content(1 << 20):
+            out.write(chunk)
+```
+
+流式作业的关键保证：
+
+- **不落整包到内存**：上传按 1 MiB 块拷贝到 `$REDACTOR_DATA_DIR/streams/raw/`（0600），
+  worker 按二进制行读取，仅维护检查点级缓冲。
+- **安全检查点**：默认每 100 条记录（`REDACTOR_CHECKPOINT_RECORDS` 可调）先 fsync 输出、
+  再在同一事务提交字节偏移、记录/审计/风险计数。服务在任意时刻被 kill，重启后从最近检查点
+  继续，partial 输出严格截断到检查点字节，不会重复或 NUL 填充。
+- **原子发布**：全部记录处理完后 `rename` 到 `streams/out/{id}.ndjson`；即使在发布后、
+  状态落库前崩溃，重启也会校验成品（可解析且记录数与检查点一致）并补登 succeeded。
+- **清理**：成功后删除原始文件、保留成品；失败/取消同时删除原始文件与未完成输出。
+- **幂等含策略**：`Idempotency-Key` 同时绑定文件 SHA-256 与**规范化策略 SHA-256**；
+  同键同文件但策略不同返回 409，不会回放旧策略的结果（仅 JSON 排版差异不算不同策略）。
+- **格式错误**：记录物理行号（空行占行号不占记录序号），作业置 failed，错误行不写入输出。
+
 ## 本地密钥
 
 - 默认：首次启动在数据目录生成 **32 字节原始随机**密钥 `data/master.key`（以 0600 权限
@@ -173,16 +249,17 @@ print(json.dumps(json.load(r),ensure_ascii=False,indent=2))'
 
 | 环境变量 | 默认 | 说明 |
 | --- | --- | --- |
-| `REDACTOR_DATA_DIR` | `./data` | SQLite、主密钥、脱敏输出文件（`jobs/`）目录 |
+| `REDACTOR_DATA_DIR` | `./data` | SQLite、主密钥、脱敏输出文件（`jobs/`）与流式作业临时/成品文件（`streams/raw|partial|out/`）目录 |
 | `REDACTOR_MASTER_KEY` | 自动生成文件 | 确定性令牌主密钥 |
+| `REDACTOR_CHECKPOINT_RECORDS` | `100` | 流式作业每处理多少条记录做一次安全检查点（1–10000） |
 
-请求体上限 10 MiB（本地批量场景）。SQLite 位于 `$REDACTOR_DATA_DIR/redactor.db`，
-审计/风险表只存位置与动作，不存任何原始敏感值。
+小批量 JSON 接口请求体上限 10 MiB；**流式 multipart 上传不受此限**（逐块落盘）。
+SQLite 位于 `$REDACTOR_DATA_DIR/redactor.db`，审计/风险表只存位置与动作，不存任何原始敏感值。
 
 ## 测试
 
 ```bash
-python -m pytest -q        # 51 个用例：识别器、路径通配、动作、确定性、API、幂等、下载
+python -m pytest -q        # 99 个用例：识别器、路径通配、动作、确定性、API、幂等、流式作业（取消/检查点恢复/原子发布）、下载
 ```
 
 ## 安全边界（请知悉）

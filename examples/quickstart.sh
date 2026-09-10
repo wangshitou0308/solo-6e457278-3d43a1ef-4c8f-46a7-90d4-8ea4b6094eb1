@@ -47,3 +47,7 @@ echo "== 4. 下载脱敏文件 =="
 curl -fsS "$BASE/api/v1/jobs/$JOB_ID/download" -o /tmp/redacted.ndjson
 echo "已下载到 /tmp/redacted.ndjson："
 cat /tmp/redacted.ndjson
+
+echo
+echo "大文件（超过 10 MiB / 需要断点续跑）请用 multipart 流式作业："
+echo "  bash examples/stream-large-file.sh /path/to/big.ndjson"
