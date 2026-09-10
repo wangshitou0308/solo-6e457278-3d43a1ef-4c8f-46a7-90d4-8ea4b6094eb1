@@ -166,8 +166,8 @@ class CreateJobRequest(BatchPayload):
 class AuditEntry(BaseModel):
     """审计清单中的一条。按设计不含任何原始值。"""
 
-    record_index: int = Field(description="记录在批次中的序号（从 0 开始）")
-    line_no: int | None = Field(default=None, description="NDJSON 输入时的行号（从 1 开始）")
+    record_index: int = Field(description="记录在批次/来源文件中的序号（从 0 开始）")
+    line_no: int | None = Field(default=None, description="NDJSON/文本输入时的行号（从 1 开始）")
     field_path: str
     key_name: str | None = None
     rule_id: str
@@ -176,6 +176,9 @@ class AuditEntry(BaseModel):
     match_type: Literal["field", "content"]
     hit_by: list[str] = Field(description="命中维度/识别器/正则名称")
     occurrences: int = Field(default=1, description="该位置内容动作的替换次数")
+    source_path: str | None = Field(
+        default=None, description="诊断包作业中来源文件在压缩包内的相对路径"
+    )
 
 
 class RiskFinding(BaseModel):
@@ -186,6 +189,9 @@ class RiskFinding(BaseModel):
     field_path: str
     detector: str
     length: int = Field(description="命中片段长度，便于人工判断")
+    source_path: str | None = Field(
+        default=None, description="诊断包作业中来源文件在压缩包内的相对路径"
+    )
 
 
 class ActionStat(BaseModel):
@@ -323,3 +329,93 @@ class RiskPage(BaseModel):
     limit: int
     offset: int
     items: list[RiskFinding]
+
+
+# ---------- 诊断包（ZIP）作业 ----------
+
+BundleJobStatus = Literal["queued", "running", "succeeded", "failed", "cancelled"]
+
+# 诊断包内可处理的文件类型（按扩展名归类）
+BundleFileFormat = Literal["json", "ndjson", "text"]
+
+
+class BundleFileInfo(BaseModel):
+    """清单中单个来源文件的处理结果（不含任何原始内容）。"""
+
+    path: str = Field(description="来源文件在压缩包内的相对路径")
+    status: Literal["redacted", "skipped", "failed"] = Field(
+        description="redacted=已脱敏并写入结果；skipped=按策略不处理（二进制/不支持类型/"
+                    "保留名冲突）；failed=处理失败（如 JSON 解析错误）"
+    )
+    reason: str | None = Field(default=None, description="skipped/failed 的原因（不含原值）")
+    format: BundleFileFormat | None = Field(default=None, description="识别出的文件类型")
+    records: int = Field(default=0, description="结构化文件的记录数")
+    lines: int = Field(default=0, description="文本/NDJSON 文件的物理行数")
+    audit_entries: int = 0
+    risk_findings: int = 0
+    output_path: str | None = Field(
+        default=None, description="结果 ZIP 内的相对路径（skipped/failed 为 null）"
+    )
+    size_in: int = Field(default=0, description="来源文件解压后字节数")
+    size_out: int = Field(default=0, description="脱敏输出字节数")
+
+
+class BundleManifest(BaseModel):
+    """结果 ZIP 内的清单（redaction-manifest.json），同样不含任何原始值。"""
+
+    job_id: str
+    created_at: str
+    completed_at: str | None = None
+    strategy_name: str
+    strategy_version: str
+    source_filename: str
+    source_sha256: str = Field(description="上传压缩包的 SHA-256，不可逆推内容")
+    key_fingerprint: str
+    stats: dict[str, Any] = Field(description="汇总统计（文件/记录/审计/风险计数）")
+    files: list[BundleFileInfo]
+
+
+class BundleJobModel(BaseModel):
+    id: str
+    idempotency_key: str | None = None
+    created_at: str
+    updated_at: str | None = None
+    status: BundleJobStatus
+    strategy_name: str
+    strategy_version: str
+    source_filename: str = Field(description="上传时的原始文件名（仅展示用）")
+    bytes_total: int = Field(default=0, description="上传压缩包字节数（压缩态）")
+    files_total: int = Field(default=0, description="压缩包内文件条目数（不含目录）")
+    files_processed: int = Field(default=0, description="已完成处理（含跳过）的文件数")
+    records_processed: int = 0
+    audit_count: int = 0
+    risk_count: int = 0
+    fields_scanned: int = 0
+    by_action: dict[str, int] = Field(default_factory=dict)
+    by_rule: dict[str, int] = Field(default_factory=dict)
+    current_file: str | None = Field(default=None, description="正在处理的包内相对路径")
+    error_message: str | None = None
+    output_filename: str | None = Field(default=None, description="成功发布后的文件名")
+    output_bytes: int = 0
+    key_fingerprint: str
+    content_sha256: str = Field(description="上传压缩包 SHA-256，用于幂等冲突判定")
+    strategy_sha256: str = Field(default="", description="规范化策略 SHA-256，参与幂等一致性判定")
+    progress_pct: float = 0.0
+    download_url: str | None = None
+
+
+class BundleJobSummary(BaseModel):
+    id: str
+    created_at: str
+    status: BundleJobStatus
+    strategy_name: str
+    files_total: int
+    files_processed: int
+    records_processed: int
+    risk_count: int
+    progress_pct: float
+
+
+class BundleJobList(BaseModel):
+    items: list[BundleJobSummary]
+    total: int

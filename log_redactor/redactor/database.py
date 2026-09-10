@@ -15,6 +15,9 @@ from .config import settings
 from .models import (
     AuditEntry,
     AuditPage,
+    BundleFileInfo,
+    BundleJobModel,
+    BundleJobSummary,
     JobDetail,
     JobModel,
     JobSummary,
@@ -123,6 +126,83 @@ CREATE TABLE IF NOT EXISTS stream_risks (
 );
 CREATE INDEX IF NOT EXISTS idx_stream_audit_job ON stream_audit(job_id);
 CREATE INDEX IF NOT EXISTS idx_stream_risks_job ON stream_risks(job_id);
+
+-- 诊断包（ZIP）作业：逐文件处理、文件级安全检查点、可取消、可恢复
+CREATE TABLE IF NOT EXISTS bundle_jobs (
+    id TEXT PRIMARY KEY,
+    idempotency_key TEXT UNIQUE,
+    created_at TEXT NOT NULL,
+    updated_at TEXT,
+    status TEXT NOT NULL,
+    strategy_json TEXT NOT NULL,
+    strategy_name TEXT NOT NULL,
+    strategy_version TEXT NOT NULL,
+    source_filename TEXT NOT NULL,
+    content_sha256 TEXT NOT NULL,
+    strategy_sha256 TEXT NOT NULL DEFAULT '',
+    bytes_total INTEGER NOT NULL DEFAULT 0,
+    files_total INTEGER NOT NULL DEFAULT 0,
+    files_processed INTEGER NOT NULL DEFAULT 0,
+    records_processed INTEGER NOT NULL DEFAULT 0,
+    audit_count INTEGER NOT NULL DEFAULT 0,
+    risk_count INTEGER NOT NULL DEFAULT 0,
+    fields_scanned INTEGER NOT NULL DEFAULT 0,
+    by_action_json TEXT NOT NULL DEFAULT '{}',
+    by_rule_json TEXT NOT NULL DEFAULT '{}',
+    current_file TEXT,
+    error_message TEXT,
+    output_filename TEXT,
+    output_bytes INTEGER NOT NULL DEFAULT 0,
+    cancel_requested INTEGER NOT NULL DEFAULT 0,
+    key_fingerprint TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_bundle_jobs_status ON bundle_jobs(status);
+-- 每个来源文件一行：文件级检查点边界；恢复时据此跳过已完成文件
+CREATE TABLE IF NOT EXISTS bundle_files (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    job_id TEXT NOT NULL,
+    path TEXT NOT NULL,
+    status TEXT NOT NULL,
+    reason TEXT,
+    format TEXT,
+    records INTEGER NOT NULL DEFAULT 0,
+    lines INTEGER NOT NULL DEFAULT 0,
+    audit_entries INTEGER NOT NULL DEFAULT 0,
+    risk_findings INTEGER NOT NULL DEFAULT 0,
+    output_path TEXT,
+    size_in INTEGER NOT NULL DEFAULT 0,
+    size_out INTEGER NOT NULL DEFAULT 0,
+    UNIQUE(job_id, path)
+);
+CREATE INDEX IF NOT EXISTS idx_bundle_files_job ON bundle_files(job_id);
+-- 诊断包审计/风险比流式表多 source_path（来源文件相对路径），不含原值
+CREATE TABLE IF NOT EXISTS bundle_audit (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    job_id TEXT NOT NULL,
+    source_path TEXT NOT NULL,
+    record_index INTEGER NOT NULL,
+    line_no INTEGER,
+    field_path TEXT NOT NULL,
+    key_name TEXT,
+    rule_id TEXT NOT NULL,
+    rule_name TEXT NOT NULL,
+    action TEXT NOT NULL,
+    match_type TEXT NOT NULL,
+    hit_by_json TEXT NOT NULL,
+    occurrences INTEGER NOT NULL
+);
+CREATE TABLE IF NOT EXISTS bundle_risks (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    job_id TEXT NOT NULL,
+    source_path TEXT NOT NULL,
+    record_index INTEGER NOT NULL,
+    line_no INTEGER,
+    field_path TEXT NOT NULL,
+    detector TEXT NOT NULL,
+    length INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_bundle_audit_job ON bundle_audit(job_id);
+CREATE INDEX IF NOT EXISTS idx_bundle_risks_job ON bundle_risks(job_id);
 """
 
 
@@ -656,5 +736,369 @@ class Database:
         with self._conn() as conn:
             return conn.execute(
                 "SELECT * FROM stream_jobs WHERE status IN ('queued','running') "
+                "ORDER BY created_at ASC"
+            ).fetchall()
+
+    # ---------- 诊断包（ZIP）作业 ----------
+
+    @staticmethod
+    def _bundle_row_to_model(row: sqlite3.Row) -> BundleJobModel:
+        files_total = row["files_total"] or 0
+        files_processed = row["files_processed"] or 0
+        pct = round(files_processed * 100.0 / files_total, 2) if files_total else 0.0
+        status = row["status"]
+        if status == "succeeded":
+            pct = 100.0
+        output_filename = row["output_filename"]
+        job_id = row["id"]
+        return BundleJobModel(
+            id=job_id,
+            idempotency_key=row["idempotency_key"],
+            created_at=row["created_at"],
+            updated_at=row["updated_at"],
+            status=status,
+            strategy_name=row["strategy_name"],
+            strategy_version=row["strategy_version"],
+            source_filename=row["source_filename"],
+            bytes_total=row["bytes_total"] or 0,
+            files_total=files_total,
+            files_processed=files_processed,
+            records_processed=row["records_processed"],
+            audit_count=row["audit_count"],
+            risk_count=row["risk_count"],
+            fields_scanned=row["fields_scanned"],
+            by_action=json.loads(row["by_action_json"] or "{}"),
+            by_rule=json.loads(row["by_rule_json"] or "{}"),
+            current_file=row["current_file"],
+            error_message=row["error_message"],
+            output_filename=output_filename,
+            output_bytes=row["output_bytes"] or 0,
+            key_fingerprint=row["key_fingerprint"],
+            content_sha256=row["content_sha256"],
+            strategy_sha256=row["strategy_sha256"],
+            progress_pct=pct,
+            download_url=(f"/api/v1/bundle-jobs/{job_id}/download"
+                          if status == "succeeded" and output_filename else None),
+        )
+
+    def create_bundle_job(
+        self,
+        *,
+        job_id: str,
+        idempotency_key: str | None,
+        strategy_json: str,
+        strategy_sha256: str,
+        source_filename: str,
+        content_sha256: str,
+        bytes_total: int,
+        files_total: int,
+        key_fingerprint: str,
+    ) -> BundleJobModel:
+        strategy = json.loads(strategy_json)
+        now = utcnow_iso()
+        with self._lock, self._conn() as conn:
+            conn.execute(
+                """INSERT INTO bundle_jobs (id, idempotency_key, created_at, updated_at,
+                   status, strategy_json, strategy_name, strategy_version,
+                   source_filename, content_sha256, strategy_sha256, bytes_total,
+                   files_total, key_fingerprint)
+                   VALUES (?,?,?,?, 'queued', ?,?,?,?,?,?,?,?,?)""",
+                (
+                    job_id, idempotency_key, now, now, strategy_json,
+                    strategy.get("name", ""), str(strategy.get("version", "1")),
+                    source_filename, content_sha256, strategy_sha256,
+                    bytes_total, files_total, key_fingerprint,
+                ),
+            )
+            row = conn.execute(
+                "SELECT * FROM bundle_jobs WHERE id = ?", (job_id,)
+            ).fetchone()
+        return self._bundle_row_to_model(row)
+
+    def get_bundle_job(self, job_id: str) -> BundleJobModel | None:
+        with self._conn() as conn:
+            row = conn.execute(
+                "SELECT * FROM bundle_jobs WHERE id = ?", (job_id,)
+            ).fetchone()
+        return self._bundle_row_to_model(row) if row else None
+
+    def get_bundle_strategy_json(self, job_id: str) -> str | None:
+        with self._conn() as conn:
+            row = conn.execute(
+                "SELECT strategy_json FROM bundle_jobs WHERE id = ?", (job_id,)
+            ).fetchone()
+        return row["strategy_json"] if row else None
+
+    def get_bundle_idempotent(self, key: str) -> sqlite3.Row | None:
+        with self._conn() as conn:
+            return conn.execute(
+                "SELECT id, content_sha256, strategy_sha256 FROM bundle_jobs "
+                "WHERE idempotency_key = ?",
+                (key,),
+            ).fetchone()
+
+    def update_bundle_current_file(self, job_id: str, path: str | None) -> None:
+        """装饰性进度：记录正在处理的包内文件（不参与恢复状态）。"""
+        with self._lock, self._conn() as conn:
+            conn.execute(
+                "UPDATE bundle_jobs SET updated_at=?, status='running', "
+                "current_file=? WHERE id=?",
+                (utcnow_iso(), path, job_id),
+            )
+
+    def checkpoint_bundle_file(
+        self,
+        job_id: str,
+        *,
+        file_row: BundleFileInfo,
+        files_processed: int,
+        records_processed: int,
+        audit_count: int,
+        risk_count: int,
+        fields_scanned: int,
+        by_action: dict[str, int],
+        by_rule: dict[str, int],
+        audit: list[AuditEntry],
+        risks: list[RiskFinding],
+    ) -> None:
+        """文件级安全检查点：文件结果行、进度与本文件审计/风险同事务落库。
+
+        调用方保证该文件的脱敏输出已 fsync 并原子 rename 到暂存区，
+        因此崩溃后不会出现“已提交但无输出”的文件。
+        """
+        with self._lock, self._conn() as conn:
+            conn.execute(
+                """INSERT INTO bundle_files (job_id, path, status, reason, format,
+                   records, lines, audit_entries, risk_findings, output_path,
+                   size_in, size_out) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)""",
+                (
+                    job_id, file_row.path, file_row.status, file_row.reason,
+                    file_row.format, file_row.records, file_row.lines,
+                    file_row.audit_entries, file_row.risk_findings,
+                    file_row.output_path, file_row.size_in, file_row.size_out,
+                ),
+            )
+            conn.execute(
+                """UPDATE bundle_jobs SET updated_at=?, status='running',
+                   files_processed=?, records_processed=?, audit_count=?,
+                   risk_count=?, fields_scanned=?, by_action_json=?,
+                   by_rule_json=?, current_file=NULL WHERE id=?""",
+                (
+                    utcnow_iso(), files_processed, records_processed, audit_count,
+                    risk_count, fields_scanned,
+                    json.dumps(by_action, ensure_ascii=False),
+                    json.dumps(by_rule, ensure_ascii=False), job_id,
+                ),
+            )
+            if audit:
+                conn.executemany(
+                    """INSERT INTO bundle_audit (job_id, source_path, record_index,
+                       line_no, field_path, key_name, rule_id, rule_name, action,
+                       match_type, hit_by_json, occurrences)
+                       VALUES (?,?,?,?,?,?,?,?,?,?,?,?)""",
+                    [
+                        (
+                            job_id, a.source_path or file_row.path, a.record_index,
+                            a.line_no, a.field_path, a.key_name, a.rule_id,
+                            a.rule_name, a.action, a.match_type,
+                            json.dumps(a.hit_by, ensure_ascii=False), a.occurrences,
+                        )
+                        for a in audit
+                    ],
+                )
+            if risks:
+                conn.executemany(
+                    """INSERT INTO bundle_risks (job_id, source_path, record_index,
+                       line_no, field_path, detector, length)
+                       VALUES (?,?,?,?,?,?,?)""",
+                    [
+                        (
+                            job_id, r.source_path or file_row.path, r.record_index,
+                            r.line_no, r.field_path, r.detector, r.length,
+                        )
+                        for r in risks
+                    ],
+                )
+
+    def bundle_done_files(self, job_id: str) -> set[str]:
+        """已在检查点落库的文件路径（恢复时跳过，避免重复处理/重复审计）。"""
+        with self._conn() as conn:
+            rows = conn.execute(
+                "SELECT path FROM bundle_files WHERE job_id=?", (job_id,)
+            ).fetchall()
+        return {r["path"] for r in rows}
+
+    def bundle_files_for_manifest(self, job_id: str) -> list[BundleFileInfo]:
+        with self._conn() as conn:
+            rows = conn.execute(
+                "SELECT * FROM bundle_files WHERE job_id=? ORDER BY id ASC", (job_id,)
+            ).fetchall()
+        return [
+            BundleFileInfo(
+                path=r["path"], status=r["status"], reason=r["reason"],
+                format=r["format"], records=r["records"], lines=r["lines"],
+                audit_entries=r["audit_entries"], risk_findings=r["risk_findings"],
+                output_path=r["output_path"], size_in=r["size_in"],
+                size_out=r["size_out"],
+            )
+            for r in rows
+        ]
+
+    def mark_bundle_succeeded(
+        self, job_id: str, *, output_filename: str, output_bytes: int
+    ) -> BundleJobModel | None:
+        with self._lock, self._conn() as conn:
+            conn.execute(
+                """UPDATE bundle_jobs SET status='succeeded', updated_at=?,
+                   cancel_requested=0, current_file=NULL, output_filename=?,
+                   output_bytes=? WHERE id=?""",
+                (utcnow_iso(), output_filename, output_bytes, job_id),
+            )
+            row = conn.execute(
+                "SELECT * FROM bundle_jobs WHERE id = ?", (job_id,)
+            ).fetchone()
+        return self._bundle_row_to_model(row) if row else None
+
+    def reconcile_published_bundle_job(
+        self, job_id: str, *, output_filename: str, output_bytes: int
+    ) -> BundleJobModel | None:
+        """崩溃恢复对账：成品 ZIP 已发布但状态事务未提交时补登 succeeded。"""
+        with self._lock, self._conn() as conn:
+            conn.execute(
+                """UPDATE bundle_jobs SET status='succeeded', updated_at=?,
+                   cancel_requested=0, current_file=NULL, output_filename=?,
+                   output_bytes=? WHERE id=? AND status IN ('queued','running')""",
+                (utcnow_iso(), output_filename, output_bytes, job_id),
+            )
+            row = conn.execute(
+                "SELECT * FROM bundle_jobs WHERE id = ?", (job_id,)
+            ).fetchone()
+        return self._bundle_row_to_model(row) if row else None
+
+    def mark_bundle_failed(
+        self, job_id: str, *, message: str
+    ) -> BundleJobModel | None:
+        with self._lock, self._conn() as conn:
+            conn.execute(
+                """UPDATE bundle_jobs SET status='failed', updated_at=?,
+                   error_message=?, current_file=NULL WHERE id=?""",
+                (utcnow_iso(), message, job_id),
+            )
+            row = conn.execute(
+                "SELECT * FROM bundle_jobs WHERE id = ?", (job_id,)
+            ).fetchone()
+        return self._bundle_row_to_model(row) if row else None
+
+    def mark_bundle_cancelled(self, job_id: str) -> BundleJobModel | None:
+        with self._lock, self._conn() as conn:
+            conn.execute(
+                """UPDATE bundle_jobs SET status='cancelled', updated_at=?,
+                   cancel_requested=0, current_file=NULL WHERE id=?""",
+                (utcnow_iso(), job_id),
+            )
+            row = conn.execute(
+                "SELECT * FROM bundle_jobs WHERE id = ?", (job_id,)
+            ).fetchone()
+        return self._bundle_row_to_model(row) if row else None
+
+    def request_bundle_cancel(self, job_id: str) -> None:
+        """持久化取消意图：服务重启后恢复作业时仍会被取消。"""
+        with self._lock, self._conn() as conn:
+            conn.execute(
+                "UPDATE bundle_jobs SET cancel_requested=1, updated_at=? "
+                "WHERE id=? AND status IN ('queued','running')",
+                (utcnow_iso(), job_id),
+            )
+
+    def bundle_cancel_requested(self, job_id: str) -> bool:
+        with self._conn() as conn:
+            row = conn.execute(
+                "SELECT cancel_requested FROM bundle_jobs WHERE id=?", (job_id,)
+            ).fetchone()
+        return bool(row and row["cancel_requested"])
+
+    def list_bundle_jobs(
+        self, *, status: str | None = None, limit: int = 50, offset: int = 0
+    ) -> tuple[list[BundleJobSummary], int]:
+        where = "WHERE status = ?" if status is not None else ""
+        params: tuple[Any, ...] = (status,) if status is not None else ()
+        with self._conn() as conn:
+            total = conn.execute(
+                f"SELECT COUNT(*) AS c FROM bundle_jobs {where}", params
+            ).fetchone()["c"]
+            rows = conn.execute(
+                f"""SELECT * FROM bundle_jobs {where}
+                    ORDER BY created_at DESC, rowid DESC LIMIT ? OFFSET ?""",
+                params + (limit, offset),
+            ).fetchall()
+        items = []
+        for r in rows:
+            m = self._bundle_row_to_model(r)
+            items.append(
+                BundleJobSummary(
+                    id=m.id, created_at=m.created_at, status=m.status,
+                    strategy_name=m.strategy_name, files_total=m.files_total,
+                    files_processed=m.files_processed,
+                    records_processed=m.records_processed, risk_count=m.risk_count,
+                    progress_pct=m.progress_pct,
+                )
+            )
+        return items, total
+
+    def _bundle_audit_row(self, r: sqlite3.Row) -> AuditEntry:
+        return AuditEntry(
+            record_index=r["record_index"], line_no=r["line_no"],
+            field_path=r["field_path"], key_name=r["key_name"],
+            rule_id=r["rule_id"], rule_name=r["rule_name"], action=r["action"],
+            match_type=r["match_type"], hit_by=json.loads(r["hit_by_json"]),
+            occurrences=r["occurrences"], source_path=r["source_path"],
+        )
+
+    def _bundle_risk_row(self, r: sqlite3.Row) -> RiskFinding:
+        return RiskFinding(
+            record_index=r["record_index"], line_no=r["line_no"],
+            field_path=r["field_path"], detector=r["detector"], length=r["length"],
+            source_path=r["source_path"],
+        )
+
+    def paginate_bundle_audit(
+        self, job_id: str, *, limit: int, offset: int
+    ) -> AuditPage:
+        with self._conn() as conn:
+            total = conn.execute(
+                "SELECT COUNT(*) AS c FROM bundle_audit WHERE job_id=?", (job_id,)
+            ).fetchone()["c"]
+            rows = conn.execute(
+                """SELECT * FROM bundle_audit WHERE job_id=?
+                   ORDER BY id ASC LIMIT ? OFFSET ?""",
+                (job_id, limit, offset),
+            ).fetchall()
+        return AuditPage(
+            job_id=job_id, total=total, limit=limit, offset=offset,
+            items=[self._bundle_audit_row(r) for r in rows],
+        )
+
+    def paginate_bundle_risks(
+        self, job_id: str, *, limit: int, offset: int
+    ) -> RiskPage:
+        with self._conn() as conn:
+            total = conn.execute(
+                "SELECT COUNT(*) AS c FROM bundle_risks WHERE job_id=?", (job_id,)
+            ).fetchone()["c"]
+            rows = conn.execute(
+                """SELECT * FROM bundle_risks WHERE job_id=?
+                   ORDER BY id ASC LIMIT ? OFFSET ?""",
+                (job_id, limit, offset),
+            ).fetchall()
+        return RiskPage(
+            job_id=job_id, total=total, limit=limit, offset=offset,
+            items=[self._bundle_risk_row(r) for r in rows],
+        )
+
+    def resumable_bundle_jobs(self) -> list[sqlite3.Row]:
+        """服务重启后需要恢复的诊断包作业（含重启前请求取消的）。"""
+        with self._conn() as conn:
+            return conn.execute(
+                "SELECT * FROM bundle_jobs WHERE status IN ('queued','running') "
                 "ORDER BY created_at ASC"
             ).fetchall()

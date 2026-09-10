@@ -423,6 +423,20 @@ class RedactionEngine:
         self._scan_risks(out, idx, "")
         return out
 
+    def process_text_line(self, text: str, idx: int,
+                          line_no: int | None = None) -> str:
+        """处理一行非结构化文本（.log/.txt）：仅内容规则生效。
+
+        整字段规则依赖 JSON 结构（字段路径/键名），对纯文本行没有意义；
+        内容规则（value_patterns/detectors）按行内片段替换。审计/风险的
+        field_path 恒为 ``$``，位置由 line_no（行号）与 record_index 表达。
+        """
+        self.current_line_no = line_no
+        self.fields_scanned += 1
+        out = self._apply_content_rules(text, idx, "", None)
+        self._scan_risks(out, idx, "")
+        return out
+
     def drain_events(self) -> tuple[list[AuditEntry], list[RiskFinding]]:
         """取出并清空自上次排空以来累积的审计与风险事件（检查点调用）。"""
         audit, self.audit = self.audit, []
