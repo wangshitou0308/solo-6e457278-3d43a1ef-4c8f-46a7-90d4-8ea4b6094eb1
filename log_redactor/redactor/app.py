@@ -9,6 +9,13 @@
 * ``GET  /api/v1/jobs/{job_id}/records`` 脱敏后记录
 * ``GET  /api/v1/jobs/{job_id}/audit``  仅取审计清单
 * ``GET  /api/v1/jobs/{job_id}/download`` 下载脱敏文件（保持 JSON/NDJSON）
+* ``POST /api/v1/stream-jobs``          大批量 NDJSON：multipart 上传，流式作业
+* ``GET  /api/v1/stream-jobs``          流式作业列表（可按状态过滤、分页）
+* ``GET  /api/v1/stream-jobs/{job_id}`` 流式作业状态与实时进度
+* ``POST /api/v1/stream-jobs/{job_id}/cancel`` 取消作业（可跨重启生效）
+* ``GET  /api/v1/stream-jobs/{job_id}/audit`` 分页审计清单
+* ``GET  /api/v1/stream-jobs/{job_id}/risks`` 分页残留风险
+* ``GET  /api/v1/stream-jobs/{job_id}/download`` 下载已完成的 NDJSON 结果
 * ``GET  /api/v1/sample/strategy``、``/sample/logs.ndjson``  可直接启动的示例
 * ``GET  /healthz``                     健康检查（含主密钥指纹）
 
@@ -16,14 +23,18 @@
 """
 from __future__ import annotations
 
+import hashlib
 import json
+import os
 import sqlite3
 import uuid
 from pathlib import Path
 from typing import Any
 
-from fastapi import FastAPI, Header, HTTPException, Query, Request
-from fastapi.responses import JSONResponse, Response
+from contextlib import asynccontextmanager
+
+from fastapi import FastAPI, File, Form, Header, HTTPException, Query, Request, UploadFile
+from fastapi.responses import FileResponse, JSONResponse, Response
 from fastapi.openapi.utils import get_openapi
 
 from . import config
@@ -42,16 +53,32 @@ from .models import (
 )
 from .parsing import ParsedBatch, PayloadError, parse_batch
 from .samples import sample_ndjson, sample_strategy_dict
+from .stream_jobs import (
+    ensure_stream_dirs,
+    final_output_path,
+    raw_path,
+    recover_stream_jobs,
+    registry as stream_registry,
+    run_stream_job,
+)
 
-MAX_BODY_BYTES = 10 * 1024 * 1024  # 10 MiB，本地工具足够，同时防止误提交巨型文件
+MAX_BODY_BYTES = 10 * 1024 * 1024  # 10 MiB，小批量 JSON 接口的请求体上限
+# 流式上传走 multipart 落盘，不受小批量请求体上限约束
+STREAM_UPLOAD_PATH = "/api/v1/stream-jobs"
+UPLOAD_CHUNK = 1024 * 1024  # 1 MiB：multipart 流式落盘的拷贝块大小
 
 app = FastAPI(
     title="本地日志脱敏 API",
-    version="1.0.0",
+    version="1.1.0",
     description=(
         "供后端团队提交故障样本前使用的本地日志脱敏服务。支持按字段路径/键名/正则/内置识别器"
         "（邮箱、手机号、IP、访问令牌、身份证、银行卡）命中，动作包括删除、掩码与基于本地"
-        "密钥的确定性令牌化；生成不含原值的审计清单，并对残留高风险内容标记需复核。"
+        "密钥的确定性令牌化；生成不含原值的审计清单，并对残留高风险内容标记需复核。\n\n"
+        "## 大批量 NDJSON 流式作业（stream-jobs）\n"
+        "通过 multipart/form-data 上传大文件，原始文件以 0600 权限临时落盘，服务逐行解析、"
+        "脱敏并定期写入安全检查点（字节偏移/记录数/审计数/风险数），不把整包读入内存；"
+        "支持 Idempotency-Key 内容校验（同键不同内容返回 409）、取消、服务重启后从检查点"
+        "继续、格式错误记录行号并终止；成功后原子发布结果文件，未完成作业不可下载。"
     ),
     contact={"name": "platform-security"},
 )
@@ -73,6 +100,18 @@ def get_master_key() -> MasterKey:
     if master_key is None:
         master_key = MasterKey.load()
     return master_key
+
+
+@asynccontextmanager
+async def lifespan(_app: FastAPI):
+    # 服务启动：确保目录就位，并从安全检查点恢复未完成的流式作业
+    ensure_stream_dirs()
+    recover_stream_jobs(get_db, get_master_key)
+    yield
+
+
+# app 在本函数之前构造，此处补挂生命周期（恢复未完成的流式作业）
+app.router.lifespan_context = lifespan
 
 
 def _execute(payload: BatchPayload) -> tuple[ParsedBatch, RunResult]:
@@ -101,11 +140,14 @@ def _run_response(result: RunResult) -> dict[str, Any]:
 
 @app.middleware("http")
 async def _limit_body(request: Request, call_next):
+    # multipart 流式上传逐块落盘、不读入内存，豁免小批量 10 MiB 请求体上限
+    exempt = request.method == "POST" and request.url.path == STREAM_UPLOAD_PATH
     cl = request.headers.get("content-length")
-    if cl and cl.isdigit() and int(cl) > MAX_BODY_BYTES:
+    if not exempt and cl and cl.isdigit() and int(cl) > MAX_BODY_BYTES:
         return JSONResponse(
             status_code=413,
-            content={"message": f"请求体超过 {MAX_BODY_BYTES} 字节限制"},
+            content={"message": f"请求体超过 {MAX_BODY_BYTES} 字节限制；"
+                                f"大文件请改用 {STREAM_UPLOAD_PATH} multipart 上传"},
         )
     return await call_next(request)
 
@@ -303,6 +345,249 @@ def download_job(job_id: str) -> Response:
         content=raw,
         media_type=f"{media}; charset=utf-8",
         headers={"Content-Disposition": f'attachment; filename="redacted-{job.output_filename}"'},
+    )
+
+
+# ---------- 大批量 NDJSON 流式作业 ----------
+
+
+def _ensure_recovery() -> None:
+    """未触发 lifespan 的部署形态（如测试/嵌入式）下惰性恢复一次。"""
+    ensure_stream_dirs()
+    recover_stream_jobs(get_db, get_master_key)
+
+
+def _stream_job_dict(job) -> dict[str, Any]:
+    return job.model_dump(mode="json")
+
+
+def _require_stream_job(job_id: str):
+    job = get_db().get_stream_job(job_id)
+    if not job:
+        raise HTTPException(status_code=404, detail=f"流式作业不存在: {job_id}")
+    return job
+
+
+@app.post(
+    "/api/v1/stream-jobs",
+    tags=["stream-jobs"],
+    summary="上传 NDJSON 大文件并创建流式脱敏作业",
+    description=(
+        "以 `multipart/form-data` 上传：`file` 为 NDJSON 文件，`strategy` 为策略 JSON。"
+        "原始文件以 **0600** 权限临时落盘，服务**逐行**解析脱敏（不把整包读入内存），"
+        "并持续记录已处理字节数、记录数、审计数与残留风险数。\n\n"
+        "携带 `Idempotency-Key` 时：相同键且**内容 SHA-256 一致**直接回放首个作业（200）；"
+        "相同键但内容不同返回 **409 冲突**。作业可取消，服务重启后从安全检查点继续；"
+        "格式错误记录行号并终止。完成后原始文件即被删除并原子发布结果文件。"
+    ),
+    status_code=202,
+    responses={
+        200: {"description": "幂等命中，回放已有作业"},
+        202: {"description": "已接受上传，后台流式处理中"},
+        409: {"description": "Idempotency-Key 冲突（同键内容不同）"},
+        422: {"description": "策略非法或文件内容为空"},
+    },
+)
+async def create_stream_job(
+    strategy: str = Form(description="脱敏策略 JSON（与小批量接口同一结构）"),
+    file: UploadFile = File(description="NDJSON 日志文件，每行一个 JSON 值"),
+    idempotency_key: str | None = Header(
+        default=None, alias="Idempotency-Key",
+        description="同一键只回放内容一致的上传；内容不同返回 409",
+    ),
+) -> JSONResponse:
+    _ensure_recovery()
+
+    if idempotency_key is not None:
+        idempotency_key = idempotency_key.strip()
+        if len(idempotency_key) > 128:
+            raise HTTPException(status_code=400, detail="Idempotency-Key 最长 128 字符")
+
+    # 先校验策略（在拷贝大文件之前快速失败）
+    try:
+        strategy_model = Strategy.model_validate_json(strategy)
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail={"message": f"策略校验失败：{exc}"}) from exc
+
+    job_id = uuid.uuid4().hex
+    ensure_stream_dirs()
+    staged = raw_path(job_id)
+
+    # 逐块拷贝到 0600 临时文件：先以安全权限创建，再流式写入，避免权限窗口
+    digest = hashlib.sha256()
+    bytes_total = 0
+    fd = os.open(str(staged), os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+    try:
+        while True:
+            chunk = await file.read(UPLOAD_CHUNK)
+            if not chunk:
+                break
+            digest.update(chunk)
+            bytes_total += len(chunk)
+            os.write(fd, chunk)
+        os.fsync(fd)
+    finally:
+        os.close(fd)
+        await file.close()
+    os.chmod(staged, 0o600)
+
+    if bytes_total == 0:
+        staged.unlink(missing_ok=True)
+        raise HTTPException(status_code=422, detail={"message": "上传文件为空"})
+
+    content_sha = digest.hexdigest()
+    source_name = Path(file.filename or "upload.ndjson").name
+
+    # 幂等：同键同内容回放，同键异内容冲突（临时文件立即清理）
+    replayed = False
+    if idempotency_key:
+        row = get_db().get_stream_idempotent(idempotency_key)
+        if row is not None:
+            staged.unlink(missing_ok=True)
+            if row["content_sha256"] != content_sha:
+                raise HTTPException(
+                    status_code=409,
+                    detail={
+                        "message": "Idempotency-Key 已用于内容不同的上传",
+                        "existing_job_id": row["id"],
+                    },
+                )
+            existing = get_db().get_stream_job(row["id"])
+            return JSONResponse(
+                status_code=200,
+                content={"replayed": True, "job": _stream_job_dict(existing)},
+            )
+
+    try:
+        job = get_db().create_stream_job(
+            job_id=job_id,
+            idempotency_key=idempotency_key,
+            strategy_json=strategy_model.model_dump_json(),
+            source_filename=source_name,
+            content_sha256=content_sha,
+            bytes_total=bytes_total,
+            key_fingerprint=key_fingerprint(get_master_key()),
+        )
+    except sqlite3.IntegrityError:
+        # 并发使用相同幂等键：以先落库者为准
+        staged.unlink(missing_ok=True)
+        winner = (
+            get_db().get_stream_idempotent(idempotency_key) if idempotency_key else None
+        )
+        if winner:
+            existing = get_db().get_stream_job(winner["id"])
+            if winner["content_sha256"] == content_sha:
+                return JSONResponse(
+                    status_code=200,
+                    content={"replayed": True, "job": _stream_job_dict(existing)},
+                )
+            raise HTTPException(
+                status_code=409,
+                detail={"message": "Idempotency-Key 已用于内容不同的上传",
+                        "existing_job_id": winner["id"]},
+            )
+        raise
+
+    stream_registry.start(
+        job_id, lambda: run_stream_job(job_id, get_db, get_master_key)
+    )
+    job = get_db().get_stream_job(job_id)
+    return JSONResponse(
+        status_code=202, content={"replayed": False, "job": _stream_job_dict(job)}
+    )
+
+
+@app.get("/api/v1/stream-jobs", tags=["stream-jobs"],
+         summary="流式作业列表（可按状态过滤、分页）")
+def list_stream_jobs(
+    status: str | None = Query(default=None,
+                               description="queued/running/succeeded/failed/cancelled"),
+    limit: int = Query(default=50, ge=1, le=200),
+    offset: int = Query(default=0, ge=0),
+):
+    if status is not None and status not in (
+        "queued", "running", "succeeded", "failed", "cancelled"
+    ):
+        raise HTTPException(status_code=400, detail="非法 status 过滤值")
+    _ensure_recovery()
+    items, total = get_db().list_stream_jobs(status=status, limit=limit, offset=offset)
+    return {"total": total, "limit": limit, "offset": offset,
+            "items": [i.model_dump(mode="json") for i in items]}
+
+
+@app.get("/api/v1/stream-jobs/{job_id}", tags=["stream-jobs"],
+         summary="流式作业状态与实时进度",
+         description="返回作业状态、已处理字节数/记录数/审计数/风险数与进度百分比；"
+                     "失败时带格式错误行号。")
+def get_stream_job(job_id: str) -> dict[str, Any]:
+    _ensure_recovery()
+    job = _require_stream_job(job_id)
+    return _stream_job_dict(job)
+
+
+@app.post("/api/v1/stream-jobs/{job_id}/cancel", tags=["stream-jobs"],
+          summary="取消流式作业",
+          description="取消意图同时写入内存与数据库（重启后仍生效）；worker 在检查点"
+                      "边界停止，状态置为 cancelled，原始文件与未完成输出被清理。",
+          responses={409: {"description": "作业已终结，无法取消"}})
+def cancel_stream_job(job_id: str) -> dict[str, Any]:
+    job = _require_stream_job(job_id)
+    if job.status not in ("queued", "running"):
+        raise HTTPException(
+            status_code=409,
+            detail={"message": f"作业已处于终态 {job.status}，无法取消",
+                    "status": job.status},
+        )
+    get_db().request_stream_cancel(job_id)
+    stream_registry.request_cancel(job_id)
+    latest = get_db().get_stream_job(job_id)
+    return {"cancelling": True, "job": _stream_job_dict(latest)}
+
+
+@app.get("/api/v1/stream-jobs/{job_id}/audit", tags=["stream-jobs"],
+         summary="分页查询流式作业的审计清单（不含原始值）")
+def get_stream_job_audit(
+    job_id: str,
+    limit: int = Query(default=100, ge=1, le=1000),
+    offset: int = Query(default=0, ge=0),
+):
+    _require_stream_job(job_id)
+    page = get_db().paginate_stream_audit(job_id, limit=limit, offset=offset)
+    return page.model_dump(mode="json")
+
+
+@app.get("/api/v1/stream-jobs/{job_id}/risks", tags=["stream-jobs"],
+         summary="分页查询流式作业的残留风险")
+def get_stream_job_risks(
+    job_id: str,
+    limit: int = Query(default=100, ge=1, le=1000),
+    offset: int = Query(default=0, ge=0),
+):
+    _require_stream_job(job_id)
+    page = get_db().paginate_stream_risks(job_id, limit=limit, offset=offset)
+    return page.model_dump(mode="json")
+
+
+@app.get("/api/v1/stream-jobs/{job_id}/download", tags=["stream-jobs"],
+         summary="下载已完成的 NDJSON 脱敏结果",
+         description="仅 succeeded 作业可下载（原子发布的结果文件）；"
+                     "排队/运行/失败/取消的作业返回 409。",
+         responses={409: {"description": "作业未完成，结果不可下载"}})
+def download_stream_job(job_id: str):
+    job = _require_stream_job(job_id)
+    if job.status != "succeeded":
+        raise HTTPException(
+            status_code=409,
+            detail={"message": f"作业状态为 {job.status}，未完成作业不得下载",
+                    "status": job.status},
+        )
+    path = final_output_path(job_id)
+    if not path.exists():
+        raise HTTPException(status_code=410, detail="结果文件已被清理")
+    return FileResponse(
+        path,
+        media_type="application/x-ndjson; charset=utf-8",
+        filename=f"redacted-{job_id}.ndjson",
     )
 
 

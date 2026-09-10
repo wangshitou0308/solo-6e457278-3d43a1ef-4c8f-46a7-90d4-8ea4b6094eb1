@@ -205,6 +205,11 @@ class RedactionEngine:
         # (record_index, field_path)：被整字段规则处理过的叶子，
         # 残留风险扫描时整体跳过（掩码前缀可能形似原数据，如 z***@example.com）
         self._fully_handled: set[tuple[int, str]] = set()
+        # 当前记录对应的 NDJSON 行号；逐记录流式处理时由外部显式指定，
+        # 批量 run() 按记录序号推导（与历史行为一致）
+        self.current_line_no: int | None = None
+        # 已在检查点落库、已从 self.risks 排空的风险数；用于跨检查点维持上限
+        self.risk_base = 0
 
     def _token_str(self, raw: str) -> str:
         token = self._text_tokens.get(raw)
@@ -231,7 +236,9 @@ class RedactionEngine:
         self.audit.append(
             AuditEntry(
                 record_index=idx,
-                line_no=(idx + 1) if self.is_ndjson else None,
+                line_no=self.current_line_no
+                if self.is_ndjson and self.current_line_no is not None
+                else ((idx + 1) if self.is_ndjson else None),
                 field_path=display_path(path),
                 key_name=key,
                 rule_id=cr.rule.id,
@@ -363,8 +370,11 @@ class RedactionEngine:
         return self._apply_leaf(node, idx, path, key)
 
     # -- 残留风险扫描 --
+    def _risk_cap_reached(self) -> bool:
+        return self.risk_base + len(self.risks) >= MAX_RISK_FINDINGS
+
     def _scan_risks(self, node: Any, idx: int, path: str) -> None:
-        if len(self.risks) >= MAX_RISK_FINDINGS:
+        if self._risk_cap_reached():
             return
         if isinstance(node, dict):
             for k, v in node.items():
@@ -384,26 +394,47 @@ class RedactionEngine:
                     self.risks.append(
                         RiskFinding(
                             record_index=idx,
-                            line_no=(idx + 1) if self.is_ndjson else None,
+                            line_no=self.current_line_no
+                            if self.is_ndjson and self.current_line_no is not None
+                            else ((idx + 1) if self.is_ndjson else None),
                             field_path=display_path(path),
                             detector=det_name,
                             length=e - s,
                         )
                     )
-                    if len(self.risks) >= MAX_RISK_FINDINGS:
+                    if self._risk_cap_reached():
                         return
+
+    # -- 逐记录流式处理 --
+
+    def process_record(self, record: Any, idx: int,
+                       line_no: int | None = None) -> Any:
+        """处理单条记录并做残留风险扫描（流式作业逐条调用）。
+
+        审计与风险事件累积在引擎内，由 :meth:`drain_events` 在安全检查点排空。
+        """
+        self.current_line_no = line_no
+        if isinstance(record, (dict, list)):
+            out = self._walk(record, idx, "", None)
+        else:
+            # 顶层标量日志：作为根叶子处理（规则可用 field_path "$"）
+            self.fields_scanned += 1
+            out = self._apply_leaf(record, idx, "", None)
+        self._scan_risks(out, idx, "")
+        return out
+
+    def drain_events(self) -> tuple[list[AuditEntry], list[RiskFinding]]:
+        """取出并清空自上次排空以来累积的审计与风险事件（检查点调用）。"""
+        audit, self.audit = self.audit, []
+        risks, self.risks = self.risks, []
+        self.risk_base += len(risks)
+        return audit, risks
 
     def run(self, records: list[Any]) -> RunResult:
         out: list[Any] = []
+        self.current_line_no = None
         for idx, record in enumerate(records):
-            if isinstance(record, (dict, list)):
-                out.append(self._walk(record, idx, "", None))
-            else:
-                # 顶层标量日志：作为根叶子处理（规则可用 field_path "$"）
-                self.fields_scanned += 1
-                out.append(self._apply_leaf(record, idx, "", None))
-        for idx, record in enumerate(out):
-            self._scan_risks(record, idx, "")
+            out.append(self.process_record(record, idx))
 
         stats = RunStats(
             records_in=len(records),

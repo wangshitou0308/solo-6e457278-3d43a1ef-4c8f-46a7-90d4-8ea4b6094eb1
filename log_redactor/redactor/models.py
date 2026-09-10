@@ -244,3 +244,81 @@ class JobSummary(BaseModel):
 class JobList(BaseModel):
     items: list[JobSummary]
     total: int
+
+
+# ---------- 大批量 NDJSON 流式作业 ----------
+
+StreamJobStatus = Literal["queued", "running", "succeeded", "failed", "cancelled"]
+
+
+class StreamProgress(BaseModel):
+    """流式作业的实时进度（全部为累计计数）。"""
+
+    bytes_total: int = Field(description="上传文件总字节数")
+    bytes_processed: int = Field(description="已安全检查点处理的输入字节数")
+    records_processed: int = Field(description="已脱敏并检查点的记录数")
+    audit_count: int = Field(description="已落库的审计条目数")
+    risk_count: int = Field(description="已落库的残留风险数")
+    last_line_no: int = Field(default=0, description="最近处理到的 NDJSON 行号（物理行）")
+    updated_at: str | None = None
+
+
+class StreamJobModel(BaseModel):
+    id: str
+    idempotency_key: str | None = None
+    created_at: str
+    updated_at: str | None = None
+    status: StreamJobStatus
+    format: str = "ndjson"
+    strategy_name: str
+    strategy_version: str
+    source_filename: str = Field(description="上传时的原始文件名（仅展示用）")
+    bytes_total: int = 0
+    bytes_processed: int = 0
+    records_processed: int = 0
+    audit_count: int = 0
+    risk_count: int = 0
+    fields_scanned: int = 0
+    by_action: dict[str, int] = Field(default_factory=dict)
+    by_rule: dict[str, int] = Field(default_factory=dict)
+    last_line_no: int = 0
+    error_line: int | None = Field(default=None, description="格式错误行号；失败时填入")
+    error_message: str | None = None
+    output_filename: str | None = Field(default=None, description="成功发布后的文件名")
+    output_bytes: int = 0
+    key_fingerprint: str
+    content_sha256: str = Field(description="上传内容 SHA-256，用于幂等冲突判定，不可逆推内容")
+    progress_pct: float = 0.0
+    download_url: str | None = None
+
+
+class StreamJobSummary(BaseModel):
+    id: str
+    created_at: str
+    status: StreamJobStatus
+    strategy_name: str
+    bytes_total: int
+    records_processed: int
+    risk_count: int
+    progress_pct: float
+
+
+class StreamJobList(BaseModel):
+    items: list[StreamJobSummary]
+    total: int
+
+
+class AuditPage(BaseModel):
+    job_id: str
+    total: int
+    limit: int
+    offset: int
+    items: list[AuditEntry]
+
+
+class RiskPage(BaseModel):
+    job_id: str
+    total: int
+    limit: int
+    offset: int
+    items: list[RiskFinding]

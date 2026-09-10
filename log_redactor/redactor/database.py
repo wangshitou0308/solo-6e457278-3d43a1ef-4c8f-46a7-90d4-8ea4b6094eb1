@@ -14,11 +14,15 @@ from typing import Any
 from .config import settings
 from .models import (
     AuditEntry,
+    AuditPage,
     JobDetail,
     JobModel,
     JobSummary,
     RiskFinding,
+    RiskPage,
     RunStats,
+    StreamJobModel,
+    StreamJobSummary,
 )
 
 _SCHEMA = """
@@ -61,6 +65,63 @@ CREATE TABLE IF NOT EXISTS risks (
 );
 CREATE INDEX IF NOT EXISTS idx_audit_job ON audit(job_id);
 CREATE INDEX IF NOT EXISTS idx_risks_job ON risks(job_id);
+
+-- 大批量 NDJSON 流式作业：逐行处理、安全检查点、可取消、可恢复
+CREATE TABLE IF NOT EXISTS stream_jobs (
+    id TEXT PRIMARY KEY,
+    idempotency_key TEXT UNIQUE,
+    created_at TEXT NOT NULL,
+    updated_at TEXT,
+    status TEXT NOT NULL,
+    format TEXT NOT NULL DEFAULT 'ndjson',
+    strategy_json TEXT NOT NULL,
+    strategy_name TEXT NOT NULL,
+    strategy_version TEXT NOT NULL,
+    source_filename TEXT NOT NULL,
+    content_sha256 TEXT NOT NULL,
+    bytes_total INTEGER NOT NULL DEFAULT 0,
+    bytes_processed INTEGER NOT NULL DEFAULT 0,
+    records_processed INTEGER NOT NULL DEFAULT 0,
+    audit_count INTEGER NOT NULL DEFAULT 0,
+    risk_count INTEGER NOT NULL DEFAULT 0,
+    fields_scanned INTEGER NOT NULL DEFAULT 0,
+    by_action_json TEXT NOT NULL DEFAULT '{}',
+    by_rule_json TEXT NOT NULL DEFAULT '{}',
+    last_line_no INTEGER NOT NULL DEFAULT 0,
+    error_line INTEGER,
+    error_message TEXT,
+    output_filename TEXT,
+    output_bytes INTEGER NOT NULL DEFAULT 0,
+    cancel_requested INTEGER NOT NULL DEFAULT 0,
+    key_fingerprint TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_stream_jobs_status ON stream_jobs(status);
+-- 流式审计/风险与检查点同事务落库，行即检查点边界
+CREATE TABLE IF NOT EXISTS stream_audit (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    job_id TEXT NOT NULL,
+    record_index INTEGER NOT NULL,
+    line_no INTEGER,
+    field_path TEXT NOT NULL,
+    key_name TEXT,
+    rule_id TEXT NOT NULL,
+    rule_name TEXT NOT NULL,
+    action TEXT NOT NULL,
+    match_type TEXT NOT NULL,
+    hit_by_json TEXT NOT NULL,
+    occurrences INTEGER NOT NULL
+);
+CREATE TABLE IF NOT EXISTS stream_risks (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    job_id TEXT NOT NULL,
+    record_index INTEGER NOT NULL,
+    line_no INTEGER,
+    field_path TEXT NOT NULL,
+    detector TEXT NOT NULL,
+    length INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_stream_audit_job ON stream_audit(job_id);
+CREATE INDEX IF NOT EXISTS idx_stream_risks_job ON stream_risks(job_id);
 """
 
 
@@ -267,3 +328,300 @@ class Database:
             for r in rows
         ]
         return items, total
+
+    # ---------- 流式作业 ----------
+
+    @staticmethod
+    def _stream_row_to_model(row: sqlite3.Row) -> StreamJobModel:
+        bytes_total = row["bytes_total"] or 0
+        bytes_processed = row["bytes_processed"] or 0
+        pct = round(bytes_processed * 100.0 / bytes_total, 2) if bytes_total else 0.0
+        status = row["status"]
+        if status == "succeeded":
+            pct = 100.0
+        output_filename = row["output_filename"]
+        job_id = row["id"]
+        return StreamJobModel(
+            id=job_id,
+            idempotency_key=row["idempotency_key"],
+            created_at=row["created_at"],
+            updated_at=row["updated_at"],
+            status=status,
+            format=row["format"],
+            strategy_name=row["strategy_name"],
+            strategy_version=row["strategy_version"],
+            source_filename=row["source_filename"],
+            bytes_total=bytes_total,
+            bytes_processed=bytes_processed,
+            records_processed=row["records_processed"],
+            audit_count=row["audit_count"],
+            risk_count=row["risk_count"],
+            fields_scanned=row["fields_scanned"],
+            by_action=json.loads(row["by_action_json"] or "{}"),
+            by_rule=json.loads(row["by_rule_json"] or "{}"),
+            last_line_no=row["last_line_no"],
+            error_line=row["error_line"],
+            error_message=row["error_message"],
+            output_filename=output_filename,
+            output_bytes=row["output_bytes"] or 0,
+            key_fingerprint=row["key_fingerprint"],
+            content_sha256=row["content_sha256"],
+            progress_pct=pct,
+            download_url=(f"/api/v1/stream-jobs/{job_id}/download"
+                          if status == "succeeded" and output_filename else None),
+        )
+
+    def create_stream_job(
+        self,
+        *,
+        job_id: str,
+        idempotency_key: str | None,
+        strategy_json: str,
+        source_filename: str,
+        content_sha256: str,
+        bytes_total: int,
+        key_fingerprint: str,
+    ) -> StreamJobModel:
+        import json as _json
+
+        strategy = _json.loads(strategy_json)
+        now = utcnow_iso()
+        with self._lock, self._conn() as conn:
+            conn.execute(
+                """INSERT INTO stream_jobs (id, idempotency_key, created_at, updated_at,
+                   status, format, strategy_json, strategy_name, strategy_version,
+                   source_filename, content_sha256, bytes_total, key_fingerprint)
+                   VALUES (?,?,?,?, 'queued', 'ndjson', ?,?,?,?,?,?,?)""",
+                (
+                    job_id, idempotency_key, now, now, strategy_json,
+                    strategy.get("name", ""), str(strategy.get("version", "1")),
+                    source_filename, content_sha256, bytes_total, key_fingerprint,
+                ),
+            )
+            row = conn.execute(
+                "SELECT * FROM stream_jobs WHERE id = ?", (job_id,)
+            ).fetchone()
+        return self._stream_row_to_model(row)
+
+    def get_stream_job(self, job_id: str) -> StreamJobModel | None:
+        with self._conn() as conn:
+            row = conn.execute(
+                "SELECT * FROM stream_jobs WHERE id = ?", (job_id,)
+            ).fetchone()
+        return self._stream_row_to_model(row) if row else None
+
+    def get_stream_strategy_json(self, job_id: str) -> str | None:
+        with self._conn() as conn:
+            row = conn.execute(
+                "SELECT strategy_json FROM stream_jobs WHERE id = ?", (job_id,)
+            ).fetchone()
+        return row["strategy_json"] if row else None
+
+    def get_stream_idempotent(self, key: str) -> sqlite3.Row | None:
+        with self._conn() as conn:
+            return conn.execute(
+                "SELECT id, content_sha256 FROM stream_jobs WHERE idempotency_key = ?",
+                (key,),
+            ).fetchone()
+
+    def checkpoint_stream_job(
+        self,
+        job_id: str,
+        *,
+        bytes_processed: int,
+        records_processed: int,
+        audit_count: int,
+        risk_count: int,
+        fields_scanned: int,
+        by_action: dict[str, int],
+        by_rule: dict[str, int],
+        last_line_no: int,
+        output_bytes: int,
+        audit: list[AuditEntry],
+        risks: list[RiskFinding],
+    ) -> None:
+        """安全检查点：进度、统计与本批审计/风险在同一事务落库。
+
+        与输出文件 fsync 配合：恢复时严格按 rows 截断输出，因此本事务在
+        fsync 之后提交（由 worker 保证），崩溃后不会出现“已提交但无输出”的行。
+        """
+        with self._lock, self._conn() as conn:
+            conn.execute(
+                """UPDATE stream_jobs SET updated_at=?, status='running',
+                   bytes_processed=?, records_processed=?, audit_count=?,
+                   risk_count=?, fields_scanned=?, by_action_json=?,
+                   by_rule_json=?, last_line_no=?, output_bytes=?
+                   WHERE id=?""",
+                (
+                    utcnow_iso(), bytes_processed, records_processed, audit_count,
+                    risk_count, fields_scanned,
+                    json.dumps(by_action, ensure_ascii=False),
+                    json.dumps(by_rule, ensure_ascii=False),
+                    last_line_no, output_bytes, job_id,
+                ),
+            )
+            if audit:
+                conn.executemany(
+                    """INSERT INTO stream_audit (job_id, record_index, line_no,
+                       field_path, key_name, rule_id, rule_name, action, match_type,
+                       hit_by_json, occurrences) VALUES (?,?,?,?,?,?,?,?,?,?,?)""",
+                    [
+                        (
+                            job_id, a.record_index, a.line_no, a.field_path,
+                            a.key_name, a.rule_id, a.rule_name, a.action,
+                            a.match_type,
+                            json.dumps(a.hit_by, ensure_ascii=False), a.occurrences,
+                        )
+                        for a in audit
+                    ],
+                )
+            if risks:
+                conn.executemany(
+                    """INSERT INTO stream_risks (job_id, record_index, line_no,
+                       field_path, detector, length) VALUES (?,?,?,?,?,?)""",
+                    [
+                        (job_id, r.record_index, r.line_no, r.field_path,
+                         r.detector, r.length)
+                        for r in risks
+                    ],
+                )
+
+    def mark_stream_succeeded(
+        self, job_id: str, *, output_filename: str
+    ) -> StreamJobModel | None:
+        with self._lock, self._conn() as conn:
+            conn.execute(
+                """UPDATE stream_jobs SET status='succeeded', updated_at=?,
+                   cancel_requested=0, output_filename=? WHERE id=?""",
+                (utcnow_iso(), output_filename, job_id),
+            )
+            row = conn.execute(
+                "SELECT * FROM stream_jobs WHERE id = ?", (job_id,)
+            ).fetchone()
+        return self._stream_row_to_model(row) if row else None
+
+    def mark_stream_failed(
+        self, job_id: str, *, message: str, line: int | None
+    ) -> StreamJobModel | None:
+        with self._lock, self._conn() as conn:
+            conn.execute(
+                """UPDATE stream_jobs SET status='failed', updated_at=?,
+                   error_message=?, error_line=? WHERE id=?""",
+                (utcnow_iso(), message, line, job_id),
+            )
+            row = conn.execute(
+                "SELECT * FROM stream_jobs WHERE id = ?", (job_id,)
+            ).fetchone()
+        return self._stream_row_to_model(row) if row else None
+
+    def mark_stream_cancelled(self, job_id: str) -> StreamJobModel | None:
+        with self._lock, self._conn() as conn:
+            conn.execute(
+                """UPDATE stream_jobs SET status='cancelled', updated_at=?,
+                   cancel_requested=0 WHERE id=?""",
+                (utcnow_iso(), job_id),
+            )
+            row = conn.execute(
+                "SELECT * FROM stream_jobs WHERE id = ?", (job_id,)
+            ).fetchone()
+        return self._stream_row_to_model(row) if row else None
+
+    def request_stream_cancel(self, job_id: str) -> None:
+        """持久化取消意图：服务重启后恢复作业时仍会被取消。"""
+        with self._lock, self._conn() as conn:
+            conn.execute(
+                "UPDATE stream_jobs SET cancel_requested=1, updated_at=? "
+                "WHERE id=? AND status IN ('queued','running')",
+                (utcnow_iso(), job_id),
+            )
+
+    def stream_cancel_requested(self, job_id: str) -> bool:
+        with self._conn() as conn:
+            row = conn.execute(
+                "SELECT cancel_requested FROM stream_jobs WHERE id=?", (job_id,)
+            ).fetchone()
+        return bool(row and row["cancel_requested"])
+
+    def list_stream_jobs(
+        self, *, status: str | None = None, limit: int = 50, offset: int = 0
+    ) -> tuple[list[StreamJobSummary], int]:
+        where = "WHERE status = ?" if status is not None else ""
+        params: tuple[Any, ...] = (status,) if status is not None else ()
+        with self._conn() as conn:
+            total = conn.execute(
+                f"SELECT COUNT(*) AS c FROM stream_jobs {where}", params
+            ).fetchone()["c"]
+            rows = conn.execute(
+                f"""SELECT * FROM stream_jobs {where}
+                    ORDER BY created_at DESC, rowid DESC LIMIT ? OFFSET ?""",
+                params + (limit, offset),
+            ).fetchall()
+        items = []
+        for r in rows:
+            m = self._stream_row_to_model(r)
+            items.append(
+                StreamJobSummary(
+                    id=m.id, created_at=m.created_at, status=m.status,
+                    strategy_name=m.strategy_name, bytes_total=m.bytes_total,
+                    records_processed=m.records_processed, risk_count=m.risk_count,
+                    progress_pct=m.progress_pct,
+                )
+            )
+        return items, total
+
+    def _audit_row(self, r: sqlite3.Row) -> AuditEntry:
+        return AuditEntry(
+            record_index=r["record_index"], line_no=r["line_no"],
+            field_path=r["field_path"], key_name=r["key_name"],
+            rule_id=r["rule_id"], rule_name=r["rule_name"], action=r["action"],
+            match_type=r["match_type"], hit_by=json.loads(r["hit_by_json"]),
+            occurrences=r["occurrences"],
+        )
+
+    def _risk_row(self, r: sqlite3.Row) -> RiskFinding:
+        return RiskFinding(
+            record_index=r["record_index"], line_no=r["line_no"],
+            field_path=r["field_path"], detector=r["detector"], length=r["length"],
+        )
+
+    def paginate_stream_audit(
+        self, job_id: str, *, limit: int, offset: int
+    ) -> AuditPage:
+        with self._conn() as conn:
+            total = conn.execute(
+                "SELECT COUNT(*) AS c FROM stream_audit WHERE job_id=?", (job_id,)
+            ).fetchone()["c"]
+            rows = conn.execute(
+                """SELECT * FROM stream_audit WHERE job_id=?
+                   ORDER BY id ASC LIMIT ? OFFSET ?""",
+                (job_id, limit, offset),
+            ).fetchall()
+        return AuditPage(
+            job_id=job_id, total=total, limit=limit, offset=offset,
+            items=[self._audit_row(r) for r in rows],
+        )
+
+    def paginate_stream_risks(
+        self, job_id: str, *, limit: int, offset: int
+    ) -> RiskPage:
+        with self._conn() as conn:
+            total = conn.execute(
+                "SELECT COUNT(*) AS c FROM stream_risks WHERE job_id=?", (job_id,)
+            ).fetchone()["c"]
+            rows = conn.execute(
+                """SELECT * FROM stream_risks WHERE job_id=?
+                   ORDER BY id ASC LIMIT ? OFFSET ?""",
+                (job_id, limit, offset),
+            ).fetchall()
+        return RiskPage(
+            job_id=job_id, total=total, limit=limit, offset=offset,
+            items=[self._risk_row(r) for r in rows],
+        )
+
+    def resumable_stream_jobs(self) -> list[sqlite3.Row]:
+        """服务重启后需要恢复的作业：已排队/运行中（含重启前请求取消的）。"""
+        with self._conn() as conn:
+            return conn.execute(
+                "SELECT * FROM stream_jobs WHERE status IN ('queued','running') "
+                "ORDER BY created_at ASC"
+            ).fetchall()
