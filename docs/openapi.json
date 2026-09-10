@@ -1,0 +1,1065 @@
+{
+  "openapi": "3.1.0",
+  "info": {
+    "title": "本地日志脱敏 API",
+    "description": "供后端团队提交故障样本前使用的本地日志脱敏服务。支持按字段路径/键名/正则/内置识别器（邮箱、手机号、IP、访问令牌、身份证、银行卡）命中，动作包括删除、掩码与基于本地密钥的确定性令牌化；生成不含原值的审计清单，并对残留高风险内容标记需复核。",
+    "version": "1.0.0"
+  },
+  "paths": {
+    "/healthz": {
+      "get": {
+        "tags": [
+          "meta"
+        ],
+        "summary": "健康检查",
+        "operationId": "healthz_healthz_get",
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "additionalProperties": {
+                    "type": "string"
+                  },
+                  "type": "object",
+                  "title": "Response Healthz Healthz Get"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/sample/strategy": {
+      "get": {
+        "tags": [
+          "samples"
+        ],
+        "summary": "示例脱敏策略",
+        "operationId": "get_sample_strategy_api_v1_sample_strategy_get",
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "additionalProperties": true,
+                  "type": "object",
+                  "title": "Response Get Sample Strategy Api V1 Sample Strategy Get"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/sample/logs.ndjson": {
+      "get": {
+        "tags": [
+          "samples"
+        ],
+        "summary": "示例 NDJSON 日志",
+        "operationId": "get_sample_logs_api_v1_sample_logs_ndjson_get",
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/strategies/validate": {
+      "post": {
+        "tags": [
+          "strategy"
+        ],
+        "summary": "策略试运行（dry-run）",
+        "description": "按策略处理批次并返回脱敏结果、审计清单与残留风险；不写库、不产生作业、不生成文件。",
+        "operationId": "validate_strategy_api_v1_strategies_validate_post",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/DryRunRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "additionalProperties": true,
+                  "type": "object",
+                  "title": "Response Validate Strategy Api V1 Strategies Validate Post"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/strategies/check": {
+      "post": {
+        "tags": [
+          "strategy"
+        ],
+        "summary": "仅校验策略语法",
+        "operationId": "check_strategy_api_v1_strategies_check_post",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/Strategy"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "additionalProperties": true,
+                  "type": "object",
+                  "title": "Response Check Strategy Api V1 Strategies Check Post"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/jobs": {
+      "post": {
+        "tags": [
+          "jobs"
+        ],
+        "summary": "正式创建脱敏作业",
+        "operationId": "create_job_api_v1_jobs_post",
+        "parameters": [
+          {
+            "name": "Idempotency-Key",
+            "in": "header",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "description": "同一键重复提交直接返回首个作业",
+              "title": "Idempotency-Key"
+            },
+            "description": "同一键重复提交直接返回首个作业"
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/CreateJobRequest"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "已有作业（幂等命中）",
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            }
+          },
+          "201": {
+            "description": "新作业已处理"
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      },
+      "get": {
+        "tags": [
+          "jobs"
+        ],
+        "summary": "查询作业列表",
+        "operationId": "list_jobs_api_v1_jobs_get",
+        "parameters": [
+          {
+            "name": "limit",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "integer",
+              "maximum": 200,
+              "minimum": 1,
+              "default": 50,
+              "title": "Limit"
+            }
+          },
+          {
+            "name": "offset",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "integer",
+              "minimum": 0,
+              "default": 0,
+              "title": "Offset"
+            }
+          },
+          {
+            "name": "needs_review",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "boolean"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Needs Review"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/JobList"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/jobs/{job_id}": {
+      "get": {
+        "tags": [
+          "jobs"
+        ],
+        "summary": "查询作业结果（含审计与残留风险）",
+        "operationId": "get_job_api_v1_jobs__job_id__get",
+        "parameters": [
+          {
+            "name": "job_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "title": "Job Id"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/JobDetail"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/jobs/{job_id}/records": {
+      "get": {
+        "tags": [
+          "jobs"
+        ],
+        "summary": "读取脱敏后记录（JSON）",
+        "operationId": "get_job_records_api_v1_jobs__job_id__records_get",
+        "parameters": [
+          {
+            "name": "job_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "title": "Job Id"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "additionalProperties": true,
+                  "title": "Response Get Job Records Api V1 Jobs  Job Id  Records Get"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/jobs/{job_id}/audit": {
+      "get": {
+        "tags": [
+          "jobs"
+        ],
+        "summary": "仅取审计清单",
+        "operationId": "get_job_audit_api_v1_jobs__job_id__audit_get",
+        "parameters": [
+          {
+            "name": "job_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "title": "Job Id"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "additionalProperties": true,
+                  "title": "Response Get Job Audit Api V1 Jobs  Job Id  Audit Get"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/jobs/{job_id}/download": {
+      "get": {
+        "tags": [
+          "jobs"
+        ],
+        "summary": "下载脱敏文件（保持提交时的 JSON/NDJSON 格式）",
+        "operationId": "download_job_api_v1_jobs__job_id__download_get",
+        "parameters": [
+          {
+            "name": "job_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "title": "Job Id"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    }
+  },
+  "components": {
+    "schemas": {
+      "AuditEntry": {
+        "properties": {
+          "record_index": {
+            "type": "integer",
+            "title": "Record Index",
+            "description": "记录在批次中的序号（从 0 开始）"
+          },
+          "line_no": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Line No",
+            "description": "NDJSON 输入时的行号（从 1 开始）"
+          },
+          "field_path": {
+            "type": "string",
+            "title": "Field Path"
+          },
+          "key_name": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Key Name"
+          },
+          "rule_id": {
+            "type": "string",
+            "title": "Rule Id"
+          },
+          "rule_name": {
+            "type": "string",
+            "title": "Rule Name"
+          },
+          "action": {
+            "type": "string",
+            "enum": [
+              "delete",
+              "mask",
+              "tokenize"
+            ],
+            "title": "Action"
+          },
+          "match_type": {
+            "type": "string",
+            "enum": [
+              "field",
+              "content"
+            ],
+            "title": "Match Type"
+          },
+          "hit_by": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array",
+            "title": "Hit By",
+            "description": "命中维度/识别器/正则名称"
+          },
+          "occurrences": {
+            "type": "integer",
+            "title": "Occurrences",
+            "description": "该位置内容动作的替换次数",
+            "default": 1
+          }
+        },
+        "type": "object",
+        "required": [
+          "record_index",
+          "field_path",
+          "rule_id",
+          "rule_name",
+          "action",
+          "match_type",
+          "hit_by"
+        ],
+        "title": "AuditEntry",
+        "description": "审计清单中的一条。按设计不含任何原始值。"
+      },
+      "CreateJobRequest": {
+        "properties": {
+          "format": {
+            "type": "string",
+            "enum": [
+              "json",
+              "ndjson"
+            ],
+            "title": "Format",
+            "description": "json 为对象或数组，ndjson 每行一个对象",
+            "default": "json"
+          },
+          "content": {
+            "type": "string",
+            "title": "Content",
+            "description": "原始日志文本；禁止随请求提交额外密钥"
+          },
+          "strategy": {
+            "$ref": "#/components/schemas/Strategy"
+          }
+        },
+        "type": "object",
+        "required": [
+          "content",
+          "strategy"
+        ],
+        "title": "CreateJobRequest"
+      },
+      "DryRunRequest": {
+        "properties": {
+          "format": {
+            "type": "string",
+            "enum": [
+              "json",
+              "ndjson"
+            ],
+            "title": "Format",
+            "description": "json 为对象或数组，ndjson 每行一个对象",
+            "default": "json"
+          },
+          "content": {
+            "type": "string",
+            "title": "Content",
+            "description": "原始日志文本；禁止随请求提交额外密钥"
+          },
+          "strategy": {
+            "$ref": "#/components/schemas/Strategy"
+          }
+        },
+        "type": "object",
+        "required": [
+          "content",
+          "strategy"
+        ],
+        "title": "DryRunRequest"
+      },
+      "HTTPValidationError": {
+        "properties": {
+          "detail": {
+            "items": {
+              "$ref": "#/components/schemas/ValidationError"
+            },
+            "type": "array",
+            "title": "Detail"
+          }
+        },
+        "type": "object",
+        "title": "HTTPValidationError"
+      },
+      "JobDetail": {
+        "properties": {
+          "id": {
+            "type": "string",
+            "title": "Id"
+          },
+          "idempotency_key": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Idempotency Key"
+          },
+          "created_at": {
+            "type": "string",
+            "title": "Created At"
+          },
+          "format": {
+            "type": "string",
+            "title": "Format"
+          },
+          "strategy_name": {
+            "type": "string",
+            "title": "Strategy Name"
+          },
+          "strategy_version": {
+            "type": "string",
+            "title": "Strategy Version"
+          },
+          "record_count": {
+            "type": "integer",
+            "title": "Record Count"
+          },
+          "needs_review": {
+            "type": "boolean",
+            "title": "Needs Review"
+          },
+          "stats": {
+            "$ref": "#/components/schemas/RunStats"
+          },
+          "output_filename": {
+            "type": "string",
+            "title": "Output Filename"
+          },
+          "key_fingerprint": {
+            "type": "string",
+            "title": "Key Fingerprint"
+          },
+          "audit": {
+            "items": {
+              "$ref": "#/components/schemas/AuditEntry"
+            },
+            "type": "array",
+            "title": "Audit"
+          },
+          "risks": {
+            "items": {
+              "$ref": "#/components/schemas/RiskFinding"
+            },
+            "type": "array",
+            "title": "Risks"
+          }
+        },
+        "type": "object",
+        "required": [
+          "id",
+          "idempotency_key",
+          "created_at",
+          "format",
+          "strategy_name",
+          "strategy_version",
+          "record_count",
+          "needs_review",
+          "stats",
+          "output_filename",
+          "key_fingerprint",
+          "audit",
+          "risks"
+        ],
+        "title": "JobDetail"
+      },
+      "JobList": {
+        "properties": {
+          "items": {
+            "items": {
+              "$ref": "#/components/schemas/JobSummary"
+            },
+            "type": "array",
+            "title": "Items"
+          },
+          "total": {
+            "type": "integer",
+            "title": "Total"
+          }
+        },
+        "type": "object",
+        "required": [
+          "items",
+          "total"
+        ],
+        "title": "JobList"
+      },
+      "JobSummary": {
+        "properties": {
+          "id": {
+            "type": "string",
+            "title": "Id"
+          },
+          "created_at": {
+            "type": "string",
+            "title": "Created At"
+          },
+          "strategy_name": {
+            "type": "string",
+            "title": "Strategy Name"
+          },
+          "record_count": {
+            "type": "integer",
+            "title": "Record Count"
+          },
+          "needs_review": {
+            "type": "boolean",
+            "title": "Needs Review"
+          },
+          "risk_findings": {
+            "type": "integer",
+            "title": "Risk Findings"
+          }
+        },
+        "type": "object",
+        "required": [
+          "id",
+          "created_at",
+          "strategy_name",
+          "record_count",
+          "needs_review",
+          "risk_findings"
+        ],
+        "title": "JobSummary"
+      },
+      "MatchSpec": {
+        "properties": {
+          "field_paths": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array",
+            "title": "Field Paths",
+            "description": "JSONPath 风格路径通配，如 $.user.email、**.ip、*.phone"
+          },
+          "key_names": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array",
+            "title": "Key Names",
+            "description": "按键名精确匹配，如 password、id_card"
+          },
+          "key_globs": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array",
+            "title": "Key Globs",
+            "description": "键名通配，如 *_token、*secret*"
+          },
+          "key_patterns": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array",
+            "title": "Key Patterns",
+            "description": "键名正则（任一命中即可）"
+          },
+          "value_patterns": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array",
+            "title": "Value Patterns",
+            "description": "对字符串值生效的内容正则"
+          },
+          "detectors": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array",
+            "title": "Detectors",
+            "description": "内置敏感信息识别器，可选：access_token, bank_card, email, id_card, ipv4, ipv6, phone"
+          }
+        },
+        "type": "object",
+        "title": "MatchSpec",
+        "description": "规则的命中条件。\n\n各维度之间是 AND；同一维度内多个值是 OR。\n\n* 含字段/键名维度、但不含 value_patterns/detectors 的规则为**整字段规则**，\n  动作作用于整个标量值。\n* 含 value_patterns/detectors 的规则为**内容规则**，动作只替换字符串中\n  命中的片段，可用字段/键名维度缩小作用范围。"
+      },
+      "RiskFinding": {
+        "properties": {
+          "record_index": {
+            "type": "integer",
+            "title": "Record Index"
+          },
+          "line_no": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Line No"
+          },
+          "field_path": {
+            "type": "string",
+            "title": "Field Path"
+          },
+          "detector": {
+            "type": "string",
+            "title": "Detector"
+          },
+          "length": {
+            "type": "integer",
+            "title": "Length",
+            "description": "命中片段长度，便于人工判断"
+          }
+        },
+        "type": "object",
+        "required": [
+          "record_index",
+          "field_path",
+          "detector",
+          "length"
+        ],
+        "title": "RiskFinding",
+        "description": "处理后仍残留的高风险内容（只记录位置与类型，不记录原值）。"
+      },
+      "Rule": {
+        "properties": {
+          "id": {
+            "type": "string",
+            "title": "Id",
+            "description": "规则唯一标识，将作为令牌化命名空间"
+          },
+          "name": {
+            "type": "string",
+            "title": "Name",
+            "description": "人类可读名称"
+          },
+          "description": {
+            "type": "string",
+            "title": "Description",
+            "default": ""
+          },
+          "enabled": {
+            "type": "boolean",
+            "title": "Enabled",
+            "default": true
+          },
+          "match": {
+            "$ref": "#/components/schemas/MatchSpec"
+          },
+          "action": {
+            "type": "string",
+            "enum": [
+              "delete",
+              "mask",
+              "tokenize"
+            ],
+            "title": "Action"
+          },
+          "mask_char": {
+            "type": "string",
+            "title": "Mask Char",
+            "description": "mask 动作的替换字符",
+            "default": "*"
+          },
+          "keep_prefix": {
+            "type": "integer",
+            "minimum": 0.0,
+            "title": "Keep Prefix",
+            "description": "mask 时保留的前缀长度",
+            "default": 0
+          },
+          "keep_suffix": {
+            "type": "integer",
+            "minimum": 0.0,
+            "title": "Keep Suffix",
+            "description": "mask 时保留的后缀长度",
+            "default": 0
+          },
+          "token_namespace": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Token Namespace",
+            "description": "tokenize 的命名空间，默认取规则 id"
+          }
+        },
+        "type": "object",
+        "required": [
+          "id",
+          "name",
+          "match",
+          "action"
+        ],
+        "title": "Rule"
+      },
+      "RunStats": {
+        "properties": {
+          "records_in": {
+            "type": "integer",
+            "title": "Records In"
+          },
+          "fields_scanned": {
+            "type": "integer",
+            "title": "Fields Scanned"
+          },
+          "audit_entries": {
+            "type": "integer",
+            "title": "Audit Entries"
+          },
+          "risk_findings": {
+            "type": "integer",
+            "title": "Risk Findings"
+          },
+          "by_action": {
+            "additionalProperties": {
+              "type": "integer"
+            },
+            "type": "object",
+            "title": "By Action"
+          },
+          "by_rule": {
+            "additionalProperties": {
+              "type": "integer"
+            },
+            "type": "object",
+            "title": "By Rule"
+          }
+        },
+        "type": "object",
+        "required": [
+          "records_in",
+          "fields_scanned",
+          "audit_entries",
+          "risk_findings",
+          "by_action",
+          "by_rule"
+        ],
+        "title": "RunStats"
+      },
+      "Strategy": {
+        "properties": {
+          "name": {
+            "type": "string",
+            "title": "Name"
+          },
+          "version": {
+            "type": "string",
+            "title": "Version",
+            "default": "1"
+          },
+          "description": {
+            "type": "string",
+            "title": "Description",
+            "default": ""
+          },
+          "rules": {
+            "items": {
+              "$ref": "#/components/schemas/Rule"
+            },
+            "type": "array",
+            "title": "Rules"
+          },
+          "risk_detectors": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array",
+            "title": "Risk Detectors",
+            "description": "处理后仍命中这些识别器的内容会被标记为需复核"
+          }
+        },
+        "type": "object",
+        "required": [
+          "name",
+          "rules"
+        ],
+        "title": "Strategy"
+      },
+      "ValidationError": {
+        "properties": {
+          "loc": {
+            "items": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "integer"
+                }
+              ]
+            },
+            "type": "array",
+            "title": "Location"
+          },
+          "msg": {
+            "type": "string",
+            "title": "Message"
+          },
+          "type": {
+            "type": "string",
+            "title": "Error Type"
+          },
+          "input": {
+            "title": "Input"
+          },
+          "ctx": {
+            "type": "object",
+            "title": "Context"
+          }
+        },
+        "type": "object",
+        "required": [
+          "loc",
+          "msg",
+          "type"
+        ],
+        "title": "ValidationError"
+      }
+    }
+  }
+}

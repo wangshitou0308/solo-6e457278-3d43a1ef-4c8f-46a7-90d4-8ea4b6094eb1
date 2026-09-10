@@ -1,0 +1,122 @@
+{
+  "name": "backend-incident-sample",
+  "version": "1.0",
+  "description": "后端故障样本提交前的示例脱敏策略：删除凭据、掩码邮箱/IP、确定性令牌化手机号与令牌、掩码身份证。",
+  "rules": [
+    {
+      "id": "delete-credentials",
+      "name": "删除凭据类字段",
+      "description": "密码、密钥、Authorization 等字段整字段删除",
+      "match": {
+        "key_names": [
+          "password",
+          "passwd",
+          "authorization",
+          "secret",
+          "api_key"
+        ],
+        "key_globs": [
+          "*_secret",
+          "*secret*",
+          "*token*",
+          "*password*"
+        ]
+      },
+      "action": "delete"
+    },
+    {
+      "id": "mask-email-field",
+      "name": "掩码邮箱字段",
+      "match": {
+        "field_paths": [
+          "**.email",
+          "$.email",
+          "**.mail"
+        ]
+      },
+      "action": "mask",
+      "mask_char": "*",
+      "keep_prefix": 1,
+      "keep_suffix": 0
+    },
+    {
+      "id": "tokenize-phone-field",
+      "name": "令牌化手机号字段",
+      "match": {
+        "key_names": [
+          "phone",
+          "mobile",
+          "tel",
+          "telephone"
+        ]
+      },
+      "action": "tokenize"
+    },
+    {
+      "id": "mask-email-in-text",
+      "name": "掩码自由文本中的邮箱",
+      "match": {
+        "detectors": [
+          "email"
+        ]
+      },
+      "action": "mask",
+      "mask_char": "*",
+      "keep_prefix": 1,
+      "keep_suffix": 0
+    },
+    {
+      "id": "scan-phone-in-text",
+      "name": "令牌化文本中的手机号",
+      "match": {
+        "detectors": [
+          "phone"
+        ]
+      },
+      "action": "tokenize"
+    },
+    {
+      "id": "mask-ip-in-text",
+      "name": "掩码文本中的 IP 地址",
+      "match": {
+        "detectors": [
+          "ipv4",
+          "ipv6"
+        ]
+      },
+      "action": "mask",
+      "mask_char": "*"
+    },
+    {
+      "id": "tokenize-access-token",
+      "name": "令牌化访问令牌",
+      "match": {
+        "detectors": [
+          "access_token"
+        ]
+      },
+      "action": "tokenize"
+    },
+    {
+      "id": "mask-id-card",
+      "name": "掩码身份证号",
+      "match": {
+        "detectors": [
+          "id_card"
+        ]
+      },
+      "action": "mask",
+      "mask_char": "*",
+      "keep_prefix": 6,
+      "keep_suffix": 4
+    }
+  ],
+  "risk_detectors": [
+    "email",
+    "phone",
+    "ipv4",
+    "access_token",
+    "id_card",
+    "bank_card"
+  ]
+}

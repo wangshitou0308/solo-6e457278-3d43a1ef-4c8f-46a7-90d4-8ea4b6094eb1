@@ -1,0 +1,189 @@
+# 本地日志脱敏 API（Log Redactor）
+
+供后端团队在**提交故障样本前**使用的本地日志脱敏服务。接收 JSON / NDJSON 日志批次与
+脱敏策略，按**字段路径、键名、正则、内置敏感信息识别器**命中规则，执行
+**删除、掩码、确定性令牌化**，生成不含原值的审计清单，并对残留高风险内容标记
+「需复核」。全部功能**离线运行**，数据只落在本机。
+
+- 语言/框架：Python 3.9+ · FastAPI · Pydantic v2 · SQLite（标准库）
+- 确定性令牌：HMAC-SHA256 + 本地主密钥，无网络依赖
+- 交互式文档：启动后访问 `http://127.0.0.1:8080/docs`（Swagger UI）、`/redoc`
+- 离线 OpenAPI 描述文件：[`../docs/openapi.json`](../docs/openapi.json)
+
+## 能力一览
+
+| 能力 | 说明 |
+| --- | --- |
+| 批次格式 | JSON（对象或数组）、NDJSON（每行一个对象，审计/风险带行号） |
+| 字段路径 | JSONPath 风格通配：`$.user.email`、`**.ip`、`items[*].id` |
+| 键名匹配 | 精确（`key_names`）、通配（`key_globs`，如 `*_token`）、正则（`key_patterns`） |
+| 内容匹配 | 值正则（`value_patterns`）、内置识别器（`detectors`） |
+| 内置识别器 | 邮箱、中国大陆手机号、IPv4/IPv6、访问令牌（Bearer/JWT/`key=xxx`/长随机串）、身份证（校验码+日期校验）、银行卡（Luhn 校验） |
+| 动作 | `delete`（置空，保留键结构）、`mask`（可配置掩码字符与首尾保留位数，数字保留数值类型）、`tokenize`（基于本地密钥的确定性替身） |
+| 确定性 | 同一命名空间下同一敏感值，整批数据（跨记录、跨作业，密钥不变时）恒为同一令牌；不同规则命名空间互相隔离 |
+| 结构保留 | 只改标量值，嵌套对象/数组层级与非敏感字段原样保留；令牌输出为 `T-XXXX` 字符串 |
+| 审计 | 命中规则、记录序号、NDJSON 行号、字段路径、动作、命中维度、替换次数；**绝不记录原始值** |
+| 需复核 | 处理后仍被高风险识别器命中的内容写入风险清单，作业 `needs_review=true` |
+| 幂等 | 请求头 `Idempotency-Key` 相同的重复提交直接回放首个作业 |
+| 试运行 | `POST /strategies/validate` 即时返回脱敏结果，不写库、不落文件 |
+
+## 快速开始
+
+```bash
+pip install -r requirements.txt
+python run.py                 # 默认监听 127.0.0.1:8080
+# ▶ 交互式文档: http://127.0.0.1:8080/docs
+```
+
+用内置示例跑通「试跑 → 正式处理 → 下载」：
+
+```bash
+bash examples/quickstart.sh
+```
+
+或直接 `curl`：
+
+```bash
+# 1) 取示例策略
+curl -s http://127.0.0.1:8080/api/v1/sample/strategy -o /tmp/strategy.json
+# 2) 取示例日志
+curl -s http://127.0.0.1:8080/api/v1/sample/logs.ndjson -o /tmp/logs.ndjson
+# 3) 试运行（用 python/jq 把两者组装成请求体）
+python3 -c '
+import json,urllib.request
+body=json.dumps({"format":"ndjson",
+  "content":open("/tmp/logs.ndjson").read(),
+  "strategy":json.load(open("/tmp/strategy.json"))}).encode()
+r=urllib.request.urlopen(urllib.request.Request(
+  "http://127.0.0.1:8080/api/v1/strategies/validate",data=body,
+  headers={"Content-Type":"application/json"}))
+print(json.dumps(json.load(r),ensure_ascii=False,indent=2))'
+```
+
+## 策略编写
+
+```json
+{
+  "name": "my-incident-policy",
+  "version": "1.0",
+  "rules": [
+    {
+      "id": "delete-credentials",
+      "name": "删除凭据字段",
+      "match": {
+        "key_names": ["password", "authorization"],
+        "key_globs": ["*secret*", "*token*"]
+      },
+      "action": "delete"
+    },
+    {
+      "id": "mask-email",
+      "name": "掩码邮箱字段",
+      "match": { "field_paths": ["**.email"] },
+      "action": "mask",
+      "mask_char": "*",
+      "keep_prefix": 1,
+      "keep_suffix": 0
+    },
+    {
+      "id": "tokenize-phone",
+      "name": "令牌化手机号",
+      "match": { "key_names": ["phone", "mobile"], "detectors": ["phone"] },
+      "action": "tokenize",
+      "token_namespace": "phone"
+    },
+    {
+      "id": "mask-ip-in-text",
+      "name": "掩码自由文本里的 IP",
+      "match": { "detectors": ["ipv4", "ipv6"] },
+      "action": "mask"
+    }
+  ],
+  "risk_detectors": ["email", "phone", "ipv4", "access_token", "id_card", "bank_card"]
+}
+```
+
+匹配语义：
+
+- **整字段规则**：含字段/键名维度、不含 `value_patterns`/`detectors`，动作作用于整个标量值；
+- **内容规则**：含 `value_patterns`/`detectors`，只替换字符串中命中的片段；可再用字段/键名
+  维度限定作用范围（如只在 `$.message` 内识别）；
+- 路径组与键名组之间为 AND；键名组内（精确/通配/正则）为 OR；
+- 同一片段被多条内容规则覆盖时，**先定义的规则优先**，片段被消费不重复处理；
+- 整字段规则按策略顺序首个命中者生效。
+
+## API 摘要
+
+| 方法 & 路径 | 说明 |
+| --- | --- |
+| `POST /api/v1/strategies/validate` | 策略试运行：返回脱敏记录、审计、风险、统计，不落库 |
+| `POST /api/v1/strategies/check` | 仅校验策略语法 |
+| `POST /api/v1/jobs` | 正式处理；支持请求头 `Idempotency-Key`；返回作业信息与完整结果 |
+| `GET /api/v1/jobs?needs_review=true` | 作业列表，可按需复核过滤、分页 |
+| `GET /api/v1/jobs/{id}` | 作业详情：元数据、统计、审计清单、残留风险 |
+| `GET /api/v1/jobs/{id}/records` | 脱敏后记录 |
+| `GET /api/v1/jobs/{id}/audit` | 仅审计清单 |
+| `GET /api/v1/jobs/{id}/download` | 下载脱敏文件，保持提交时的 JSON / NDJSON 格式 |
+| `GET /api/v1/sample/strategy` / `.../sample/logs.ndjson` | 可直接启动的示例 |
+| `GET /healthz` | 健康检查 + 主密钥指纹 |
+
+审计条目示例（**无原值**）：
+
+```json
+{
+  "record_index": 0,
+  "line_no": 1,
+  "field_path": "$.user.phone",
+  "key_name": "phone",
+  "rule_id": "tokenize-phone-field",
+  "rule_name": "令牌化手机号字段",
+  "action": "tokenize",
+  "match_type": "field",
+  "hit_by": ["field_match"],
+  "occurrences": 1
+}
+```
+
+残留风险示例（处理后仍发现高风险内容时，作业被标记需人工复核）：
+
+```json
+{ "record_index": 1, "line_no": 2, "field_path": "$.note",
+  "detector": "bank_card", "length": 19 }
+```
+
+## 本地密钥
+
+- 默认：首次启动在数据目录生成 32 字节随机密钥 `data/master.key`（权限 `600`）；
+  删除该文件会让历史令牌全部换新，相当于轮换密钥。
+- 推荐：通过环境变量注入密钥（不落盘）：
+
+  ```bash
+  REDACTOR_MASTER_KEY="$(openssl rand -hex 32)" python run.py
+  ```
+
+- `/healthz` 返回密钥指纹（HMAC 摘要前 8 字节），可用于确认两次运行是否同一密钥。
+- 令牌为 `HMAC-SHA256(key, namespace + '\\0' + value)` 的 Base32 截断（`T-XXXX`），
+  不可逆推原值；命名空间默认取规则 id，可显式指定 `token_namespace`。
+
+## 数据与配置
+
+| 环境变量 | 默认 | 说明 |
+| --- | --- | --- |
+| `REDACTOR_DATA_DIR` | `./data` | SQLite、主密钥、脱敏输出文件（`jobs/`）目录 |
+| `REDACTOR_MASTER_KEY` | 自动生成文件 | 确定性令牌主密钥 |
+
+请求体上限 10 MiB（本地批量场景）。SQLite 位于 `$REDACTOR_DATA_DIR/redactor.db`，
+审计/风险表只存位置与动作，不存任何原始敏感值。
+
+## 测试
+
+```bash
+python -m pytest -q        # 51 个用例：识别器、路径通配、动作、确定性、API、幂等、下载
+```
+
+## 安全边界（请知悉）
+
+- 本工具降低误提交风险，不替代人工复核；**`needs_review=true` 的作业应人工确认后再外发**。
+- 确定性令牌允许关联分析但也允许“等值连接”，请结合场景决定是否对跨作业分析使用不同密钥。
+- 识别器基于正则/校验码，可能存在漏报与误报；可叠加自定义正则规则并扩充 `risk_detectors`。
+- 服务默认只监听 `127.0.0.1`；如需团队共享请自行置于内网与访问控制之后。
