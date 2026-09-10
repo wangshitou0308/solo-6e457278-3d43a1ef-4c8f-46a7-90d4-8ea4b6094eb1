@@ -838,11 +838,14 @@ class Database:
             ).fetchone()
 
     def update_bundle_current_file(self, job_id: str, path: str | None) -> None:
-        """装饰性进度：记录正在处理的包内文件（不参与恢复状态）。"""
+        """装饰性进度：记录正在处理的包内文件（不参与恢复状态）。
+
+        仅对 queued/running 作业生效，避免与终结事务竞争时把终态翻回 running。
+        """
         with self._lock, self._conn() as conn:
             conn.execute(
                 "UPDATE bundle_jobs SET updated_at=?, status='running', "
-                "current_file=? WHERE id=?",
+                "current_file=? WHERE id=? AND status IN ('queued','running')",
                 (utcnow_iso(), path, job_id),
             )
 

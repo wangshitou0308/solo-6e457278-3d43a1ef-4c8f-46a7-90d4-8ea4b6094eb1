@@ -102,11 +102,15 @@ def normalize_entry_name(name: str) -> str | None:
 
 def _is_symlink_or_special(info: zipfile.ZipInfo) -> bool:
     mode = (info.external_attr >> 16) & 0xFFFF
+    # 仅看文件类型位：writestr 等工具只写权限位（如 0o600，无 S_IFREG），
+    # 这种"只有权限、没有类型"的条目是普通文件，不能误判为特殊文件
+    file_type = stat.S_IFMT(mode)
+    if file_type == 0:
+        return False
     if stat.S_ISLNK(mode):
         return True
-    # 非普通文件且非目录的特殊类型（socket/fifo/设备）同样拒绝；
-    # Windows 生成的包模式位常为 0，按普通文件对待
-    return bool(mode) and not (stat.S_ISREG(mode) or stat.S_ISDIR(mode))
+    # 有类型位但不是普通文件/目录（socket/fifo/设备）同样拒绝
+    return not (stat.S_ISREG(mode) or stat.S_ISDIR(mode))
 
 
 def validate_bundle(path: "os.PathLike[str] | str") -> list[BundleEntry]:

@@ -16,6 +16,14 @@
 * ``GET  /api/v1/stream-jobs/{job_id}/audit`` 分页审计清单
 * ``GET  /api/v1/stream-jobs/{job_id}/risks`` 分页残留风险
 * ``GET  /api/v1/stream-jobs/{job_id}/download`` 下载已完成的 NDJSON 结果
+* ``POST /api/v1/bundle-jobs``          诊断包（ZIP）：multipart 上传压缩包+策略
+* ``GET  /api/v1/bundle-jobs``          诊断包作业列表（可按状态过滤、分页）
+* ``GET  /api/v1/bundle-jobs/{job_id}`` 诊断包作业状态与进度
+* ``POST /api/v1/bundle-jobs/{job_id}/cancel`` 取消诊断包作业（可跨重启生效）
+* ``GET  /api/v1/bundle-jobs/{job_id}/audit`` 分页审计清单（带来源路径）
+* ``GET  /api/v1/bundle-jobs/{job_id}/risks`` 分页残留风险（带来源路径）
+* ``GET  /api/v1/bundle-jobs/{job_id}/manifest`` 处理清单（跳过/失败原因）
+* ``GET  /api/v1/bundle-jobs/{job_id}/download`` 下载结果 ZIP（脱敏文件+清单）
 * ``GET  /api/v1/sample/strategy``、``/sample/logs.ndjson``  可直接启动的示例
 * ``GET  /healthz``                     健康检查（含主密钥指纹）
 
@@ -38,6 +46,16 @@ from fastapi.responses import FileResponse, JSONResponse, Response
 from fastapi.openapi.utils import get_openapi
 
 from . import config
+from .bundle_jobs import (
+    build_manifest,
+    bundle_registry,
+    ensure_bundle_dirs,
+    final_output_path as bundle_final_output_path,
+    raw_path as bundle_raw_path,
+    recover_bundle_jobs,
+    run_bundle_job,
+)
+from .bundle_zip import BundleRejection, max_total_bytes, validate_bundle
 from .crypto import MasterKey, key_fingerprint
 from .database import Database
 from .engine import run_strategy
@@ -63,13 +81,14 @@ from .stream_jobs import (
 )
 
 MAX_BODY_BYTES = 10 * 1024 * 1024  # 10 MiB，小批量 JSON 接口的请求体上限
-# 流式上传走 multipart 落盘，不受小批量请求体上限约束
+# 流式/诊断包上传走 multipart 落盘，不受小批量请求体上限约束
 STREAM_UPLOAD_PATH = "/api/v1/stream-jobs"
+BUNDLE_UPLOAD_PATH = "/api/v1/bundle-jobs"
 UPLOAD_CHUNK = 1024 * 1024  # 1 MiB：multipart 流式落盘的拷贝块大小
 
 app = FastAPI(
     title="本地日志脱敏 API",
-    version="1.1.0",
+    version="1.2.0",
     description=(
         "供后端团队提交故障样本前使用的本地日志脱敏服务。支持按字段路径/键名/正则/内置识别器"
         "（邮箱、手机号、IP、访问令牌、身份证、银行卡）命中，动作包括删除、掩码与基于本地"
@@ -78,7 +97,15 @@ app = FastAPI(
         "通过 multipart/form-data 上传大文件，原始文件以 0600 权限临时落盘，服务逐行解析、"
         "脱敏并定期写入安全检查点（字节偏移/记录数/审计数/风险数），不把整包读入内存；"
         "支持 Idempotency-Key 内容校验（同键不同内容返回 409）、取消、服务重启后从检查点"
-        "继续、格式错误记录行号并终止；成功后原子发布结果文件，未完成作业不可下载。"
+        "继续、格式错误记录行号并终止；成功后原子发布结果文件，未完成作业不可下载。\n\n"
+        "## 诊断包作业（bundle-jobs）\n"
+        "通过 multipart/form-data 上传 ZIP 诊断包与脱敏策略，逐个处理包内 "
+        ".json/.ndjson/.log/.txt 文件：结构化文件走字段+内容规则，纯文本按行应用内容规则，"
+        "输出保留包内相对路径与原换行风格。拒绝路径穿越、符号链接、重复路径、加密条目及"
+        "超过文件数/单文件/展开总量/压缩比上限的压缩包；二进制与不支持类型不写入结果，"
+        "只在结果 ZIP 的 redaction-manifest.json 清单列明原因。审计与残留风险带来源路径"
+        "与行号/记录位置，不含原值；同一 Idempotency-Key 仅在压缩包与策略均一致时回放，"
+        "否则 409；支持进度查询、取消与重启续跑，终态清理原始包，成功后原子发布结果 ZIP。"
     ),
     contact={"name": "platform-security"},
 )
@@ -104,9 +131,11 @@ def get_master_key() -> MasterKey:
 
 @asynccontextmanager
 async def lifespan(_app: FastAPI):
-    # 服务启动：确保目录就位，并从安全检查点恢复未完成的流式作业
+    # 服务启动：确保目录就位，并从安全检查点恢复未完成的流式/诊断包作业
     ensure_stream_dirs()
+    ensure_bundle_dirs()
     recover_stream_jobs(get_db, get_master_key)
+    recover_bundle_jobs(get_db, get_master_key)
     yield
 
 
@@ -141,7 +170,9 @@ def _run_response(result: RunResult) -> dict[str, Any]:
 @app.middleware("http")
 async def _limit_body(request: Request, call_next):
     # multipart 流式上传逐块落盘、不读入内存，豁免小批量 10 MiB 请求体上限
-    exempt = request.method == "POST" and request.url.path == STREAM_UPLOAD_PATH
+    exempt = request.method == "POST" and request.url.path in (
+        STREAM_UPLOAD_PATH, BUNDLE_UPLOAD_PATH,
+    )
     cl = request.headers.get("content-length")
     if not exempt and cl and cl.isdigit() and int(cl) > MAX_BODY_BYTES:
         return JSONResponse(
@@ -598,6 +629,284 @@ def download_stream_job(job_id: str):
         path,
         media_type="application/x-ndjson; charset=utf-8",
         filename=f"redacted-{job_id}.ndjson",
+    )
+
+
+# ---------- 诊断包（ZIP）作业 ----------
+
+
+def _ensure_bundle_recovery() -> None:
+    """未触发 lifespan 的部署形态（如测试/嵌入式）下惰性恢复一次。"""
+    ensure_bundle_dirs()
+    recover_bundle_jobs(get_db, get_master_key)
+
+
+def _bundle_job_dict(job) -> dict[str, Any]:
+    return job.model_dump(mode="json")
+
+
+def _require_bundle_job(job_id: str):
+    job = get_db().get_bundle_job(job_id)
+    if not job:
+        raise HTTPException(status_code=404, detail=f"诊断包作业不存在: {job_id}")
+    return job
+
+
+@app.post(
+    "/api/v1/bundle-jobs",
+    tags=["bundle-jobs"],
+    summary="上传 ZIP 诊断包并创建脱敏作业",
+    description=(
+        "以 `multipart/form-data` 上传：`file` 为 ZIP 诊断包，`strategy` 为策略 JSON。"
+        "逐个处理包内 `.json`/`.ndjson`/`.log`/`.txt`：结构化文件走字段+内容规则，"
+        "纯文本按行应用内容规则，输出保留包内相对路径与原换行风格。\n\n"
+        "压缩包先过安全校验：拒绝路径穿越、符号链接、重复路径、加密条目，以及超过"
+        "文件数/单文件/展开总量/压缩比上限的包（422 并列出全部原因）。二进制与不支持"
+        "类型不写入结果，只在清单列明原因。携带 `Idempotency-Key` 时：相同键且"
+        "**压缩包与策略的 SHA-256 均一致**才回放首个作业（200），任一不同返回 **409**。"
+        "作业可取消、可在服务重启后从文件级检查点续跑；终态清理原始压缩包，"
+        "成功后原子发布结果 ZIP（仅含脱敏文件与 redaction-manifest.json 清单）。"
+    ),
+    status_code=202,
+    responses={
+        200: {"description": "幂等命中，回放已有作业"},
+        202: {"description": "已接受上传，后台处理中"},
+        409: {"description": "Idempotency-Key 冲突（同键内容/策略不同）"},
+        413: {"description": "压缩包超过上传大小上限"},
+        422: {"description": "策略非法、压缩包为空或未通过安全校验"},
+    },
+)
+async def create_bundle_job(
+    strategy: str = Form(description="脱敏策略 JSON（与小批量接口同一结构）"),
+    file: UploadFile = File(description="ZIP 诊断包（.json/.ndjson/.log/.txt 会被处理）"),
+    idempotency_key: str | None = Header(
+        default=None, alias="Idempotency-Key",
+        description="同一键只回放压缩包与策略均一致的上传；不一致返回 409",
+    ),
+) -> JSONResponse:
+    _ensure_bundle_recovery()
+
+    if idempotency_key is not None:
+        idempotency_key = idempotency_key.strip()
+        if len(idempotency_key) > 128:
+            raise HTTPException(status_code=400, detail="Idempotency-Key 最长 128 字符")
+
+    # 先校验策略（在拷贝大文件之前快速失败）
+    try:
+        strategy_model = Strategy.model_validate_json(strategy)
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail={"message": f"策略校验失败：{exc}"}) from exc
+    # 规范化策略后取摘要：键顺序/空白差异不算不同策略
+    strategy_canonical = strategy_model.model_dump_json()
+    strategy_sha = hashlib.sha256(strategy_canonical.encode("utf-8")).hexdigest()
+
+    job_id = uuid.uuid4().hex
+    ensure_bundle_dirs()
+    staged = bundle_raw_path(job_id)
+
+    # 逐块拷贝到 0600 临时文件；压缩态大小不得超过展开总量上限
+    digest = hashlib.sha256()
+    bytes_total = 0
+    upload_cap = max_total_bytes()
+    fd = os.open(str(staged), os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+    try:
+        while True:
+            chunk = await file.read(UPLOAD_CHUNK)
+            if not chunk:
+                break
+            digest.update(chunk)
+            bytes_total += len(chunk)
+            if bytes_total > upload_cap:
+                raise HTTPException(
+                    status_code=413,
+                    detail={"message": f"压缩包超过上传大小上限（{upload_cap} 字节）"},
+                )
+            os.write(fd, chunk)
+        os.fsync(fd)
+    except Exception:
+        staged.unlink(missing_ok=True)
+        raise
+    finally:
+        os.close(fd)
+        await file.close()
+    os.chmod(staged, 0o600)
+
+    if bytes_total == 0:
+        staged.unlink(missing_ok=True)
+        raise HTTPException(status_code=422, detail={"message": "上传文件为空"})
+
+    # 安全校验：不安全的压缩包整体拒绝（422 并列出全部原因）
+    try:
+        entries = validate_bundle(staged)
+    except BundleRejection as exc:
+        staged.unlink(missing_ok=True)
+        raise HTTPException(
+            status_code=422,
+            detail={"message": "压缩包未通过安全校验", "reasons": exc.reasons},
+        ) from exc
+
+    content_sha = digest.hexdigest()
+    source_name = Path(file.filename or "bundle.zip").name
+
+    # 幂等：同键且压缩包+策略都一致才回放，任一不同返回冲突（临时文件立即清理）
+    if idempotency_key:
+        row = get_db().get_bundle_idempotent(idempotency_key)
+        if row is not None:
+            staged.unlink(missing_ok=True)
+            if row["content_sha256"] != content_sha:
+                raise _idempotency_conflict(row["id"], "压缩包内容")
+            if row["strategy_sha256"] != strategy_sha:
+                raise _idempotency_conflict(row["id"], "策略")
+            existing = get_db().get_bundle_job(row["id"])
+            return JSONResponse(
+                status_code=200,
+                content={"replayed": True, "job": _bundle_job_dict(existing)},
+            )
+
+    try:
+        job = get_db().create_bundle_job(
+            job_id=job_id,
+            idempotency_key=idempotency_key,
+            strategy_json=strategy_canonical,
+            strategy_sha256=strategy_sha,
+            source_filename=source_name,
+            content_sha256=content_sha,
+            bytes_total=bytes_total,
+            files_total=len(entries),
+            key_fingerprint=key_fingerprint(get_master_key()),
+        )
+    except sqlite3.IntegrityError:
+        # 并发使用相同幂等键：以先落库者为准
+        staged.unlink(missing_ok=True)
+        winner = (
+            get_db().get_bundle_idempotent(idempotency_key) if idempotency_key else None
+        )
+        if winner:
+            existing = get_db().get_bundle_job(winner["id"])
+            if (winner["content_sha256"] == content_sha
+                    and winner["strategy_sha256"] == strategy_sha):
+                return JSONResponse(
+                    status_code=200,
+                    content={"replayed": True, "job": _bundle_job_dict(existing)},
+                )
+            if winner["content_sha256"] != content_sha:
+                raise _idempotency_conflict(winner["id"], "压缩包内容")
+            raise _idempotency_conflict(winner["id"], "策略")
+        raise
+
+    bundle_registry.start(
+        job_id, lambda: run_bundle_job(job_id, get_db, get_master_key)
+    )
+    job = get_db().get_bundle_job(job_id)
+    return JSONResponse(
+        status_code=202, content={"replayed": False, "job": _bundle_job_dict(job)}
+    )
+
+
+@app.get("/api/v1/bundle-jobs", tags=["bundle-jobs"],
+         summary="诊断包作业列表（可按状态过滤、分页）")
+def list_bundle_jobs(
+    status: str | None = Query(default=None,
+                               description="queued/running/succeeded/failed/cancelled"),
+    limit: int = Query(default=50, ge=1, le=200),
+    offset: int = Query(default=0, ge=0),
+):
+    if status is not None and status not in (
+        "queued", "running", "succeeded", "failed", "cancelled"
+    ):
+        raise HTTPException(status_code=400, detail="非法 status 过滤值")
+    _ensure_bundle_recovery()
+    items, total = get_db().list_bundle_jobs(status=status, limit=limit, offset=offset)
+    return {"total": total, "limit": limit, "offset": offset,
+            "items": [i.model_dump(mode="json") for i in items]}
+
+
+@app.get("/api/v1/bundle-jobs/{job_id}", tags=["bundle-jobs"],
+         summary="诊断包作业状态与进度",
+         description="返回作业状态、文件/记录/审计/风险计数、当前处理文件与进度百分比。")
+def get_bundle_job(job_id: str) -> dict[str, Any]:
+    _ensure_bundle_recovery()
+    job = _require_bundle_job(job_id)
+    return _bundle_job_dict(job)
+
+
+@app.post("/api/v1/bundle-jobs/{job_id}/cancel", tags=["bundle-jobs"],
+          summary="取消诊断包作业",
+          description="取消意图同时写入内存与数据库（重启后仍生效）；worker 在文件"
+                      "边界停止，状态置为 cancelled，原始压缩包与暂存输出被清理。",
+          responses={409: {"description": "作业已终结，无法取消"}})
+def cancel_bundle_job(job_id: str) -> dict[str, Any]:
+    job = _require_bundle_job(job_id)
+    if job.status not in ("queued", "running"):
+        raise HTTPException(
+            status_code=409,
+            detail={"message": f"作业已处于终态 {job.status}，无法取消",
+                    "status": job.status},
+        )
+    get_db().request_bundle_cancel(job_id)
+    bundle_registry.request_cancel(job_id)
+    latest = get_db().get_bundle_job(job_id)
+    return {"cancelling": True, "job": _bundle_job_dict(latest)}
+
+
+@app.get("/api/v1/bundle-jobs/{job_id}/audit", tags=["bundle-jobs"],
+         summary="分页查询诊断包作业的审计清单（带来源路径，不含原始值）")
+def get_bundle_job_audit(
+    job_id: str,
+    limit: int = Query(default=100, ge=1, le=1000),
+    offset: int = Query(default=0, ge=0),
+):
+    _require_bundle_job(job_id)
+    page = get_db().paginate_bundle_audit(job_id, limit=limit, offset=offset)
+    return page.model_dump(mode="json")
+
+
+@app.get("/api/v1/bundle-jobs/{job_id}/risks", tags=["bundle-jobs"],
+         summary="分页查询诊断包作业的残留风险（带来源路径）")
+def get_bundle_job_risks(
+    job_id: str,
+    limit: int = Query(default=100, ge=1, le=1000),
+    offset: int = Query(default=0, ge=0),
+):
+    _require_bundle_job(job_id)
+    page = get_db().paginate_bundle_risks(job_id, limit=limit, offset=offset)
+    return page.model_dump(mode="json")
+
+
+@app.get("/api/v1/bundle-jobs/{job_id}/manifest", tags=["bundle-jobs"],
+         summary="诊断包处理清单（每个文件的状态与跳过/失败原因）",
+         description="与结果 ZIP 内的 redaction-manifest.json 同源；未完成的作业"
+                     "返回截至当前的进度清单（completed_at 为 null）。")
+def get_bundle_job_manifest(job_id: str) -> dict[str, Any]:
+    job = _require_bundle_job(job_id)
+    files = get_db().bundle_files_for_manifest(job_id)
+    completed_at = job.updated_at if job.status == "succeeded" else None
+    return build_manifest(job, files, completed_at=completed_at)
+
+
+@app.get("/api/v1/bundle-jobs/{job_id}/download", tags=["bundle-jobs"],
+         summary="下载已完成的结果 ZIP（脱敏文件 + 清单）",
+         description="仅 succeeded 作业可下载（原子发布的结果 ZIP）；"
+                     "排队/运行/失败/取消的作业返回 409。",
+         responses={409: {"description": "作业未完成，结果不可下载"}})
+def download_bundle_job(job_id: str):
+    job = _require_bundle_job(job_id)
+    if job.status != "succeeded":
+        raise HTTPException(
+            status_code=409,
+            detail={"message": f"作业状态为 {job.status}，未完成作业不得下载",
+                    "status": job.status},
+        )
+    path = bundle_final_output_path(job_id)
+    if not path.exists():
+        raise HTTPException(status_code=410, detail="结果文件已被清理")
+    name = Path(job.source_filename).name or "bundle.zip"
+    if not name.lower().endswith(".zip"):
+        name += ".zip"
+    return FileResponse(
+        path,
+        media_type="application/zip",
+        filename=f"redacted-{name}",
     )
 
 
