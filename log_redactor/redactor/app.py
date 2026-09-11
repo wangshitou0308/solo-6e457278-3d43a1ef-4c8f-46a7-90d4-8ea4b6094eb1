@@ -1234,7 +1234,7 @@ def verify_job_receipt(
 )
 def get_stream_job_receipt(job_id: str) -> dict[str, Any]:
     job = _require_stream_job(job_id)
-    _require_succeeded(job.status, "流式作业")
+    _require_succeeded(job.status)
     out = final_output_path(job_id)
     path = _resolve_receipt_path(
         out,
@@ -1257,7 +1257,7 @@ def get_stream_job_receipt(job_id: str) -> dict[str, Any]:
 )
 def download_stream_job_receipt(job_id: str) -> FileResponse:
     job = _require_stream_job(job_id)
-    _require_succeeded(job.status, "流式作业")
+    _require_succeeded(job.status)
     out = final_output_path(job_id)
     path = _resolve_receipt_path(
         out,
@@ -1286,7 +1286,7 @@ def verify_stream_job_receipt(
     receipt: dict[str, Any] = Body(description="待校验的完整性凭证 JSON"),
 ) -> ReceiptVerifyResponse:
     job = _require_stream_job(job_id)
-    _require_succeeded(job.status, "流式作业")
+    _require_succeeded(job.status)
     verdict = receipts.verify_receipt(
         get_master_key(),
         receipt,
@@ -1310,7 +1310,7 @@ def verify_stream_job_receipt(
 )
 def get_bundle_job_receipt(job_id: str) -> dict[str, Any]:
     job = _require_bundle_job(job_id)
-    _require_succeeded(job.status, "诊断包作业")
+    _require_succeeded(job.status)
     out = bundle_final_output_path(job_id)
     path = _resolve_receipt_path(
         out,
@@ -1333,7 +1333,7 @@ def get_bundle_job_receipt(job_id: str) -> dict[str, Any]:
 )
 def download_bundle_job_receipt(job_id: str) -> FileResponse:
     job = _require_bundle_job(job_id)
-    _require_succeeded(job.status, "诊断包作业")
+    _require_succeeded(job.status)
     out = bundle_final_output_path(job_id)
     path = _resolve_receipt_path(
         out,
@@ -1362,7 +1362,7 @@ def verify_bundle_job_receipt(
     receipt: dict[str, Any] = Body(description="待校验的完整性凭证 JSON"),
 ) -> ReceiptVerifyResponse:
     job = _require_bundle_job(job_id)
-    _require_succeeded(job.status, "诊断包作业")
+    _require_succeeded(job.status)
     verdict = receipts.verify_receipt(
         get_master_key(),
         receipt,
