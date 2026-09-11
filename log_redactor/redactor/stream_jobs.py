@@ -474,11 +474,12 @@ def run_stream_job(job_id: str, get_db: Callable[[], Database],
                 on_publish_hook(job_id)
             # 完整性凭证随成品一同发布（崩溃窗口由恢复对账补发）
             publish_stream_receipt(db, get_key(), job_id, output_path=published)
+            # 先清理原始文件，再发布终态：调用方看到 succeeded 时
+            # 作业目录必须已经收拾干净（崩溃则由恢复对账重复清理，幂等）
+            raw_path(job_id).unlink(missing_ok=True)
             db.mark_stream_succeeded(
                 job_id, output_filename=published.name
             )
-            # 原始文件必须清理；已发布的成品保留
-            raw_path(job_id).unlink(missing_ok=True)
     finally:
         if not out.closed:
             out.close()

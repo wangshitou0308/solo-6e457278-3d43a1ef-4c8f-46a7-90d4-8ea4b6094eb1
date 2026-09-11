@@ -723,13 +723,14 @@ def run_bundle_job(job_id: str, get_db: Callable[[], Database],
                 on_publish_hook(job_id)
             # 完整性凭证随成品一同发布（崩溃窗口由恢复对账补发）
             publish_bundle_receipt(db, get_key(), job_id, output_path=published)
+            # 先清理原始压缩包与暂存区，再发布终态：调用方看到 succeeded 时
+            # 作业目录必须已经收拾干净（崩溃则由恢复对账重复清理，幂等）
+            raw_path(job_id).unlink(missing_ok=True)
+            shutil.rmtree(staging_dir(job_id), ignore_errors=True)
             db.mark_bundle_succeeded(
                 job_id, output_filename=published.name,
                 output_bytes=published.stat().st_size,
             )
-            # 原始压缩包与暂存区必须清理；已发布的成品保留
-            raw_path(job_id).unlink(missing_ok=True)
-            shutil.rmtree(staging_dir(job_id), ignore_errors=True)
         except Exception as exc:  # 发布失败同样进入终态并清理
             db.mark_bundle_failed(job_id, message=f"结果发布失败：{exc}")
             cleanup_bundle_files(job_id, keep_output=False)
