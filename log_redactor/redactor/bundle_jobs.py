@@ -48,6 +48,7 @@ from .crypto import (
 from .database import Database, utcnow_iso
 from .engine import RedactionEngine
 from .models import BundleFileInfo, BundleJobModel, Strategy
+from .receipts import publish_bundle_receipt, receipt_path_for_output
 from .stream_jobs import JobRegistry, _fsync_dir, atomic_publish, tighten
 
 # 结果 ZIP 内每个条目的权限（仅属主可读写）
@@ -82,11 +83,12 @@ def ensure_bundle_dirs() -> None:
 
 
 def cleanup_bundle_files(job_id: str, *, keep_output: bool) -> None:
-    """作业终结清理：原始压缩包与暂存区必删；未发布成功时输出一并删除。"""
+    """作业终结清理：原始压缩包与暂存区必删；未发布成功时输出与凭证一并删除。"""
     raw_path(job_id).unlink(missing_ok=True)
     shutil.rmtree(staging_dir(job_id), ignore_errors=True)
     if not keep_output:
         final_output_path(job_id).unlink(missing_ok=True)
+        receipt_path_for_output(final_output_path(job_id)).unlink(missing_ok=True)
         (bundles_dir() / "out" / f"{_TMP_PREFIX}{job_id}.zip").unlink(missing_ok=True)
 
 
@@ -533,6 +535,9 @@ def run_bundle_job(job_id: str, get_db: Callable[[], Database],
     db = get_db()
     # 优先对账“成品已发布但状态未提交”的崩溃窗口：补登 succeeded 后直接退出
     if reconcile_published_bundle(db, job_id):
+        # 崩溃可能发生在凭证发布之前：对账补登的同时确保凭证存在
+        publish_bundle_receipt(db, get_key(), job_id,
+                               output_path=final_output_path(job_id))
         bundle_registry._discard(job_id)
         return
     job = db.get_bundle_job(job_id)
@@ -716,6 +721,8 @@ def run_bundle_job(job_id: str, get_db: Callable[[], Database],
             # 测试钩子：精确模拟“成品已发布、succeeded 事务未提交”的崩溃窗口
             if on_publish_hook is not None:
                 on_publish_hook(job_id)
+            # 完整性凭证随成品一同发布（崩溃窗口由恢复对账补发）
+            publish_bundle_receipt(db, get_key(), job_id, output_path=published)
             db.mark_bundle_succeeded(
                 job_id, output_filename=published.name,
                 output_bytes=published.stat().st_size,
@@ -757,6 +764,9 @@ def recover_bundle_jobs(get_db: Callable[[], Database],
             continue
         # 1) 先对账“成品已发布、状态未提交”的崩溃窗口
         if reconcile_published_bundle(db, job_id):
+            # 对账补登的同时确保完整性凭证存在（崩溃可能发生在凭证发布前）
+            publish_bundle_receipt(db, get_key(), job_id,
+                                   output_path=final_output_path(job_id))
             continue
         # 2) 原始压缩包已丢失：无法续跑，标记失败并清理残留
         if not raw_path(job_id).exists():

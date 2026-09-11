@@ -417,6 +417,9 @@ class JobModel(BaseModel):
         default="global",
         description="令牌关联域指纹：global=全局映射；dom:<hex>=隔离域",
     )
+    receipt_url: str = Field(
+        default="", description="完整性凭证查询地址（成功发布的作业必有凭证）"
+    )
 
 
 class JobDetail(JobModel):
@@ -487,6 +490,9 @@ class StreamJobModel(BaseModel):
     strategy_sha256: str = Field(default="", description="规范化策略 SHA-256，参与幂等一致性判定")
     progress_pct: float = 0.0
     download_url: str | None = None
+    receipt_url: str | None = Field(
+        default=None, description="完整性凭证查询地址；仅 succeeded 作业可用"
+    )
 
 
 class StreamJobSummary(BaseModel):
@@ -600,6 +606,9 @@ class BundleJobModel(BaseModel):
     strategy_sha256: str = Field(default="", description="规范化策略 SHA-256，参与幂等一致性判定")
     progress_pct: float = 0.0
     download_url: str | None = None
+    receipt_url: str | None = Field(
+        default=None, description="完整性凭证查询地址；仅 succeeded 作业可用"
+    )
 
 
 class BundleJobSummary(BaseModel):
@@ -617,3 +626,34 @@ class BundleJobSummary(BaseModel):
 class BundleJobList(BaseModel):
     items: list[BundleJobSummary]
     total: int
+
+
+# ---------- 脱敏结果完整性凭证 ----------
+
+ReceiptVerdict = Literal[
+    "ok",
+    "unsupported_format",
+    "key_mismatch",
+    "receipt_tampered",
+    "job_mismatch",
+    "result_missing",
+    "content_mismatch",
+]
+
+
+class ReceiptVerifyResponse(BaseModel):
+    """凭证校验结论。HTTP 恒为 200，结论看 ``verdict``；不返回任何文件内容。"""
+
+    job_id: str
+    job_kind: Literal["batch", "stream", "bundle"]
+    ok: bool = Field(description="凭证标签与结果摘要均一致时为 true")
+    verdict: ReceiptVerdict = Field(
+        description="ok=一致；unsupported_format=格式不支持；key_mismatch=密钥不匹配；"
+                    "receipt_tampered=凭证被改动；job_mismatch=凭证与本作业不对应；"
+                    "result_missing=结果缺失；content_mismatch=内容不符"
+    )
+    detail: str = Field(description="结论说明（不含原始值/处理后值）")
+    checks: dict[str, str] = Field(
+        description="各校验阶段结果（ok/failed/skipped）：format/binding/structure/"
+                    "key/tag/result/content"
+    )

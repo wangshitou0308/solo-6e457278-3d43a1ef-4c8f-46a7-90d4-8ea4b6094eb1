@@ -31,6 +31,7 @@ from .crypto import (
 from .database import Database
 from .engine import RedactionEngine
 from .models import AuditEntry, RiskFinding, Strategy
+from .receipts import publish_stream_receipt, receipt_path_for_output
 
 
 def checkpoint_records() -> int:
@@ -95,11 +96,12 @@ def atomic_publish(src: Path, dst: Path) -> None:
 
 
 def cleanup_stream_files(job_id: str, *, keep_output: bool) -> None:
-    """作业终结清理：原始文件必删；未发布成功时输出一并删除。"""
+    """作业终结清理：原始文件必删；未发布成功时输出与凭证一并删除。"""
     raw_path(job_id).unlink(missing_ok=True)
     if not keep_output:
         partial_output_path(job_id).unlink(missing_ok=True)
         final_output_path(job_id).unlink(missing_ok=True)
+        receipt_path_for_output(final_output_path(job_id)).unlink(missing_ok=True)
 
 
 # ---------- 取消注册表（进程内） ----------
@@ -258,6 +260,9 @@ def run_stream_job(job_id: str, get_db: Callable[[], Database],
     db = get_db()
     # 优先对账“成品已发布但状态未提交”的崩溃窗口：补登 succeeded 后直接退出
     if reconcile_published_job(db, job_id):
+        # 崩溃可能发生在凭证发布之前：对账补登的同时确保凭证存在
+        publish_stream_receipt(db, get_key(), job_id,
+                               output_path=final_output_path(job_id))
         registry._discard(job_id)
         return
     job = db.get_stream_job(job_id)
@@ -467,6 +472,8 @@ def run_stream_job(job_id: str, get_db: Callable[[], Database],
             # 测试钩子：精确模拟“成品已发布、succeeded 事务未提交”的崩溃窗口
             if on_publish_hook is not None:
                 on_publish_hook(job_id)
+            # 完整性凭证随成品一同发布（崩溃窗口由恢复对账补发）
+            publish_stream_receipt(db, get_key(), job_id, output_path=published)
             db.mark_stream_succeeded(
                 job_id, output_filename=published.name
             )
@@ -507,6 +514,9 @@ def recover_stream_jobs(get_db: Callable[[], Database],
         # 1) 先对账“成品已发布、状态未提交”的崩溃窗口：补登 succeeded，
         #    绝不能在这种状态下再开一个会写 NUL partial 的 worker
         if reconcile_published_job(db, job_id):
+            # 对账补登的同时确保完整性凭证存在（崩溃可能发生在凭证发布前）
+            publish_stream_receipt(db, get_key(), job_id,
+                                   output_path=final_output_path(job_id))
             continue
         # 2) 原始文件已丢失（如手工清理）：无法续跑，标记失败并清理残留输出
         if not raw_path(job_id).exists():

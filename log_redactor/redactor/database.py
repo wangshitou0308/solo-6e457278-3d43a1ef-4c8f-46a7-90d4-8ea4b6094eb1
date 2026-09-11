@@ -46,6 +46,7 @@ CREATE TABLE IF NOT EXISTS jobs (
     key_fingerprint TEXT NOT NULL,
     content_sha256 TEXT NOT NULL DEFAULT '',
     strategy_sha256 TEXT NOT NULL DEFAULT '',
+    content_bytes INTEGER NOT NULL DEFAULT 0,
     domain_id TEXT
 );
 CREATE TABLE IF NOT EXISTS audit (
@@ -262,6 +263,11 @@ class Database:
                 conn.execute(
                     "ALTER TABLE jobs ADD COLUMN strategy_sha256 TEXT NOT NULL DEFAULT ''"
                 )
+            # 完整性凭证：输入字节数（与内容摘要一同参与凭证记录）
+            if "content_bytes" not in jobs_cols:
+                conn.execute(
+                    "ALTER TABLE jobs ADD COLUMN content_bytes INTEGER NOT NULL DEFAULT 0"
+                )
 
     # ---------- 写入 ----------
 
@@ -283,6 +289,7 @@ class Database:
         risks: list[RiskFinding],
         content_sha256: str = "",
         strategy_sha256: str = "",
+        content_bytes: int = 0,
         domain_id: str | None = None,
     ) -> JobModel:
         created_at = utcnow_iso()
@@ -292,8 +299,8 @@ class Database:
                    strategy_name, strategy_version, record_count, needs_review,
                    stats_json, output_filename, output_format,
                    top_level_is_array, key_fingerprint,
-                   content_sha256, strategy_sha256, domain_id)
-                   VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                   content_sha256, strategy_sha256, content_bytes, domain_id)
+                   VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
                 (
                     job_id,
                     idempotency_key,
@@ -310,6 +317,7 @@ class Database:
                     key_fingerprint,
                     content_sha256,
                     strategy_sha256,
+                    content_bytes,
                     domain_id,
                 ),
             )
@@ -354,6 +362,16 @@ class Database:
                 "COALESCE(domain_id, '') AS domain_id "
                 "FROM jobs WHERE idempotency_key = ?",
                 (key,),
+            ).fetchone()
+
+    def get_job_receipt_source(self, job_id: str) -> sqlite3.Row | None:
+        """取生成/补发小批量作业完整性凭证所需的持久化字段。"""
+        with self._conn() as conn:
+            return conn.execute(
+                "SELECT id, format, strategy_name, strategy_version, stats_json, "
+                "output_filename, content_sha256, strategy_sha256, content_bytes, "
+                "COALESCE(domain_id, '') AS domain_id FROM jobs WHERE id = ?",
+                (job_id,),
             ).fetchone()
 
     def _load_audit(self, conn: sqlite3.Connection, job_id: str) -> list[AuditEntry]:
@@ -410,6 +428,7 @@ class Database:
             domain_fingerprint=domain_fingerprint(
                 row["domain_id"] if row.keys().count("domain_id") else None
             ),
+            receipt_url=f"/api/v1/jobs/{row['id']}/receipt",
         )
 
     def get_job(self, job_id: str) -> JobModel | None:
@@ -495,6 +514,8 @@ class Database:
             progress_pct=pct,
             download_url=(f"/api/v1/stream-jobs/{job_id}/download"
                           if status == "succeeded" and output_filename else None),
+            receipt_url=(f"/api/v1/stream-jobs/{job_id}/receipt"
+                         if status == "succeeded" and output_filename else None),
         )
 
     def create_stream_job(
@@ -827,6 +848,8 @@ class Database:
             progress_pct=pct,
             download_url=(f"/api/v1/bundle-jobs/{job_id}/download"
                           if status == "succeeded" and output_filename else None),
+            receipt_url=(f"/api/v1/bundle-jobs/{job_id}/receipt"
+                         if status == "succeeded" and output_filename else None),
         )
 
     def create_bundle_job(

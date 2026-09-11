@@ -25,6 +25,9 @@
 * ``GET  /api/v1/bundle-jobs/{job_id}/risks`` 分页残留风险（带来源路径）
 * ``GET  /api/v1/bundle-jobs/{job_id}/manifest`` 处理清单（跳过/失败原因）
 * ``GET  /api/v1/bundle-jobs/{job_id}/download`` 下载结果 ZIP（脱敏文件+清单）
+* ``GET  /api/v1/{jobs,stream-jobs,bundle-jobs}/{job_id}/receipt`` 完整性凭证查询
+* ``GET  /api/v1/{jobs,stream-jobs,bundle-jobs}/{job_id}/receipt/download`` 凭证下载
+* ``POST /api/v1/{jobs,stream-jobs,bundle-jobs}/{job_id}/receipt/verify`` 凭证校验
 * ``GET  /api/v1/sample/strategy``、``/sample/logs.ndjson``  可直接启动的示例
 * ``GET  /healthz``                     健康检查（含主密钥指纹）
 
@@ -38,15 +41,15 @@ import os
 import sqlite3
 import uuid
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 from contextlib import asynccontextmanager
 
-from fastapi import FastAPI, File, Form, Header, HTTPException, Query, Request, UploadFile
+from fastapi import Body, FastAPI, File, Form, Header, HTTPException, Query, Request, UploadFile
 from fastapi.responses import FileResponse, JSONResponse, Response
 from fastapi.openapi.utils import get_openapi
 
-from . import config
+from . import config, receipts
 from .bundle_jobs import (
     build_manifest,
     bundle_registry,
@@ -73,6 +76,7 @@ from .models import (
     JobDetail,
     JobList,
     JobModel,
+    ReceiptVerifyResponse,
     RunResult,
     Strategy,
     StrategyDiffRequest,
@@ -98,7 +102,7 @@ UPLOAD_CHUNK = 1024 * 1024  # 1 MiB：multipart 流式落盘的拷贝块大小
 
 app = FastAPI(
     title="本地日志脱敏 API",
-    version="1.4.0",
+    version="1.5.0",
     description=(
         "供后端团队提交故障样本前使用的本地日志脱敏服务。支持按字段路径/键名/正则/内置识别器"
         "（邮箱、手机号、IP、访问令牌、身份证、银行卡）命中，动作包括删除、掩码与基于本地"
@@ -134,7 +138,15 @@ app = FastAPI(
         "超过文件数/单文件/展开总量/压缩比上限的压缩包；二进制与不支持类型不写入结果，"
         "只在结果 ZIP 的 redaction-manifest.json 清单列明原因。审计与残留风险带来源路径"
         "与行号/记录位置，不含原值；同一 Idempotency-Key 仅在压缩包与策略均一致时回放，"
-        "否则 409；支持进度查询、取消与重启续跑，终态清理原始包，成功后原子发布结果 ZIP。"
+        "否则 409；支持进度查询、取消与重启续跑，终态清理原始包，成功后原子发布结果 ZIP。\n\n"
+        "## 脱敏结果完整性凭证（receipt）\n"
+        "小批量、流式 NDJSON 与诊断包作业在**成功发布结果**时生成独立 JSON 凭证：记录"
+        "格式版本、输入与规范化策略摘要、关联域指纹、统计计数与输出文件摘要（诊断包另列"
+        "结果 ZIP 内各文件的路径与摘要），**不含原始值、处理后值、策略正文或密钥材料**。"
+        "凭证由主密钥派生的凭证子密钥按固定字段顺序计算 HMAC-SHA256 标签。三类作业均提供"
+        "凭证查询、下载与校验接口；校验重算标签与现有结果摘要，区分凭证被改动、结果缺失、"
+        "内容不符、密钥不匹配与格式不支持，**不重新脱敏、不返回文件内容**。取消/失败的"
+        "异步作业不生成凭证；幂等回放指向同一凭证；重启后仍可校验已发布结果。"
     ),
     contact={"name": "platform-security"},
 )
@@ -386,8 +398,24 @@ def create_job(
     parsed, result = _execute(req)
     job_id = uuid.uuid4().hex
     filename = f"{job_id}.{req.format}"
-    _write_output(_output_path(job_id, req.format), result.records, req.format,
+    out_path = _output_path(job_id, req.format)
+    _write_output(out_path, result.records, req.format,
                   as_array=parsed.top_level_is_array)
+    # 完整性凭证与结果文件一同发布（只含摘要/指纹/计数，不落任何值）
+    receipt_path = receipts.receipt_path_for_output(out_path)
+    receipts.publish_batch_receipt(
+        get_master_key(),
+        job_id=job_id,
+        fmt=req.format,
+        content_sha256=content_sha,
+        content_bytes=len(content_bytes),
+        strategy_name=req.strategy.name,
+        strategy_version=req.strategy.version,
+        strategy_sha256=strategy_sha,
+        domain_fingerprint=result.domain_fingerprint,
+        stats=receipts.batch_stats(result.stats),
+        output_path=out_path,
+    )
     try:
         job = get_db().save_job(
             job_id=job_id,
@@ -405,12 +433,14 @@ def create_job(
             risks=result.risks,
             content_sha256=content_sha,
             strategy_sha256=strategy_sha,
+            content_bytes=len(content_bytes),
             domain_id=domain_hex,
         )
     except sqlite3.IntegrityError:
         # 并发提交相同幂等键：对方先落库，回放或冲突（清理本请求的冗余文件）
         winner = get_db().get_idempotent(idempotency_key) if idempotency_key else None
-        _output_path(job_id, req.format).unlink(missing_ok=True)
+        out_path.unlink(missing_ok=True)
+        receipt_path.unlink(missing_ok=True)
         if winner:
             _check_idempotency_triplet(
                 winner, content_sha=content_sha, strategy_sha=strategy_sha,
@@ -1080,6 +1110,267 @@ def download_bundle_job(job_id: str):
         media_type="application/zip",
         filename=f"redacted-{name}",
     )
+
+
+# ---------- 脱敏结果完整性凭证 ----------
+
+
+def _resolve_receipt_path(output_path: Path, ensure: Callable[[], bool]) -> Path:
+    """定位凭证文件：缺失时先尽力自愈补发；仍不可得则按结果状态报错。"""
+    path = receipts.receipt_path_for_output(output_path)
+    if not path.exists():
+        ensure()
+    if receipts.read_receipt(path) is None:
+        if not output_path.exists():
+            raise HTTPException(status_code=410, detail="结果文件与凭证均已被清理")
+        raise HTTPException(status_code=404, detail="凭证不存在或已损坏")
+    return path
+
+
+def _receipt_json(path: Path) -> dict[str, Any]:
+    """按原样返回凭证（不做任何字段增删，保证标签可被调用方复核）。"""
+    receipt = receipts.read_receipt(path)
+    assert receipt is not None  # _resolve_receipt_path 已保证可读
+    return receipt
+
+
+def _receipt_file_response(job_id: str, path: Path) -> FileResponse:
+    return FileResponse(
+        path,
+        media_type="application/json; charset=utf-8",
+        filename=f"receipt-{job_id}.json",
+    )
+
+
+def _require_succeeded(status: str) -> None:
+    if status != "succeeded":
+        raise HTTPException(
+            status_code=409,
+            detail={"message": f"作业状态为 {status}，未发布结果，无完整性凭证",
+                    "status": status},
+        )
+
+
+@app.get(
+    "/api/v1/jobs/{job_id}/receipt",
+    tags=["receipts"],
+    summary="查询小批量作业的完整性凭证",
+    description="返回成功发布时生成的 JSON 凭证：格式版本、输入与规范化策略摘要、"
+                "关联域指纹、统计计数与输出文件摘要及 HMAC-SHA256 标签；"
+                "不含原始值、处理后值、策略正文或密钥材料。",
+    responses={404: {"description": "作业或凭证不存在"}, 410: {"description": "结果与凭证已被清理"}},
+)
+def get_job_receipt(job_id: str) -> dict[str, Any]:
+    job = _require_job(job_id)
+    out = _output_path(job_id, job.format)
+    path = _resolve_receipt_path(
+        out,
+        lambda: receipts.ensure_batch_receipt(
+            get_db(), get_master_key(), job_id, output_path=out
+        ),
+    )
+    return _receipt_json(path)
+
+
+@app.get(
+    "/api/v1/jobs/{job_id}/receipt/download",
+    tags=["receipts"],
+    summary="下载小批量作业的完整性凭证（JSON 文件）",
+    responses={404: {"description": "作业或凭证不存在"}, 410: {"description": "结果与凭证已被清理"}},
+)
+def download_job_receipt(job_id: str) -> FileResponse:
+    job = _require_job(job_id)
+    out = _output_path(job_id, job.format)
+    path = _resolve_receipt_path(
+        out,
+        lambda: receipts.ensure_batch_receipt(
+            get_db(), get_master_key(), job_id, output_path=out
+        ),
+    )
+    return _receipt_file_response(job_id, path)
+
+
+@app.post(
+    "/api/v1/jobs/{job_id}/receipt/verify",
+    tags=["receipts"],
+    summary="校验小批量作业凭证（重算标签与现有结果摘要）",
+    description=(
+        "请求体为待校验的凭证 JSON（通常为先前查询/下载得到的凭证）。服务重算凭证"
+        "标签与**现有结果文件**摘要并给出结论，**不重新脱敏、不返回文件内容**。\n\n"
+        "`verdict` 取值：`ok`=一致；`unsupported_format`=格式不支持；"
+        "`key_mismatch`=密钥不匹配；`receipt_tampered`=凭证被改动；"
+        "`job_mismatch`=凭证与本作业不对应；`result_missing`=结果缺失；"
+        "`content_mismatch`=内容不符。HTTP 恒为 200，结论看 `verdict`。"
+    ),
+    response_model=ReceiptVerifyResponse,
+    responses={404: {"description": "作业不存在"}, 422: {"description": "请求体不是 JSON 对象"}},
+)
+def verify_job_receipt(
+    job_id: str,
+    receipt: dict[str, Any] = Body(description="待校验的完整性凭证 JSON"),
+) -> ReceiptVerifyResponse:
+    job = _require_job(job_id)
+    verdict = receipts.verify_receipt(
+        get_master_key(),
+        receipt,
+        job_id=job_id,
+        job_kind=receipts.KIND_BATCH,
+        output_path=_output_path(job_id, job.format),
+    )
+    return ReceiptVerifyResponse(**verdict)
+
+
+@app.get(
+    "/api/v1/stream-jobs/{job_id}/receipt",
+    tags=["receipts"],
+    summary="查询流式作业的完整性凭证",
+    description="仅 succeeded 作业有凭证（成功发布结果时生成）；"
+                "排队/运行/失败/取消的作业返回 409。",
+    responses={
+        404: {"description": "作业或凭证不存在"},
+        409: {"description": "作业未完成，尚无凭证"},
+        410: {"description": "结果与凭证已被清理"},
+    },
+)
+def get_stream_job_receipt(job_id: str) -> dict[str, Any]:
+    job = _require_stream_job(job_id)
+    _require_succeeded(job.status, "流式作业")
+    out = final_output_path(job_id)
+    path = _resolve_receipt_path(
+        out,
+        lambda: receipts.publish_stream_receipt(
+            get_db(), get_master_key(), job_id, output_path=out
+        ),
+    )
+    return _receipt_json(path)
+
+
+@app.get(
+    "/api/v1/stream-jobs/{job_id}/receipt/download",
+    tags=["receipts"],
+    summary="下载流式作业的完整性凭证（JSON 文件）",
+    responses={
+        404: {"description": "作业或凭证不存在"},
+        409: {"description": "作业未完成，尚无凭证"},
+        410: {"description": "结果与凭证已被清理"},
+    },
+)
+def download_stream_job_receipt(job_id: str) -> FileResponse:
+    job = _require_stream_job(job_id)
+    _require_succeeded(job.status, "流式作业")
+    out = final_output_path(job_id)
+    path = _resolve_receipt_path(
+        out,
+        lambda: receipts.publish_stream_receipt(
+            get_db(), get_master_key(), job_id, output_path=out
+        ),
+    )
+    return _receipt_file_response(job_id, path)
+
+
+@app.post(
+    "/api/v1/stream-jobs/{job_id}/receipt/verify",
+    tags=["receipts"],
+    summary="校验流式作业凭证（重算标签与现有结果摘要）",
+    description="请求体为待校验的凭证 JSON；仅 succeeded 作业可校验。"
+                "判定语义与小批量凭证校验接口一致，不重新脱敏、不返回文件内容。",
+    response_model=ReceiptVerifyResponse,
+    responses={
+        404: {"description": "作业不存在"},
+        409: {"description": "作业未完成，无法校验"},
+        422: {"description": "请求体不是 JSON 对象"},
+    },
+)
+def verify_stream_job_receipt(
+    job_id: str,
+    receipt: dict[str, Any] = Body(description="待校验的完整性凭证 JSON"),
+) -> ReceiptVerifyResponse:
+    job = _require_stream_job(job_id)
+    _require_succeeded(job.status, "流式作业")
+    verdict = receipts.verify_receipt(
+        get_master_key(),
+        receipt,
+        job_id=job_id,
+        job_kind=receipts.KIND_STREAM,
+        output_path=final_output_path(job_id),
+    )
+    return ReceiptVerifyResponse(**verdict)
+
+
+@app.get(
+    "/api/v1/bundle-jobs/{job_id}/receipt",
+    tags=["receipts"],
+    summary="查询诊断包作业的完整性凭证",
+    description="仅 succeeded 作业有凭证；凭证另列结果 ZIP 内各文件的路径与摘要。",
+    responses={
+        404: {"description": "作业或凭证不存在"},
+        409: {"description": "作业未完成，尚无凭证"},
+        410: {"description": "结果与凭证已被清理"},
+    },
+)
+def get_bundle_job_receipt(job_id: str) -> dict[str, Any]:
+    job = _require_bundle_job(job_id)
+    _require_succeeded(job.status, "诊断包作业")
+    out = bundle_final_output_path(job_id)
+    path = _resolve_receipt_path(
+        out,
+        lambda: receipts.publish_bundle_receipt(
+            get_db(), get_master_key(), job_id, output_path=out
+        ),
+    )
+    return _receipt_json(path)
+
+
+@app.get(
+    "/api/v1/bundle-jobs/{job_id}/receipt/download",
+    tags=["receipts"],
+    summary="下载诊断包作业的完整性凭证（JSON 文件）",
+    responses={
+        404: {"description": "作业或凭证不存在"},
+        409: {"description": "作业未完成，尚无凭证"},
+        410: {"description": "结果与凭证已被清理"},
+    },
+)
+def download_bundle_job_receipt(job_id: str) -> FileResponse:
+    job = _require_bundle_job(job_id)
+    _require_succeeded(job.status, "诊断包作业")
+    out = bundle_final_output_path(job_id)
+    path = _resolve_receipt_path(
+        out,
+        lambda: receipts.publish_bundle_receipt(
+            get_db(), get_master_key(), job_id, output_path=out
+        ),
+    )
+    return _receipt_file_response(job_id, path)
+
+
+@app.post(
+    "/api/v1/bundle-jobs/{job_id}/receipt/verify",
+    tags=["receipts"],
+    summary="校验诊断包作业凭证（重算标签、结果 ZIP 与各条目摘要）",
+    description="请求体为待校验的凭证 JSON；仅 succeeded 作业可校验。除整体摘要外，"
+                "还逐一核对结果 ZIP 内各文件的路径与摘要；不重新脱敏、不返回文件内容。",
+    response_model=ReceiptVerifyResponse,
+    responses={
+        404: {"description": "作业不存在"},
+        409: {"description": "作业未完成，无法校验"},
+        422: {"description": "请求体不是 JSON 对象"},
+    },
+)
+def verify_bundle_job_receipt(
+    job_id: str,
+    receipt: dict[str, Any] = Body(description="待校验的完整性凭证 JSON"),
+) -> ReceiptVerifyResponse:
+    job = _require_bundle_job(job_id)
+    _require_succeeded(job.status, "诊断包作业")
+    verdict = receipts.verify_receipt(
+        get_master_key(),
+        receipt,
+        job_id=job_id,
+        job_kind=receipts.KIND_BUNDLE,
+        output_path=bundle_final_output_path(job_id),
+    )
+    return ReceiptVerifyResponse(**verdict)
 
 
 # ---------- 错误处理 ----------
