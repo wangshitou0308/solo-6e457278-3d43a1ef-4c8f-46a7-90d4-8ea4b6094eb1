@@ -12,6 +12,7 @@ from pathlib import Path
 from typing import Any
 
 from .config import settings
+from .crypto import domain_fingerprint
 from .models import (
     AuditEntry,
     AuditPage,
@@ -42,7 +43,10 @@ CREATE TABLE IF NOT EXISTS jobs (
     output_filename TEXT NOT NULL,
     output_format TEXT NOT NULL,
     top_level_is_array INTEGER NOT NULL DEFAULT 1,
-    key_fingerprint TEXT NOT NULL
+    key_fingerprint TEXT NOT NULL,
+    content_sha256 TEXT NOT NULL DEFAULT '',
+    strategy_sha256 TEXT NOT NULL DEFAULT '',
+    domain_id TEXT
 );
 CREATE TABLE IF NOT EXISTS audit (
     job_id TEXT NOT NULL,
@@ -97,7 +101,8 @@ CREATE TABLE IF NOT EXISTS stream_jobs (
     output_filename TEXT,
     output_bytes INTEGER NOT NULL DEFAULT 0,
     cancel_requested INTEGER NOT NULL DEFAULT 0,
-    key_fingerprint TEXT NOT NULL
+    key_fingerprint TEXT NOT NULL,
+    domain_id TEXT
 );
 CREATE INDEX IF NOT EXISTS idx_stream_jobs_status ON stream_jobs(status);
 -- 流式审计/风险与检查点同事务落库，行即检查点边界
@@ -154,7 +159,8 @@ CREATE TABLE IF NOT EXISTS bundle_jobs (
     output_filename TEXT,
     output_bytes INTEGER NOT NULL DEFAULT 0,
     cancel_requested INTEGER NOT NULL DEFAULT 0,
-    key_fingerprint TEXT NOT NULL
+    key_fingerprint TEXT NOT NULL,
+    domain_id TEXT
 );
 CREATE INDEX IF NOT EXISTS idx_bundle_jobs_status ON bundle_jobs(status);
 -- 每个来源文件一行：文件级检查点边界；恢复时据此跳过已完成文件
@@ -239,6 +245,23 @@ class Database:
                 conn.execute(
                     "ALTER TABLE stream_jobs ADD COLUMN strategy_sha256 TEXT NOT NULL DEFAULT ''"
                 )
+            # 令牌关联域：只持久化不可逆域标识（hex），全局域为 NULL
+            for table in ("jobs", "stream_jobs", "bundle_jobs"):
+                tcols = {r["name"] for r in conn.execute(f"PRAGMA table_info({table})")}
+                if "domain_id" not in tcols:
+                    conn.execute(
+                        f"ALTER TABLE {table} ADD COLUMN domain_id TEXT"
+                    )
+            # 小批量作业幂等键升级为同时绑定内容与策略（既有列补齐默认值）
+            jobs_cols = {r["name"] for r in conn.execute("PRAGMA table_info(jobs)")}
+            if "content_sha256" not in jobs_cols:
+                conn.execute(
+                    "ALTER TABLE jobs ADD COLUMN content_sha256 TEXT NOT NULL DEFAULT ''"
+                )
+            if "strategy_sha256" not in jobs_cols:
+                conn.execute(
+                    "ALTER TABLE jobs ADD COLUMN strategy_sha256 TEXT NOT NULL DEFAULT ''"
+                )
 
     # ---------- 写入 ----------
 
@@ -258,6 +281,9 @@ class Database:
         key_fingerprint: str,
         audit: list[AuditEntry],
         risks: list[RiskFinding],
+        content_sha256: str = "",
+        strategy_sha256: str = "",
+        domain_id: str | None = None,
     ) -> JobModel:
         created_at = utcnow_iso()
         with self._lock, self._conn() as conn:
@@ -265,8 +291,9 @@ class Database:
                 """INSERT INTO jobs (id, idempotency_key, created_at, format,
                    strategy_name, strategy_version, record_count, needs_review,
                    stats_json, output_filename, output_format,
-                   top_level_is_array, key_fingerprint)
-                   VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                   top_level_is_array, key_fingerprint,
+                   content_sha256, strategy_sha256, domain_id)
+                   VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
                 (
                     job_id,
                     idempotency_key,
@@ -281,6 +308,9 @@ class Database:
                     output_format,
                     int(top_level_is_array),
                     key_fingerprint,
+                    content_sha256,
+                    strategy_sha256,
+                    domain_id,
                 ),
             )
             conn.executemany(
@@ -316,12 +346,15 @@ class Database:
 
     # ---------- 读取 ----------
 
-    def get_idempotent(self, key: str) -> str | None:
+    def get_idempotent(self, key: str) -> sqlite3.Row | None:
+        """按幂等键取回内容/策略摘要与关联域标识，供回放与冲突判定。"""
         with self._conn() as conn:
-            row = conn.execute(
-                "SELECT id FROM jobs WHERE idempotency_key = ?", (key,)
+            return conn.execute(
+                "SELECT id, content_sha256, strategy_sha256, "
+                "COALESCE(domain_id, '') AS domain_id "
+                "FROM jobs WHERE idempotency_key = ?",
+                (key,),
             ).fetchone()
-        return row["id"] if row else None
 
     def _load_audit(self, conn: sqlite3.Connection, job_id: str) -> list[AuditEntry]:
         rows = conn.execute(
@@ -374,6 +407,9 @@ class Database:
             top_level_is_array=bool(row.keys().count("top_level_is_array")
                                     and row["top_level_is_array"]),
             key_fingerprint=row["key_fingerprint"],
+            domain_fingerprint=domain_fingerprint(
+                row["domain_id"] if row.keys().count("domain_id") else None
+            ),
         )
 
     def get_job(self, job_id: str) -> JobModel | None:
@@ -453,6 +489,7 @@ class Database:
             output_filename=output_filename,
             output_bytes=row["output_bytes"] or 0,
             key_fingerprint=row["key_fingerprint"],
+            domain_fingerprint=domain_fingerprint(row["domain_id"]),
             content_sha256=row["content_sha256"],
             strategy_sha256=row["strategy_sha256"],
             progress_pct=pct,
@@ -471,6 +508,7 @@ class Database:
         content_sha256: str,
         bytes_total: int,
         key_fingerprint: str,
+        domain_id: str | None = None,
     ) -> StreamJobModel:
         import json as _json
 
@@ -481,13 +519,13 @@ class Database:
                 """INSERT INTO stream_jobs (id, idempotency_key, created_at, updated_at,
                    status, format, strategy_json, strategy_name, strategy_version,
                    source_filename, content_sha256, strategy_sha256, bytes_total,
-                   key_fingerprint)
-                   VALUES (?,?,?,?, 'queued', 'ndjson', ?,?,?,?,?,?,?,?)""",
+                   key_fingerprint, domain_id)
+                   VALUES (?,?,?,?, 'queued', 'ndjson', ?,?,?,?,?,?,?,?,?)""",
                 (
                     job_id, idempotency_key, now, now, strategy_json,
                     strategy.get("name", ""), str(strategy.get("version", "1")),
                     source_filename, content_sha256, strategy_sha256,
-                    bytes_total, key_fingerprint,
+                    bytes_total, key_fingerprint, domain_id,
                 ),
             )
             row = conn.execute(
@@ -512,10 +550,19 @@ class Database:
     def get_stream_idempotent(self, key: str) -> sqlite3.Row | None:
         with self._conn() as conn:
             return conn.execute(
-                "SELECT id, content_sha256, strategy_sha256 FROM stream_jobs "
+                "SELECT id, content_sha256, strategy_sha256, "
+                "COALESCE(domain_id, '') AS domain_id FROM stream_jobs "
                 "WHERE idempotency_key = ?",
                 (key,),
             ).fetchone()
+
+    def get_stream_domain_id(self, job_id: str) -> str | None:
+        """取作业的令牌关联域标识（worker 重启续跑时据此恢复域子密钥）。"""
+        with self._conn() as conn:
+            row = conn.execute(
+                "SELECT domain_id FROM stream_jobs WHERE id = ?", (job_id,)
+            ).fetchone()
+        return row["domain_id"] if row else None
 
     def checkpoint_stream_job(
         self,
@@ -774,6 +821,7 @@ class Database:
             output_filename=output_filename,
             output_bytes=row["output_bytes"] or 0,
             key_fingerprint=row["key_fingerprint"],
+            domain_fingerprint=domain_fingerprint(row["domain_id"]),
             content_sha256=row["content_sha256"],
             strategy_sha256=row["strategy_sha256"],
             progress_pct=pct,
@@ -793,6 +841,7 @@ class Database:
         bytes_total: int,
         files_total: int,
         key_fingerprint: str,
+        domain_id: str | None = None,
     ) -> BundleJobModel:
         strategy = json.loads(strategy_json)
         now = utcnow_iso()
@@ -801,13 +850,13 @@ class Database:
                 """INSERT INTO bundle_jobs (id, idempotency_key, created_at, updated_at,
                    status, strategy_json, strategy_name, strategy_version,
                    source_filename, content_sha256, strategy_sha256, bytes_total,
-                   files_total, key_fingerprint)
-                   VALUES (?,?,?,?, 'queued', ?,?,?,?,?,?,?,?,?)""",
+                   files_total, key_fingerprint, domain_id)
+                   VALUES (?,?,?,?, 'queued', ?,?,?,?,?,?,?,?,?,?)""",
                 (
                     job_id, idempotency_key, now, now, strategy_json,
                     strategy.get("name", ""), str(strategy.get("version", "1")),
                     source_filename, content_sha256, strategy_sha256,
-                    bytes_total, files_total, key_fingerprint,
+                    bytes_total, files_total, key_fingerprint, domain_id,
                 ),
             )
             row = conn.execute(
@@ -832,10 +881,19 @@ class Database:
     def get_bundle_idempotent(self, key: str) -> sqlite3.Row | None:
         with self._conn() as conn:
             return conn.execute(
-                "SELECT id, content_sha256, strategy_sha256 FROM bundle_jobs "
+                "SELECT id, content_sha256, strategy_sha256, "
+                "COALESCE(domain_id, '') AS domain_id FROM bundle_jobs "
                 "WHERE idempotency_key = ?",
                 (key,),
             ).fetchone()
+
+    def get_bundle_domain_id(self, job_id: str) -> str | None:
+        """取作业的令牌关联域标识（worker 重启续跑时据此恢复域子密钥）。"""
+        with self._conn() as conn:
+            row = conn.execute(
+                "SELECT domain_id FROM bundle_jobs WHERE id = ?", (job_id,)
+            ).fetchone()
+        return row["domain_id"] if row else None
 
     def update_bundle_current_file(self, job_id: str, path: str | None) -> None:
         """装饰性进度：记录正在处理的包内文件（不参与恢复状态）。

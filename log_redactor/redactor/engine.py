@@ -210,12 +210,17 @@ def _mask_whole(value: Any, char: str, prefix: int, suffix: int) -> Any:
 
 class RedactionEngine:
     def __init__(self, strategy: Strategy, key: MasterKey, is_ndjson: bool = False,
-                 collect_coverage: bool = False) -> None:
+                 collect_coverage: bool = False,
+                 domain_fingerprint: str = "global") -> None:
         self.strategy = strategy
         self.compiled = compile_strategy(strategy)
         self.field_rules = [c for c in self.compiled if c.is_field_rule]
         self.content_rules = [c for c in self.compiled if c.is_content_rule]
+        # key 为生效密钥：全局域即主密钥，隔离域为主密钥派生的域子密钥
+        # （由 crypto.resolve_token_domain 解析），引擎本身不感知上下文原文。
         self.key = key
+        # 仅用于结果展示：令牌实际所在的关联域指纹（global / dom:<hex>）
+        self.domain_fingerprint = domain_fingerprint
         self.is_ndjson = is_ndjson
         self.audit: list[AuditEntry] = []
         self.risks: list[RiskFinding] = []
@@ -521,9 +526,14 @@ class RedactionEngine:
             stats=stats,
             needs_review=bool(self.risks),
             key_fingerprint=key_fingerprint(self.key),
+            domain_fingerprint=self.domain_fingerprint,
         )
 
 
 def run_strategy(strategy: Strategy, records: list[Any], key: MasterKey,
-                 is_ndjson: bool = False) -> RunResult:
-    return RedactionEngine(strategy, key, is_ndjson=is_ndjson).run(records)
+                 is_ndjson: bool = False,
+                 domain_fingerprint: str = "global") -> RunResult:
+    return RedactionEngine(
+        strategy, key, is_ndjson=is_ndjson,
+        domain_fingerprint=domain_fingerprint,
+    ).run(records)

@@ -51,3 +51,37 @@ cat /tmp/redacted.ndjson
 echo
 echo "大文件（超过 10 MiB / 需要断点续跑）请用 multipart 流式作业："
 echo "  bash examples/stream-large-file.sh /path/to/big.ndjson"
+echo
+echo "== 5. 令牌关联域（token_context）：隔离域替身 =="
+python3 - "$BASE" <<'PY'
+import json, sys, urllib.request
+
+base = sys.argv[1]
+strategy = json.load(open("examples/sample-strategy.json", encoding="utf-8"))
+logs = open("examples/sample-logs.ndjson", encoding="utf-8").read()
+
+def call(ctx=None):
+    body_obj = {"format": "ndjson", "content": logs, "strategy": strategy}
+    if ctx is not None:
+        body_obj["token_context"] = ctx
+    req = urllib.request.Request(
+        base + "/api/v1/strategies/validate",
+        data=json.dumps(body_obj).encode(),
+        headers={"Content-Type": "application/json"},
+    )
+    return json.load(urllib.request.urlopen(req))
+
+g = call()                                  # 未传 -> 全局域
+a1 = call("incident-20260911-alpha")        # 隔离域 A
+a2 = call("incident-20260911-alpha")        # 同样的上下文
+b = call("incident-20260911-beta")          # 不同上下文 -> 不同域
+print("域指纹:", g["domain_fingerprint"], a1["domain_fingerprint"], b["domain_fingerprint"])
+tg, ta1, ta2, tb = (r["records"][0]["user"]["phone"] for r in (g, a1, a2, b))
+print("手机号替身:")
+print("  全局        ", tg)
+print("  域 A（两次）", ta1, ta2, "-> 相同" if ta1 == ta2 else "-> 不一致！")
+print("  域 B        ", tb)
+assert ta1 == ta2 and ta1 != tb and ta1 != tg
+print("结论：同上下文同替身、不同上下文不同替身；服务只返回域指纹，不保存上下文原文。")
+PY
+

@@ -40,7 +40,11 @@ from .bundle_zip import (
     max_total_bytes,
     validate_bundle,
 )
-from .crypto import MasterKey
+from .crypto import (
+    MasterKey,
+    domain_fingerprint,
+    resolve_token_domain,
+)
 from .database import Database, utcnow_iso
 from .engine import RedactionEngine
 from .models import BundleFileInfo, BundleJobModel, Strategy
@@ -435,6 +439,7 @@ def build_manifest(
         "source_filename": job.source_filename,
         "source_sha256": job.content_sha256,
         "key_fingerprint": job.key_fingerprint,
+        "domain_fingerprint": job.domain_fingerprint,
         "stats": {
             "files_total": job.files_total,
             "files_redacted": redacted,
@@ -580,7 +585,11 @@ def run_bundle_job(job_id: str, get_db: Callable[[], Database],
         bundle_registry._discard(job_id)
         return
 
-    engine = RedactionEngine(strategy, get_key())
+    # 沿用作业创建时的令牌关联域：上下文原文不持久化，凭域标识恢复子密钥
+    domain_id = db.get_bundle_domain_id(job_id)
+    token_key, _domain_fp, _ = resolve_token_domain(get_key(), domain_id=domain_id)
+    engine = RedactionEngine(strategy, token_key,
+                             domain_fingerprint=domain_fingerprint(domain_id))
     engine.risk_base = job.risk_count
 
     # 从文件级检查点恢复：已完成文件直接跳过（审计/风险不会重复落库）

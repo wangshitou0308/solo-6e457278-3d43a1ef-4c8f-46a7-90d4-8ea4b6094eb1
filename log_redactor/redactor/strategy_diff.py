@@ -57,8 +57,12 @@ class _TraceRun:
 
 
 def _trace_run(strategy: Strategy, records: list[Any], line_nos: list[int | None],
-               key: MasterKey, is_ndjson: bool) -> _TraceRun:
-    engine = RedactionEngine(strategy, key, is_ndjson=is_ndjson, collect_coverage=True)
+               key: MasterKey, is_ndjson: bool,
+               domain_fingerprint: str = "global") -> _TraceRun:
+    engine = RedactionEngine(
+        strategy, key, is_ndjson=is_ndjson, collect_coverage=True,
+        domain_fingerprint=domain_fingerprint,
+    )
     out: list[Any] = []
     for idx, record in enumerate(records):
         # NDJSON 传物理行号（空行占号）；JSON 传 None（审计/风险本就不带行号）
@@ -317,10 +321,20 @@ def run_strategy_diff(
     candidate: Strategy,
     limits: StrategyDiffLimits,
     key: MasterKey,
+    *,
+    master_key: MasterKey | None = None,
+    domain_fingerprint: str = "global",
 ) -> StrategyDiffResponse:
-    """在同一批记录上对照基线与候选策略（纯内存，不落库、不生成文件）。"""
-    base = _trace_run(baseline, records, line_nos, key, is_ndjson)
-    cand = _trace_run(candidate, records, line_nos, key, is_ndjson)
+    """在同一批记录上对照基线与候选策略（纯内存，不落库、不生成文件）。
+
+    ``key`` 为生效密钥（全局域即主密钥，隔离域为派生子密钥）；
+    ``master_key`` 给定时用于报告主密钥指纹（隔离域下 ``key`` 是子密钥）。
+    基线与候选共用同一关联域，避免仅因域隔离产生伪差异。
+    """
+    base = _trace_run(baseline, records, line_nos, key, is_ndjson,
+                      domain_fingerprint)
+    cand = _trace_run(candidate, records, line_nos, key, is_ndjson,
+                      domain_fingerprint)
 
     gained, lost, action_changes, winner_changes = _diff_coverage(base, cand)
     risks_new, risks_resolved = _diff_risks(base, cand)
@@ -359,5 +373,6 @@ def run_strategy_diff(
         risks_new=_cap(risks_new, "risks_new", truncated),
         risks_resolved=_cap(risks_resolved, "risks_resolved", truncated),
         truncated=truncated,
-        key_fingerprint=key_fingerprint(key),
+        key_fingerprint=key_fingerprint(master_key or key),
+        domain_fingerprint=domain_fingerprint,
     )

@@ -23,7 +23,11 @@ from pathlib import Path
 from typing import Any, Callable
 
 from . import config
-from .crypto import MasterKey
+from .crypto import (
+    MasterKey,
+    domain_fingerprint,
+    resolve_token_domain,
+)
 from .database import Database
 from .engine import RedactionEngine
 from .models import AuditEntry, RiskFinding, Strategy
@@ -290,7 +294,13 @@ def run_stream_job(job_id: str, get_db: Callable[[], Database],
         registry._discard(job_id)
         return
 
-    engine = RedactionEngine(strategy, get_key(), is_ndjson=True)
+    # 沿用作业创建时的令牌关联域：上下文原文不持久化，凭域标识恢复子密钥
+    domain_id = db.get_stream_domain_id(job_id)
+    token_key, _domain_fp, _ = resolve_token_domain(
+        get_key(), domain_id=domain_id
+    )
+    engine = RedactionEngine(strategy, token_key, is_ndjson=True,
+                             domain_fingerprint=domain_fingerprint(domain_id))
 
     # 从安全检查点恢复：偏移、计数与统计
     pos = job.bytes_processed

@@ -6,6 +6,7 @@ from typing import Any, Literal
 
 from pydantic import BaseModel, Field, field_validator, model_validator
 
+from .crypto import MAX_TOKEN_CONTEXT
 from .detectors import DETECTOR_NAMES
 
 ActionType = Literal["delete", "mask", "tokenize"]
@@ -150,6 +151,25 @@ class BatchPayload(BaseModel):
     format: InputFormat = Field(default="json", description="json 为对象或数组，ndjson 每行一个对象")
     content: str = Field(description="原始日志文本；禁止随请求提交额外密钥")
     strategy: Strategy
+    token_context: str | None = Field(
+        default=None,
+        max_length=MAX_TOKEN_CONTEXT,
+        description=(
+            "令牌关联域上下文（最长 128 字符）。传入后令牌化在该上下文专属的"
+            "隔离域内进行：同一主密钥下，相同上下文与原值恒为同一替身，"
+            "不同上下文必为不同替身；服务只持久化不可逆域标识（域指纹），"
+            "不保存本字段原文。未传（或纯空白）时沿用全局映射；"
+            "对 delete/mask 动作无影响。"
+        ),
+    )
+
+    @field_validator("token_context")
+    @classmethod
+    def _normalize_token_context(cls, v: str | None) -> str | None:
+        if v is None:
+            return None
+        v = v.strip()
+        return v or None
 
 
 class DryRunRequest(BatchPayload):
@@ -187,6 +207,23 @@ class StrategyDiffRequest(BaseModel):
     baseline: Strategy = Field(description="基线策略（当前线上版本）")
     candidate: Strategy = Field(description="候选策略（待放行版本）")
     limits: StrategyDiffLimits = Field(default_factory=StrategyDiffLimits)
+    token_context: str | None = Field(
+        default=None,
+        max_length=MAX_TOKEN_CONTEXT,
+        description=(
+            "令牌关联域上下文（最长 128 字符）。基线与候选**共用同一关联域**"
+            "执行，避免两侧仅因域隔离产生伪差异；未传时基线与候选共用全局域。"
+            "服务只持久化不可逆域标识（域指纹），不保存本字段原文。"
+        ),
+    )
+
+    @field_validator("token_context")
+    @classmethod
+    def _normalize_token_context(cls, v: str | None) -> str | None:
+        if v is None:
+            return None
+        v = v.strip()
+        return v or None
 
 
 class DiffLocation(BaseModel):
@@ -295,6 +332,10 @@ class StrategyDiffResponse(BaseModel):
         description="因超过单类返回上限而被截断的差异类目名（summary 计数仍为全量）",
     )
     key_fingerprint: str = Field(description="执行对照的主密钥指纹（两侧相同）")
+    domain_fingerprint: str = Field(
+        default="global",
+        description="基线与候选共用的令牌关联域指纹：global=全局域；dom:<hex>=隔离域",
+    )
 
 
 # ---------- 响应 ----------
@@ -353,6 +394,10 @@ class RunResult(BaseModel):
     stats: RunStats
     needs_review: bool
     key_fingerprint: str
+    domain_fingerprint: str = Field(
+        default="global",
+        description="令牌关联域指纹：global=全局映射；dom:<hex>=隔离域（不可逆推上下文原文）",
+    )
 
 
 class JobModel(BaseModel):
@@ -368,6 +413,10 @@ class JobModel(BaseModel):
     output_filename: str
     top_level_is_array: bool
     key_fingerprint: str
+    domain_fingerprint: str = Field(
+        default="global",
+        description="令牌关联域指纹：global=全局映射；dom:<hex>=隔离域",
+    )
 
 
 class JobDetail(JobModel):
@@ -430,6 +479,10 @@ class StreamJobModel(BaseModel):
     output_filename: str | None = Field(default=None, description="成功发布后的文件名")
     output_bytes: int = 0
     key_fingerprint: str
+    domain_fingerprint: str = Field(
+        default="global",
+        description="令牌关联域指纹：global=全局映射；dom:<hex>=隔离域",
+    )
     content_sha256: str = Field(description="上传内容 SHA-256，用于幂等冲突判定，不可逆推内容")
     strategy_sha256: str = Field(default="", description="规范化策略 SHA-256，参与幂等一致性判定")
     progress_pct: float = 0.0
@@ -508,6 +561,10 @@ class BundleManifest(BaseModel):
     source_filename: str
     source_sha256: str = Field(description="上传压缩包的 SHA-256，不可逆推内容")
     key_fingerprint: str
+    domain_fingerprint: str = Field(
+        default="global",
+        description="令牌关联域指纹：global=全局映射；dom:<hex>=隔离域",
+    )
     stats: dict[str, Any] = Field(description="汇总统计（文件/记录/审计/风险计数）")
     files: list[BundleFileInfo]
 
@@ -535,6 +592,10 @@ class BundleJobModel(BaseModel):
     output_filename: str | None = Field(default=None, description="成功发布后的文件名")
     output_bytes: int = 0
     key_fingerprint: str
+    domain_fingerprint: str = Field(
+        default="global",
+        description="令牌关联域指纹：global=全局映射；dom:<hex>=隔离域",
+    )
     content_sha256: str = Field(description="上传压缩包 SHA-256，用于幂等冲突判定")
     strategy_sha256: str = Field(default="", description="规范化策略 SHA-256，参与幂等一致性判定")
     progress_pct: float = 0.0

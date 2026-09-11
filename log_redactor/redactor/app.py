@@ -57,7 +57,13 @@ from .bundle_jobs import (
     run_bundle_job,
 )
 from .bundle_zip import BundleRejection, max_total_bytes, validate_bundle
-from .crypto import MasterKey, key_fingerprint
+from .crypto import (
+    MasterKey,
+    domain_id_hex,
+    key_fingerprint,
+    validate_token_context,
+)
+from .crypto import resolve_token_domain
 from .database import Database
 from .engine import run_strategy
 from .models import (
@@ -92,11 +98,23 @@ UPLOAD_CHUNK = 1024 * 1024  # 1 MiB：multipart 流式落盘的拷贝块大小
 
 app = FastAPI(
     title="本地日志脱敏 API",
-    version="1.3.0",
+    version="1.4.0",
     description=(
         "供后端团队提交故障样本前使用的本地日志脱敏服务。支持按字段路径/键名/正则/内置识别器"
         "（邮箱、手机号、IP、访问令牌、身份证、银行卡）命中，动作包括删除、掩码与基于本地"
         "密钥的确定性令牌化；生成不含原值的审计清单，并对残留高风险内容标记需复核。\n\n"
+        "## 令牌关联域（token_context）\n"
+        "小批量、流式 NDJSON、诊断包与策略对照入口均可传 `token_context`（最长 128 字符）。"
+        "服务用主密钥为上下文计算**不可逆域标识**并派生域专属子密钥：同一主密钥下，相同"
+        "上下文与同一原值恒为同一替身，不同上下文必为不同替身。服务**只持久化域标识**"
+        "（对外以域指纹 `dom:<hex>` 展示），**不保存上下文原文**；上下文无法从域指纹逆推。"
+        "未传时沿用全局映射（域指纹 `global`，替身与历史行为完全一致）；`delete`/`mask` "
+        "动作与关联域无关。流式作业与诊断包重启续跑自动沿用创建时的关联域。"
+        "`Idempotency-Key` 同时绑定内容、策略与关联域，同键换域返回 409；策略对照的基线"
+        "与候选共用同一关联域。\n\n"
+        "**隐私取舍**：全局域便于跨作业/跨事件做等值关联分析，但替身本身也是跨批次的"
+        "稳定连接键；隔离域切断跨上下文的等值连接（同一实体在不同事件中的替身不同），"
+        "代价是失去跨域关联能力，且需要调用方自行记住上下文取值（服务无法替你找回）。\n\n"
         "## 策略变更对照（strategies/diff）\n"
         "在同一批 JSON/NDJSON 上以同一主密钥分别执行基线与候选策略（纯内存，不落库、不生成"
         "文件），按记录、行号、字段路径与内容命中位置（原文内偏移）对齐：汇总候选新增/失去的"
@@ -164,14 +182,31 @@ def _parse_or_422(content: str, fmt: str) -> tuple[ParsedBatch, list[int | None]
         raise HTTPException(status_code=422, detail=detail) from exc
 
 
+def _validate_form_token_context(token_context: str | None) -> str | None:
+    """校验 multipart 表单中的 token_context（在拷贝上传文件之前调用）。
+
+    非法请求直接 422，不创建任何临时文件或数据库记录。
+    """
+    try:
+        return validate_token_context(token_context)
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail={"message": str(exc)}) from exc
+
+
 def _execute(payload: BatchPayload) -> tuple[ParsedBatch, RunResult]:
     parsed, _line_nos = _parse_or_422(payload.content, payload.format)
+    token_key, domain_fp, _domain_id = resolve_token_domain(
+        get_master_key(), payload.token_context
+    )
     result = run_strategy(
         payload.strategy,
         parsed.records,
-        get_master_key(),
+        token_key,
         is_ndjson=(payload.format == "ndjson"),
+        domain_fingerprint=domain_fp,
     )
+    # 审计展示的始终是主密钥指纹（隔离域下 token_key 是派生子密钥）
+    result.key_fingerprint = key_fingerprint(get_master_key())
     return parsed, result
 
 
@@ -256,6 +291,9 @@ def check_strategy(strategy: Strategy) -> dict[str, Any]:
         "`limits` 可为新增残留风险、失去处理与输出类型变化设置上限，`passed` 与 `checks` "
         "给出 pass/fail 及逐项依据，供 CI 决定是否放行。NDJSON 空行占行号、规则顺序变化"
         "造成的重叠命中均按原文坐标稳定对齐；两份策略相同则差异为空。\n\n"
+        "请求体可传 `token_context`（最长 128 字符）：**基线与候选共用同一关联域**"
+        "执行（不传则共用全局域），因此对照不会因域隔离产生伪差异；服务只持久化"
+        "不可逆域标识，不保存上下文原文。\n\n"
         "差异项只含位置、规则、动作、识别器与计数，**不回显原始值、正则文本或处理后仍含"
         "敏感信息的值**。"
     ),
@@ -264,6 +302,9 @@ def check_strategy(strategy: Strategy) -> dict[str, Any]:
 )
 def diff_strategies(req: StrategyDiffRequest) -> StrategyDiffResponse:
     parsed, line_nos = _parse_or_422(req.content, req.format)
+    token_key, domain_fp, _domain_id = resolve_token_domain(
+        get_master_key(), req.token_context
+    )
     return run_strategy_diff(
         parsed.records,
         line_nos,
@@ -271,7 +312,9 @@ def diff_strategies(req: StrategyDiffRequest) -> StrategyDiffResponse:
         baseline=req.baseline,
         candidate=req.candidate,
         limits=req.limits,
-        key=get_master_key(),
+        key=token_key,
+        master_key=get_master_key(),
+        domain_fingerprint=domain_fp,
     )
 
 
@@ -299,20 +342,44 @@ def _write_output(path: Path, records: list[Any], fmt: str, *, as_array: bool) -
     "/api/v1/jobs",
     tags=["jobs"],
     summary="正式创建脱敏作业",
-    responses={200: {"description": "已有作业（幂等命中）"}, 201: {"description": "新作业已处理"}},
+    description=(
+        "携带 `Idempotency-Key` 时，回放条件为**内容、规范化策略与令牌关联域**"
+        "三者均与首次提交一致；任一不同返回 **409 冲突**，不会回放旧结果。"
+        "请求体可传 `token_context`（最长 128 字符）启用令牌隔离域。"
+    ),
+    responses={
+        200: {"description": "已有作业（幂等命中）"},
+        201: {"description": "新作业已处理"},
+        409: {"description": "Idempotency-Key 冲突（同键内容/策略/关联域不同）"},
+        422: {"description": "日志解析失败、策略非法或 token_context 超长"},
+    },
 )
 def create_job(
     req: CreateJobRequest,
     idempotency_key: str | None = Header(default=None, alias="Idempotency-Key",
-                                         description="同一键重复提交直接返回首个作业"),
+                                         description="同一键只回放内容、策略与关联域均一致的提交"),
 ) -> JSONResponse:
     if idempotency_key is not None:
         idempotency_key = idempotency_key.strip()
         if len(idempotency_key) > 128:
             raise HTTPException(status_code=400, detail="Idempotency-Key 最长 128 字符")
-        existing_id = get_db().get_idempotent(idempotency_key)
-        if existing_id:
-            existing = get_db().get_job(existing_id)
+
+    # 幂等三元组摘要：规范化内容字节 + 规范化策略 + 关联域标识
+    content_bytes = req.content.encode("utf-8")
+    content_sha = hashlib.sha256(content_bytes).hexdigest()
+    strategy_canonical = req.strategy.model_dump_json()
+    strategy_sha = hashlib.sha256(strategy_canonical.encode("utf-8")).hexdigest()
+    domain_hex = domain_id_hex(get_master_key(), req.token_context)
+
+    if idempotency_key is not None:
+        row = get_db().get_idempotent(idempotency_key)
+        if row:
+            # 既回放也冲突判定，都必须在写任何文件/记录之前完成
+            _check_idempotency_triplet(
+                row, content_sha=content_sha, strategy_sha=strategy_sha,
+                domain_id=domain_hex,
+            )
+            existing = get_db().get_job(row["id"])
             return JSONResponse(status_code=200, content={"replayed": True,
                                                           "job": _job_dict(existing)})  # type: ignore[arg-type]
 
@@ -336,14 +403,21 @@ def create_job(
             key_fingerprint=result.key_fingerprint,
             audit=result.audit,
             risks=result.risks,
+            content_sha256=content_sha,
+            strategy_sha256=strategy_sha,
+            domain_id=domain_hex,
         )
     except sqlite3.IntegrityError:
-        # 并发提交相同幂等键：对方先落库，回放其作业（清理本请求的冗余文件）
+        # 并发提交相同幂等键：对方先落库，回放或冲突（清理本请求的冗余文件）
         winner = get_db().get_idempotent(idempotency_key) if idempotency_key else None
         _output_path(job_id, req.format).unlink(missing_ok=True)
         if winner:
+            _check_idempotency_triplet(
+                winner, content_sha=content_sha, strategy_sha=strategy_sha,
+                domain_id=domain_hex,
+            )
             return JSONResponse(status_code=200,
-                                content={"replayed": True, "job": _job_dict(get_db().get_job(winner))})  # type: ignore[arg-type]
+                                content={"replayed": True, "job": _job_dict(get_db().get_job(winner["id"]))})  # type: ignore[arg-type]
         raise
     return JSONResponse(
         status_code=201,
@@ -453,6 +527,20 @@ def _idempotency_conflict(job_id: str, reason: str) -> HTTPException:
     )
 
 
+def _check_idempotency_triplet(row, *, content_sha: str, strategy_sha: str,
+                               domain_id: str | None) -> None:
+    """幂等键同时绑定内容、策略与令牌关联域；任一不同即 409。
+
+    ``domain_id`` 传 hex 串，全局域传 None；行内以空串表示全局域。
+    """
+    if row["content_sha256"] != content_sha:
+        raise _idempotency_conflict(row["id"], "文件内容")
+    if row["strategy_sha256"] != strategy_sha:
+        raise _idempotency_conflict(row["id"], "策略")
+    if row["domain_id"] != (domain_id or ""):
+        raise _idempotency_conflict(row["id"], "令牌关联域")
+
+
 def _require_stream_job(job_id: str):
     job = get_db().get_stream_job(job_id)
     if not job:
@@ -465,36 +553,53 @@ def _require_stream_job(job_id: str):
     tags=["stream-jobs"],
     summary="上传 NDJSON 大文件并创建流式脱敏作业",
     description=(
-        "以 `multipart/form-data` 上传：`file` 为 NDJSON 文件，`strategy` 为策略 JSON。"
+        "以 `multipart/form-data` 上传：`file` 为 NDJSON 文件，`strategy` 为策略 JSON，"
+        "可选 `token_context` 为令牌关联域上下文（最长 128 字符）。"
         "原始文件以 **0600** 权限临时落盘，服务**逐行**解析脱敏（不把整包读入内存），"
         "并持续记录已处理字节数、记录数、审计数与残留风险数。\n\n"
-        "携带 `Idempotency-Key` 时：相同键且**上传内容与策略的 SHA-256 均一致**"
-        "才回放首个作业（200）；相同键但文件内容或策略不同返回 **409 冲突**，"
-        "不会回放旧结果。作业可取消，服务重启后从安全检查点继续；"
+        "携带 `token_context` 时，令牌化在该上下文的隔离域内进行：相同上下文与原值"
+        "恒为同一替身、不同上下文必为不同替身；服务只持久化不可逆域标识（域指纹），"
+        "**不保存上下文原文**；**重启续跑自动沿用原关联域**。不传则沿用全局映射；"
+        "delete/mask 不受影响。\n\n"
+        "携带 `Idempotency-Key` 时：相同键且**上传内容、规范化策略与令牌关联域**"
+        "三者均一致才回放首个作业（200）；任一不同返回 **409 冲突**，不会回放旧结果。"
+        "作业可取消，服务重启后从安全检查点继续；"
         "格式错误记录行号并终止。完成后原始文件即被删除并原子发布结果文件。"
     ),
     status_code=202,
     responses={
         200: {"description": "幂等命中，回放已有作业"},
         202: {"description": "已接受上传，后台流式处理中"},
-        409: {"description": "Idempotency-Key 冲突（同键内容不同）"},
-        422: {"description": "策略非法或文件内容为空"},
+        409: {"description": "Idempotency-Key 冲突（同键内容/策略/关联域不同）"},
+        422: {"description": "策略非法、文件内容为空或 token_context 超长"},
     },
 )
 async def create_stream_job(
     strategy: str = Form(description="脱敏策略 JSON（与小批量接口同一结构）"),
     file: UploadFile = File(description="NDJSON 日志文件，每行一个 JSON 值"),
+    token_context: str | None = Form(
+        default=None,
+        max_length=128,
+        description="令牌关联域上下文（最长 128 字符）；只持久化不可逆域标识，"
+                    "不传沿用全局映射，重启续跑自动沿用本作业的关联域",
+    ),
     idempotency_key: str | None = Header(
         default=None, alias="Idempotency-Key",
-        description="同一键只回放内容一致的上传；内容不同返回 409",
+        description="同一键只回放内容、策略与关联域均一致的上传；任一不同返回 409",
     ),
 ) -> JSONResponse:
     _ensure_recovery()
+
+    # 非法 token_context 必须最先失败：不拷贝上传文件、不创建任何记录
+    token_context = _validate_form_token_context(token_context)
 
     if idempotency_key is not None:
         idempotency_key = idempotency_key.strip()
         if len(idempotency_key) > 128:
             raise HTTPException(status_code=400, detail="Idempotency-Key 最长 128 字符")
+
+    # 关联域在拷贝大文件之前解析（同时校验主密钥可用）；只保留不可逆域标识
+    domain_hex = domain_id_hex(get_master_key(), token_context)
 
     # 先校验策略（在拷贝大文件之前快速失败）
     try:
@@ -535,15 +640,15 @@ async def create_stream_job(
     content_sha = digest.hexdigest()
     source_name = Path(file.filename or "upload.ndjson").name
 
-    # 幂等：同键且文件+策略都一致才回放，任一不同返回冲突（临时文件立即清理）
+    # 幂等：同键且文件+策略+关联域都一致才回放，任一不同返回冲突（临时文件立即清理）
     if idempotency_key:
         row = get_db().get_stream_idempotent(idempotency_key)
         if row is not None:
             staged.unlink(missing_ok=True)
-            if row["content_sha256"] != content_sha:
-                raise _idempotency_conflict(row["id"], "文件内容")
-            if row["strategy_sha256"] != strategy_sha:
-                raise _idempotency_conflict(row["id"], "策略")
+            _check_idempotency_triplet(
+                row, content_sha=content_sha, strategy_sha=strategy_sha,
+                domain_id=domain_hex,
+            )
             existing = get_db().get_stream_job(row["id"])
             return JSONResponse(
                 status_code=200,
@@ -560,6 +665,7 @@ async def create_stream_job(
             content_sha256=content_sha,
             bytes_total=bytes_total,
             key_fingerprint=key_fingerprint(get_master_key()),
+            domain_id=domain_hex,
         )
     except sqlite3.IntegrityError:
         # 并发使用相同幂等键：以先落库者为准
@@ -569,15 +675,14 @@ async def create_stream_job(
         )
         if winner:
             existing = get_db().get_stream_job(winner["id"])
-            if (winner["content_sha256"] == content_sha
-                    and winner["strategy_sha256"] == strategy_sha):
-                return JSONResponse(
-                    status_code=200,
-                    content={"replayed": True, "job": _stream_job_dict(existing)},
-                )
-            if winner["content_sha256"] != content_sha:
-                raise _idempotency_conflict(winner["id"], "文件内容")
-            raise _idempotency_conflict(winner["id"], "策略")
+            _check_idempotency_triplet(
+                winner, content_sha=content_sha, strategy_sha=strategy_sha,
+                domain_id=domain_hex,
+            )
+            return JSONResponse(
+                status_code=200,
+                content={"replayed": True, "job": _stream_job_dict(existing)},
+            )
         raise
 
     stream_registry.start(
@@ -708,39 +813,55 @@ def _require_bundle_job(job_id: str):
     tags=["bundle-jobs"],
     summary="上传 ZIP 诊断包并创建脱敏作业",
     description=(
-        "以 `multipart/form-data` 上传：`file` 为 ZIP 诊断包，`strategy` 为策略 JSON。"
+        "以 `multipart/form-data` 上传：`file` 为 ZIP 诊断包，`strategy` 为策略 JSON，"
+        "可选 `token_context` 为令牌关联域上下文（最长 128 字符）。"
         "逐个处理包内 `.json`/`.ndjson`/`.log`/`.txt`：结构化文件走字段+内容规则，"
         "纯文本按行应用内容规则，输出保留包内相对路径与原换行风格。\n\n"
         "压缩包先过安全校验：拒绝路径穿越、符号链接、重复路径、加密条目，以及超过"
         "文件数/单文件/展开总量/压缩比上限的包（422 并列出全部原因）。二进制与不支持"
-        "类型不写入结果，只在清单列明原因。携带 `Idempotency-Key` 时：相同键且"
-        "**压缩包与策略的 SHA-256 均一致**才回放首个作业（200），任一不同返回 **409**。"
-        "作业可取消、可在服务重启后从文件级检查点续跑；终态清理原始压缩包，"
-        "成功后原子发布结果 ZIP（仅含脱敏文件与 redaction-manifest.json 清单）。"
+        "类型不写入结果，只在清单列明原因。携带 `token_context` 时令牌化在隔离域内进行，"
+        "服务只持久化不可逆域标识（域指纹），**不保存上下文原文**，**重启续跑自动沿用"
+        "原关联域**，清单与状态返回域指纹；不传则沿用全局映射。携带 `Idempotency-Key` "
+        "时：相同键且**压缩包、规范化策略与令牌关联域**三者均一致才回放首个作业（200），"
+        "任一不同返回 **409**。作业可取消、可在服务重启后从文件级检查点续跑；"
+        "终态清理原始压缩包，成功后原子发布结果 ZIP（仅含脱敏文件与 "
+        "redaction-manifest.json 清单）。"
     ),
     status_code=202,
     responses={
         200: {"description": "幂等命中，回放已有作业"},
         202: {"description": "已接受上传，后台处理中"},
-        409: {"description": "Idempotency-Key 冲突（同键内容/策略不同）"},
+        409: {"description": "Idempotency-Key 冲突（同键内容/策略/关联域不同）"},
         413: {"description": "压缩包超过上传大小上限"},
-        422: {"description": "策略非法、压缩包为空或未通过安全校验"},
+        422: {"description": "策略非法、压缩包为空、未通过安全校验或 token_context 超长"},
     },
 )
 async def create_bundle_job(
     strategy: str = Form(description="脱敏策略 JSON（与小批量接口同一结构）"),
     file: UploadFile = File(description="ZIP 诊断包（.json/.ndjson/.log/.txt 会被处理）"),
+    token_context: str | None = Form(
+        default=None,
+        max_length=128,
+        description="令牌关联域上下文（最长 128 字符）；只持久化不可逆域标识，"
+                    "不传沿用全局映射，重启续跑自动沿用本作业的关联域",
+    ),
     idempotency_key: str | None = Header(
         default=None, alias="Idempotency-Key",
-        description="同一键只回放压缩包与策略均一致的上传；不一致返回 409",
+        description="同一键只回放压缩包、策略与关联域均一致的上传；任一不同返回 409",
     ),
 ) -> JSONResponse:
     _ensure_bundle_recovery()
+
+    # 非法 token_context 必须最先失败：不拷贝上传文件、不创建任何记录
+    token_context = _validate_form_token_context(token_context)
 
     if idempotency_key is not None:
         idempotency_key = idempotency_key.strip()
         if len(idempotency_key) > 128:
             raise HTTPException(status_code=400, detail="Idempotency-Key 最长 128 字符")
+
+    # 关联域在拷贝大文件之前解析；只保留不可逆域标识
+    domain_hex = domain_id_hex(get_master_key(), token_context)
 
     # 先校验策略（在拷贝大文件之前快速失败）
     try:
@@ -799,15 +920,15 @@ async def create_bundle_job(
     content_sha = digest.hexdigest()
     source_name = Path(file.filename or "bundle.zip").name
 
-    # 幂等：同键且压缩包+策略都一致才回放，任一不同返回冲突（临时文件立即清理）
+    # 幂等：同键且压缩包+策略+关联域都一致才回放，任一不同返回冲突（临时文件立即清理）
     if idempotency_key:
         row = get_db().get_bundle_idempotent(idempotency_key)
         if row is not None:
             staged.unlink(missing_ok=True)
-            if row["content_sha256"] != content_sha:
-                raise _idempotency_conflict(row["id"], "压缩包内容")
-            if row["strategy_sha256"] != strategy_sha:
-                raise _idempotency_conflict(row["id"], "策略")
+            _check_idempotency_triplet(
+                row, content_sha=content_sha, strategy_sha=strategy_sha,
+                domain_id=domain_hex,
+            )
             existing = get_db().get_bundle_job(row["id"])
             return JSONResponse(
                 status_code=200,
@@ -825,6 +946,7 @@ async def create_bundle_job(
             bytes_total=bytes_total,
             files_total=len(entries),
             key_fingerprint=key_fingerprint(get_master_key()),
+            domain_id=domain_hex,
         )
     except sqlite3.IntegrityError:
         # 并发使用相同幂等键：以先落库者为准
@@ -834,15 +956,14 @@ async def create_bundle_job(
         )
         if winner:
             existing = get_db().get_bundle_job(winner["id"])
-            if (winner["content_sha256"] == content_sha
-                    and winner["strategy_sha256"] == strategy_sha):
-                return JSONResponse(
-                    status_code=200,
-                    content={"replayed": True, "job": _bundle_job_dict(existing)},
-                )
-            if winner["content_sha256"] != content_sha:
-                raise _idempotency_conflict(winner["id"], "压缩包内容")
-            raise _idempotency_conflict(winner["id"], "策略")
+            _check_idempotency_triplet(
+                winner, content_sha=content_sha, strategy_sha=strategy_sha,
+                domain_id=domain_hex,
+            )
+            return JSONResponse(
+                status_code=200,
+                content={"replayed": True, "job": _bundle_job_dict(existing)},
+            )
         raise
 
     bundle_registry.start(

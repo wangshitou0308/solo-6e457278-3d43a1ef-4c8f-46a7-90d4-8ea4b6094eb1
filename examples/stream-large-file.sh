@@ -27,12 +27,20 @@ PY
 fi
 echo "== 上传文件: $LOGS ($(wc -c < "$LOGS") 字节) =="
 
+# 可选：令牌关联域（最长 128 字符）。设置后令牌化只在本事件的隔离域内稳定，
+# 与其他事件/全局域的同名实体替身互不相同；重启续跑自动沿用该域。
+# 留空则不传 token_context，沿用全局映射。
+TOKEN_CONTEXT="${TOKEN_CONTEXT:-incident-20260911-big-001}"
+
 # multipart：file 为 NDJSON 文件；strategy 字段直接取策略文件内容（不发送文件名）
-RESP=$(curl -fsS -X POST "$BASE/api/v1/stream-jobs" \
-  -H "Idempotency-Key: example-stream-$(date +%s)" \
-  -F "strategy=<$HERE/sample-strategy.json;type=application/json" \
-  -F "file=@$LOGS;type=application/x-ndjson")
+CURL_ARGS=( -fsS -X POST "$BASE/api/v1/stream-jobs"
+  -H "Idempotency-Key: example-stream-$(date +%s)"
+  -F "strategy=<$HERE/sample-strategy.json;type=application/json"
+  -F "file=@$LOGS;type=application/x-ndjson" )
+[[ -n "$TOKEN_CONTEXT" ]] && CURL_ARGS+=( -F "token_context=$TOKEN_CONTEXT" )
+RESP=$(curl "${CURL_ARGS[@]}")
 JOB_ID=$(python3 -c 'import json,sys; print(json.load(sys.stdin)["job"]["id"])' <<<"$RESP")
+python3 -c 'import json,sys; j=json.load(sys.stdin)["job"]; print("关联域指纹:", j["domain_fingerprint"])' <<<"$RESP"
 echo "job_id=$JOB_ID（202 已接受）"
 
 echo "== 轮询进度 =="
@@ -66,4 +74,4 @@ curl -fsS "$BASE/api/v1/stream-jobs/$JOB_ID/download" -o /tmp/redacted-stream.nd
 echo "已下载 /tmp/redacted-stream.ndjson：$(wc -l < /tmp/redacted-stream.ndjson) 行；首行："
 head -1 /tmp/redacted-stream.ndjson
 
-echo "== 幂等演示：同一 Idempotency-Key 重放返回 200（换成新策略则会 409）=="
+echo "== 幂等演示：同一 Idempotency-Key 重放返回 200（换文件/策略/关联域则会 409）=="
