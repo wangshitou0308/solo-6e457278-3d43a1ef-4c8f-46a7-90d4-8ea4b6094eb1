@@ -3,6 +3,7 @@
 接口概览
 --------
 * ``POST /api/v1/strategies/validate``  策略试运行（不落库，返回脱敏结果与审计）
+* ``POST /api/v1/strategies/diff``      策略变更对照（基线 vs 候选，CI 放行判定）
 * ``POST /api/v1/jobs``                 正式处理，支持 ``Idempotency-Key``
 * ``GET  /api/v1/jobs``                 作业列表（可按需复核过滤）
 * ``GET  /api/v1/jobs/{job_id}``        作业详情、统计、审计清单、残留风险
@@ -68,9 +69,12 @@ from .models import (
     JobModel,
     RunResult,
     Strategy,
+    StrategyDiffRequest,
+    StrategyDiffResponse,
 )
-from .parsing import ParsedBatch, PayloadError, parse_batch
+from .parsing import ParsedBatch, PayloadError, parse_batch_indexed
 from .samples import sample_ndjson, sample_strategy_dict
+from .strategy_diff import run_strategy_diff
 from .stream_jobs import (
     ensure_stream_dirs,
     final_output_path,
@@ -88,11 +92,18 @@ UPLOAD_CHUNK = 1024 * 1024  # 1 MiB：multipart 流式落盘的拷贝块大小
 
 app = FastAPI(
     title="本地日志脱敏 API",
-    version="1.2.0",
+    version="1.3.0",
     description=(
         "供后端团队提交故障样本前使用的本地日志脱敏服务。支持按字段路径/键名/正则/内置识别器"
         "（邮箱、手机号、IP、访问令牌、身份证、银行卡）命中，动作包括删除、掩码与基于本地"
         "密钥的确定性令牌化；生成不含原值的审计清单，并对残留高风险内容标记需复核。\n\n"
+        "## 策略变更对照（strategies/diff）\n"
+        "在同一批 JSON/NDJSON 上以同一主密钥分别执行基线与候选策略（纯内存，不落库、不生成"
+        "文件），按记录、行号、字段路径与内容命中位置（原文内偏移）对齐：汇总候选新增/失去的"
+        "覆盖、动作变化、胜出规则变化与残留风险增减；仅规则改名且处理一致时不算覆盖改善。"
+        "调用方可为新增残留风险、失去处理与输出类型变化设置上限，响应返回 pass/fail 与逐项"
+        "依据供 CI 放行判定。差异项只含位置、规则、动作、识别器与计数，不回显原始值、正则"
+        "文本或处理后仍含敏感信息的值。\n\n"
         "## 大批量 NDJSON 流式作业（stream-jobs）\n"
         "通过 multipart/form-data 上传大文件，原始文件以 0600 权限临时落盘，服务逐行解析、"
         "脱敏并定期写入安全检查点（字节偏移/记录数/审计数/风险数），不把整包读入内存；"
@@ -143,14 +154,18 @@ async def lifespan(_app: FastAPI):
 app.router.lifespan_context = lifespan
 
 
-def _execute(payload: BatchPayload) -> tuple[ParsedBatch, RunResult]:
+def _parse_or_422(content: str, fmt: str) -> tuple[ParsedBatch, list[int | None]]:
     try:
-        parsed = parse_batch(payload.content, payload.format)
+        return parse_batch_indexed(content, fmt)
     except PayloadError as exc:
         detail = {"message": str(exc)}
         if exc.line is not None:
             detail["line"] = exc.line
         raise HTTPException(status_code=422, detail=detail) from exc
+
+
+def _execute(payload: BatchPayload) -> tuple[ParsedBatch, RunResult]:
+    parsed, _line_nos = _parse_or_422(payload.content, payload.format)
     result = run_strategy(
         payload.strategy,
         parsed.records,
@@ -222,6 +237,42 @@ def validate_strategy(req: DryRunRequest) -> dict[str, Any]:
 )
 def check_strategy(strategy: Strategy) -> dict[str, Any]:
     return {"valid": True, "name": strategy.name, "rules": len(strategy.rules)}
+
+
+@app.post(
+    "/api/v1/strategies/diff",
+    tags=["strategy"],
+    summary="策略变更对照（基线 vs 候选，CI 放行判定）",
+    description=(
+        "在同一批 JSON/NDJSON 上以**同一主密钥**分别执行 `baseline` 与 `candidate` "
+        "两份策略（纯内存对照：不写库、不产生作业、不生成文件），按记录、行号、字段路径"
+        "与内容命中位置（原文内偏移）对齐，返回：\n\n"
+        "* **覆盖增减**（coverage_gained/lost）：候选新增或失去的处理覆盖；仅规则改名"
+        "（id/名称变化）而处理一致时记为胜出规则变化，**不算覆盖改善**；\n"
+        "* **动作变化**（action_changes）：同一位置两侧均被处理但动作不同；\n"
+        "* **胜出规则变化**（winner_changes）：动作一致但胜出规则 id 不同；\n"
+        "* **输出类型变化**（type_changes）：同一叶子输出值的 JSON 类型名变化（不记录值）；\n"
+        "* **残留风险增减**（risks_new/resolved）：按记录/行号/字段路径/识别器聚合计数。\n\n"
+        "`limits` 可为新增残留风险、失去处理与输出类型变化设置上限，`passed` 与 `checks` "
+        "给出 pass/fail 及逐项依据，供 CI 决定是否放行。NDJSON 空行占行号、规则顺序变化"
+        "造成的重叠命中均按原文坐标稳定对齐；两份策略相同则差异为空。\n\n"
+        "差异项只含位置、规则、动作、识别器与计数，**不回显原始值、正则文本或处理后仍含"
+        "敏感信息的值**。"
+    ),
+    response_model=StrategyDiffResponse,
+    responses={422: {"description": "日志内容解析失败或策略非法"}},
+)
+def diff_strategies(req: StrategyDiffRequest) -> StrategyDiffResponse:
+    parsed, line_nos = _parse_or_422(req.content, req.format)
+    return run_strategy_diff(
+        parsed.records,
+        line_nos,
+        is_ndjson=(req.format == "ndjson"),
+        baseline=req.baseline,
+        candidate=req.candidate,
+        limits=req.limits,
+        key=get_master_key(),
+    )
 
 
 # ---------- 作业 ----------

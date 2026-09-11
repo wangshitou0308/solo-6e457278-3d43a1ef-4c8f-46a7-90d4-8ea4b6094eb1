@@ -25,6 +25,30 @@ MAX_RISK_FINDINGS = 500
 _TOKEN_PREFIX = "T-"  # 与 detectors 协调：自定义令牌不会被内置识别器再次命中
 
 
+@dataclass(frozen=True)
+class CoverageEvent:
+    """一次覆盖命中的内部轨迹（仅位置/规则/动作/识别器，绝不含原值）。
+
+    仅供策略变更对照等内存内分析使用（``collect_coverage=True`` 时收集），
+    不落库、不写入任何文件。
+
+    * ``span`` 为内容命中在**原始字符串**中的 ``(start, end)`` 偏移；
+      整字段规则命中字符串时记为 ``(0, len(原值))``，命中非字符串标量时
+      为 ``None``（表示整个值被处理，无字符坐标）。
+    """
+
+    record_index: int
+    line_no: int | None
+    field_path: str
+    key_name: str | None
+    span: tuple[int, int] | None
+    rule_id: str
+    rule_name: str
+    action: str
+    match_type: str
+    hit_by: tuple[str, ...]
+
+
 def display_path(path: str) -> str:
     """内部路径（如 ``user.addrs[0].ip``）转成 ``$.user.addrs[0].ip``。"""
     if not path:
@@ -185,7 +209,8 @@ def _mask_whole(value: Any, char: str, prefix: int, suffix: int) -> Any:
 
 
 class RedactionEngine:
-    def __init__(self, strategy: Strategy, key: MasterKey, is_ndjson: bool = False) -> None:
+    def __init__(self, strategy: Strategy, key: MasterKey, is_ndjson: bool = False,
+                 collect_coverage: bool = False) -> None:
         self.strategy = strategy
         self.compiled = compile_strategy(strategy)
         self.field_rules = [c for c in self.compiled if c.is_field_rule]
@@ -194,6 +219,9 @@ class RedactionEngine:
         self.is_ndjson = is_ndjson
         self.audit: list[AuditEntry] = []
         self.risks: list[RiskFinding] = []
+        # 覆盖轨迹（策略变更对照用）：仅 collect_coverage=True 时收集，纯内存
+        self.collect_coverage = collect_coverage
+        self.coverage: list[CoverageEvent] = []
         self.fields_scanned = 0
         self.by_rule: dict[str, int] = {}
         self.by_action: dict[str, int] = {}
@@ -231,14 +259,17 @@ class RedactionEngine:
             self._float_tokens[str(value)] = token
         return token
 
+    def _event_line_no(self, idx: int) -> int | None:
+        if not self.is_ndjson:
+            return None
+        return self.current_line_no if self.current_line_no is not None else idx + 1
+
     def _record_audit(self, idx: int, path: str, key: str | None, cr: CompiledRule,
                       match_type: str, hit_by: list[str], occurrences: int = 1) -> None:
         self.audit.append(
             AuditEntry(
                 record_index=idx,
-                line_no=self.current_line_no
-                if self.is_ndjson and self.current_line_no is not None
-                else ((idx + 1) if self.is_ndjson else None),
+                line_no=self._event_line_no(idx),
                 field_path=display_path(path),
                 key_name=key,
                 rule_id=cr.rule.id,
@@ -252,6 +283,26 @@ class RedactionEngine:
         self.by_rule[cr.rule.id] = self.by_rule.get(cr.rule.id, 0) + 1
         self.by_action[cr.rule.action] = self.by_action.get(cr.rule.action, 0) + 1
 
+    def _record_coverage(self, idx: int, path: str, key: str | None, cr: CompiledRule,
+                         match_type: str, hit_by: tuple[str, ...],
+                         span: tuple[int, int] | None) -> None:
+        if not self.collect_coverage:
+            return
+        self.coverage.append(
+            CoverageEvent(
+                record_index=idx,
+                line_no=self._event_line_no(idx),
+                field_path=display_path(path),
+                key_name=key,
+                span=span,
+                rule_id=cr.rule.id,
+                rule_name=cr.rule.name,
+                action=cr.rule.action,
+                match_type=match_type,
+                hit_by=hit_by,
+            )
+        )
+
     # -- 单个标量叶子 --
     def _apply_leaf(self, value: Any, idx: int, path: str, key: str | None) -> Any:
         self.fields_scanned += 1
@@ -260,6 +311,10 @@ class RedactionEngine:
         for cr in self.field_rules:
             if cr.field_matches(path, key):
                 self._record_audit(idx, path, key, cr, "field", ["field_match"])
+                # 字符串整字段命中记为 (0, len)，便于与内容命中在同一坐标系对齐
+                span = (0, len(value)) if isinstance(value, str) else None
+                self._record_coverage(idx, path, key, cr, "field",
+                                      ("field_match",), span)
                 if path:
                     self._fully_handled.add((idx, path))
                 return self._field_action(value, cr)
@@ -328,6 +383,9 @@ class RedactionEngine:
             self._record_audit(
                 idx, path, key, cr, "content", labels, occurrences=len(spans)
             )
+            for s, e in spans:
+                self._record_coverage(idx, path, key, cr, "content",
+                                      tuple(labels), (s, e))
             # 替换串在任何改写之前基于原文计算，避免读到已被改写的文本
             for s, e in spans:
                 original = text[s:e]
@@ -394,9 +452,7 @@ class RedactionEngine:
                     self.risks.append(
                         RiskFinding(
                             record_index=idx,
-                            line_no=self.current_line_no
-                            if self.is_ndjson and self.current_line_no is not None
-                            else ((idx + 1) if self.is_ndjson else None),
+                            line_no=self._event_line_no(idx),
                             field_path=display_path(path),
                             detector=det_name,
                             length=e - s,

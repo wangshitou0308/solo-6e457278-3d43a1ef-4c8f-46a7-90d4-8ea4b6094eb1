@@ -160,6 +160,143 @@ class CreateJobRequest(BatchPayload):
     pass
 
 
+# ---------- 策略变更对照（baseline vs candidate） ----------
+
+
+class StrategyDiffLimits(BaseModel):
+    """CI 放行门槛；字段为 None 表示该项不设限（恒通过）。"""
+
+    max_new_risks: int | None = Field(
+        default=None, ge=0, description="候选策略新增残留风险条数上限"
+    )
+    max_lost_coverage: int | None = Field(
+        default=None, ge=0, description="候选策略失去处理的覆盖条数上限"
+    )
+    max_type_changes: int | None = Field(
+        default=None, ge=0, description="输出值 JSON 类型变化处数上限"
+    )
+
+
+class StrategyDiffRequest(BaseModel):
+    """同一批日志上对照基线与候选策略（同一主密钥执行，不落库、不生成文件）。"""
+
+    format: InputFormat = Field(
+        default="json", description="json 为对象或数组，ndjson 每行一个对象（空行占行号）"
+    )
+    content: str = Field(description="原始日志文本；禁止随请求提交额外密钥")
+    baseline: Strategy = Field(description="基线策略（当前线上版本）")
+    candidate: Strategy = Field(description="候选策略（待放行版本）")
+    limits: StrategyDiffLimits = Field(default_factory=StrategyDiffLimits)
+
+
+class DiffLocation(BaseModel):
+    """差异位置：记录序号、NDJSON 行号、字段路径与内容命中位置（原文内字符偏移）。
+
+    ``span_start``/``span_end`` 仅对内容命中存在；整字段（整值）差异为 null。
+    偏移基于原始文本坐标，基线与候选两侧可直接对齐。
+    """
+
+    record_index: int = Field(description="记录在批次中的序号（从 0 开始）")
+    line_no: int | None = Field(default=None, description="NDJSON 输入时的物理行号（从 1 开始，空行占号）")
+    field_path: str = Field(description="字段路径，如 $.user.email")
+    span_start: int | None = Field(default=None, description="内容命中起点（原文内偏移）")
+    span_end: int | None = Field(default=None, description="内容命中终点（原文内偏移，开区间）")
+
+
+class CoverageDiffItem(BaseModel):
+    """一处覆盖增减（只含位置、规则、动作、识别器与计数，绝不含值）。"""
+
+    location: DiffLocation
+    action: ActionType = Field(description="该位置的处理动作")
+    rule_id: str
+    rule_name: str
+    hit_by: list[str] = Field(description="命中维度/识别器标签（detector:<名称> 等）")
+    count: int = Field(default=1, description="该差异项合并的命中段数")
+
+
+class ActionChangeItem(BaseModel):
+    """同一位置两侧均被处理、但动作不同。"""
+
+    location: DiffLocation
+    from_action: ActionType
+    to_action: ActionType
+    from_rule_id: str
+    from_rule_name: str
+    to_rule_id: str
+    to_rule_name: str
+    count: int = Field(default=1, description="该差异项合并的命中段数")
+
+
+class WinnerChangeItem(BaseModel):
+    """同一位置动作一致、但胜出规则 id 不同（含规则换名重写）。"""
+
+    location: DiffLocation
+    action: ActionType = Field(description="两侧一致的处理动作")
+    from_rule_id: str
+    from_rule_name: str
+    to_rule_id: str
+    to_rule_name: str
+    count: int = Field(default=1, description="该差异项合并的命中段数")
+
+
+class TypeChangeItem(BaseModel):
+    """同一叶子输出值的 JSON 类型变化（只记录类型名，不记录值）。"""
+
+    location: DiffLocation
+    from_type: str = Field(description="基线输出的 JSON 类型（null/boolean/number/string/array/object）")
+    to_type: str = Field(description="候选输出的 JSON 类型")
+    count: int = Field(default=1)
+
+
+class RiskDiffItem(BaseModel):
+    """残留风险增减（按记录/行号/字段路径/识别器聚合，只含计数）。"""
+
+    location: DiffLocation
+    detector: str = Field(description="命中识别器名称")
+    count: int = Field(description="该位置该识别器新增/解除的残留风险条数")
+
+
+class DiffCheck(BaseModel):
+    """一项放行门槛的核对结果。"""
+
+    name: str = Field(description="门槛名称：new_risks / lost_coverage / type_changes")
+    limit: int | None = Field(description="上限；null 表示未设限（恒通过）")
+    actual: int = Field(description="实际数量")
+    passed: bool
+
+
+class StrategyDiffSummary(BaseModel):
+    """各项差异的总数（不受返回列表截断影响）。"""
+
+    coverage_gained: int = Field(description="候选新增覆盖条数")
+    coverage_lost: int = Field(description="候选失去覆盖条数")
+    action_changes: int = Field(description="动作变化条数")
+    winner_changes: int = Field(description="胜出规则变化条数（动作一致）")
+    type_changes: int = Field(description="输出 JSON 类型变化处数")
+    risks_new: int = Field(description="候选新增残留风险条数")
+    risks_resolved: int = Field(description="候选解除的残留风险条数")
+
+
+class StrategyDiffResponse(BaseModel):
+    """策略变更对照结果。所有差异项均不含原始值、正则文本或处理后仍含敏感信息的值。"""
+
+    passed: bool = Field(description="全部已设限门槛通过时为 true，供 CI 放行判定")
+    checks: list[DiffCheck] = Field(description="逐项门槛依据")
+    summary: StrategyDiffSummary
+    coverage_gained: list[CoverageDiffItem]
+    coverage_lost: list[CoverageDiffItem]
+    action_changes: list[ActionChangeItem]
+    winner_changes: list[WinnerChangeItem]
+    type_changes: list[TypeChangeItem]
+    risks_new: list[RiskDiffItem]
+    risks_resolved: list[RiskDiffItem]
+    truncated: list[str] = Field(
+        default_factory=list,
+        description="因超过单类返回上限而被截断的差异类目名（summary 计数仍为全量）",
+    )
+    key_fingerprint: str = Field(description="执行对照的主密钥指纹（两侧相同）")
+
+
 # ---------- 响应 ----------
 
 
