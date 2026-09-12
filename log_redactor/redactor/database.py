@@ -63,6 +63,9 @@ CREATE TABLE IF NOT EXISTS audit (
     match_type TEXT NOT NULL,
     hit_by_json TEXT NOT NULL,
     occurrences INTEGER NOT NULL,
+    decode_depth INTEGER NOT NULL DEFAULT 0,
+    outer_field_path TEXT,
+    inner_path TEXT,
     FOREIGN KEY (job_id) REFERENCES jobs(id)
 );
 CREATE TABLE IF NOT EXISTS risks (
@@ -71,7 +74,10 @@ CREATE TABLE IF NOT EXISTS risks (
     line_no INTEGER,
     field_path TEXT NOT NULL,
     detector TEXT NOT NULL,
-    length INTEGER NOT NULL
+    length INTEGER NOT NULL,
+    decode_depth INTEGER NOT NULL DEFAULT 0,
+    outer_field_path TEXT,
+    inner_path TEXT
 );
 -- 内嵌结构解码未执行（保持原值）的待复核原因，同样不含原值
 CREATE TABLE IF NOT EXISTS decode_issues (
@@ -134,7 +140,10 @@ CREATE TABLE IF NOT EXISTS stream_audit (
     action TEXT NOT NULL,
     match_type TEXT NOT NULL,
     hit_by_json TEXT NOT NULL,
-    occurrences INTEGER NOT NULL
+    occurrences INTEGER NOT NULL,
+    decode_depth INTEGER NOT NULL DEFAULT 0,
+    outer_field_path TEXT,
+    inner_path TEXT
 );
 CREATE TABLE IF NOT EXISTS stream_risks (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -143,7 +152,10 @@ CREATE TABLE IF NOT EXISTS stream_risks (
     line_no INTEGER,
     field_path TEXT NOT NULL,
     detector TEXT NOT NULL,
-    length INTEGER NOT NULL
+    length INTEGER NOT NULL,
+    decode_depth INTEGER NOT NULL DEFAULT 0,
+    outer_field_path TEXT,
+    inner_path TEXT
 );
 CREATE TABLE IF NOT EXISTS stream_decode_issues (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -225,7 +237,10 @@ CREATE TABLE IF NOT EXISTS bundle_audit (
     action TEXT NOT NULL,
     match_type TEXT NOT NULL,
     hit_by_json TEXT NOT NULL,
-    occurrences INTEGER NOT NULL
+    occurrences INTEGER NOT NULL,
+    decode_depth INTEGER NOT NULL DEFAULT 0,
+    outer_field_path TEXT,
+    inner_path TEXT
 );
 CREATE TABLE IF NOT EXISTS bundle_risks (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -235,7 +250,10 @@ CREATE TABLE IF NOT EXISTS bundle_risks (
     line_no INTEGER,
     field_path TEXT NOT NULL,
     detector TEXT NOT NULL,
-    length INTEGER NOT NULL
+    length INTEGER NOT NULL,
+    decode_depth INTEGER NOT NULL DEFAULT 0,
+    outer_field_path TEXT,
+    inner_path TEXT
 );
 CREATE TABLE IF NOT EXISTS bundle_decode_issues (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -430,6 +448,23 @@ class Database:
                     "ALTER TABLE bundle_files ADD COLUMN "
                     "decode_issues INTEGER NOT NULL DEFAULT 0"
                 )
+            # 审计/风险表的内嵌定位列（解码层级、外层字段、内部路径）
+            for table in ("audit", "risks", "stream_audit", "stream_risks",
+                          "bundle_audit", "bundle_risks"):
+                tcols = {r["name"] for r in conn.execute(f"PRAGMA table_info({table})")}
+                if "decode_depth" not in tcols:
+                    conn.execute(
+                        f"ALTER TABLE {table} ADD COLUMN "
+                        "decode_depth INTEGER NOT NULL DEFAULT 0"
+                    )
+                if "outer_field_path" not in tcols:
+                    conn.execute(
+                        f"ALTER TABLE {table} ADD COLUMN outer_field_path TEXT"
+                    )
+                if "inner_path" not in tcols:
+                    conn.execute(
+                        f"ALTER TABLE {table} ADD COLUMN inner_path TEXT"
+                    )
             # 保留策略：首次初始化内置默认期限（仅当规则表为空时，不覆盖既有配置）
             from .retention import DEFAULT_RETENTION_RULES
 
@@ -532,7 +567,8 @@ class Database:
             conn.executemany(
                 """INSERT INTO audit (job_id, record_index, line_no, field_path,
                    key_name, rule_id, rule_name, action, match_type,
-                   hit_by_json, occurrences) VALUES (?,?,?,?,?,?,?,?,?,?,?)""",
+                   hit_by_json, occurrences, decode_depth, outer_field_path,
+                   inner_path) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
                 [
                     (
                         job_id,
@@ -546,15 +582,20 @@ class Database:
                         a.match_type,
                         json.dumps(a.hit_by, ensure_ascii=False),
                         a.occurrences,
+                        a.decode_depth,
+                        a.outer_field_path,
+                        a.inner_path,
                     )
                     for a in audit
                 ],
             )
             conn.executemany(
                 """INSERT INTO risks (job_id, record_index, line_no, field_path,
-                   detector, length) VALUES (?,?,?,?,?,?)""",
+                   detector, length, decode_depth, outer_field_path, inner_path)
+                   VALUES (?,?,?,?,?,?,?,?,?)""",
                 [
-                    (job_id, r.record_index, r.line_no, r.field_path, r.detector, r.length)
+                    (job_id, r.record_index, r.line_no, r.field_path, r.detector,
+                     r.length, r.decode_depth, r.outer_field_path, r.inner_path)
                     for r in risks
                 ],
             )
@@ -609,6 +650,9 @@ class Database:
                 match_type=r["match_type"],
                 hit_by=json.loads(r["hit_by_json"]),
                 occurrences=r["occurrences"],
+                decode_depth=r["decode_depth"],
+                outer_field_path=r["outer_field_path"],
+                inner_path=r["inner_path"],
             )
             for r in rows
         ]
@@ -624,6 +668,9 @@ class Database:
                 field_path=r["field_path"],
                 detector=r["detector"],
                 length=r["length"],
+                decode_depth=r["decode_depth"],
+                outer_field_path=r["outer_field_path"],
+                inner_path=r["inner_path"],
             )
             for r in rows
         ]
@@ -870,13 +917,15 @@ class Database:
                 conn.executemany(
                     """INSERT INTO stream_audit (job_id, record_index, line_no,
                        field_path, key_name, rule_id, rule_name, action, match_type,
-                       hit_by_json, occurrences) VALUES (?,?,?,?,?,?,?,?,?,?,?)""",
+                       hit_by_json, occurrences, decode_depth, outer_field_path,
+                       inner_path) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
                     [
                         (
                             job_id, a.record_index, a.line_no, a.field_path,
                             a.key_name, a.rule_id, a.rule_name, a.action,
                             a.match_type,
                             json.dumps(a.hit_by, ensure_ascii=False), a.occurrences,
+                            a.decode_depth, a.outer_field_path, a.inner_path,
                         )
                         for a in audit
                     ],
@@ -884,10 +933,12 @@ class Database:
             if risks:
                 conn.executemany(
                     """INSERT INTO stream_risks (job_id, record_index, line_no,
-                       field_path, detector, length) VALUES (?,?,?,?,?,?)""",
+                       field_path, detector, length, decode_depth,
+                       outer_field_path, inner_path) VALUES (?,?,?,?,?,?,?,?,?)""",
                     [
                         (job_id, r.record_index, r.line_no, r.field_path,
-                         r.detector, r.length)
+                         r.detector, r.length, r.decode_depth,
+                         r.outer_field_path, r.inner_path)
                         for r in risks
                     ],
                 )
@@ -1012,13 +1063,16 @@ class Database:
             field_path=r["field_path"], key_name=r["key_name"],
             rule_id=r["rule_id"], rule_name=r["rule_name"], action=r["action"],
             match_type=r["match_type"], hit_by=json.loads(r["hit_by_json"]),
-            occurrences=r["occurrences"],
+            occurrences=r["occurrences"], decode_depth=r["decode_depth"],
+            outer_field_path=r["outer_field_path"], inner_path=r["inner_path"],
         )
 
     def _risk_row(self, r: sqlite3.Row) -> RiskFinding:
         return RiskFinding(
             record_index=r["record_index"], line_no=r["line_no"],
             field_path=r["field_path"], detector=r["detector"], length=r["length"],
+            decode_depth=r["decode_depth"],
+            outer_field_path=r["outer_field_path"], inner_path=r["inner_path"],
         )
 
     def paginate_stream_audit(
@@ -1232,6 +1286,8 @@ class Database:
         by_rule: dict[str, int],
         audit: list[AuditEntry],
         risks: list[RiskFinding],
+        decode_issues: list[DecodeIssue] | None = None,
+        decode_issue_count: int = 0,
     ) -> None:
         """文件级安全检查点：文件结果行、进度与本文件审计/风险同事务落库。
 
@@ -1241,23 +1297,24 @@ class Database:
         with self._lock, self._conn() as conn:
             conn.execute(
                 """INSERT INTO bundle_files (job_id, path, status, reason, format,
-                   records, lines, audit_entries, risk_findings, output_path,
-                   size_in, size_out) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)""",
+                   records, lines, audit_entries, risk_findings, decode_issues,
+                   output_path, size_in, size_out) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)""",
                 (
                     job_id, file_row.path, file_row.status, file_row.reason,
                     file_row.format, file_row.records, file_row.lines,
                     file_row.audit_entries, file_row.risk_findings,
+                    file_row.decode_issues,
                     file_row.output_path, file_row.size_in, file_row.size_out,
                 ),
             )
             conn.execute(
                 """UPDATE bundle_jobs SET updated_at=?, status='running',
                    files_processed=?, records_processed=?, audit_count=?,
-                   risk_count=?, fields_scanned=?, by_action_json=?,
-                   by_rule_json=?, current_file=NULL WHERE id=?""",
+                   risk_count=?, decode_issue_count=?, fields_scanned=?,
+                   by_action_json=?, by_rule_json=?, current_file=NULL WHERE id=?""",
                 (
                     utcnow_iso(), files_processed, records_processed, audit_count,
-                    risk_count, fields_scanned,
+                    risk_count, decode_issue_count, fields_scanned,
                     json.dumps(by_action, ensure_ascii=False),
                     json.dumps(by_rule, ensure_ascii=False), job_id,
                 ),
@@ -1266,14 +1323,16 @@ class Database:
                 conn.executemany(
                     """INSERT INTO bundle_audit (job_id, source_path, record_index,
                        line_no, field_path, key_name, rule_id, rule_name, action,
-                       match_type, hit_by_json, occurrences)
-                       VALUES (?,?,?,?,?,?,?,?,?,?,?,?)""",
+                       match_type, hit_by_json, occurrences, decode_depth,
+                       outer_field_path, inner_path)
+                       VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
                     [
                         (
                             job_id, a.source_path or file_row.path, a.record_index,
                             a.line_no, a.field_path, a.key_name, a.rule_id,
                             a.rule_name, a.action, a.match_type,
                             json.dumps(a.hit_by, ensure_ascii=False), a.occurrences,
+                            a.decode_depth, a.outer_field_path, a.inner_path,
                         )
                         for a in audit
                     ],
@@ -1281,14 +1340,31 @@ class Database:
             if risks:
                 conn.executemany(
                     """INSERT INTO bundle_risks (job_id, source_path, record_index,
-                       line_no, field_path, detector, length)
-                       VALUES (?,?,?,?,?,?,?)""",
+                       line_no, field_path, detector, length, decode_depth,
+                       outer_field_path, inner_path)
+                       VALUES (?,?,?,?,?,?,?,?,?,?)""",
                     [
                         (
                             job_id, r.source_path or file_row.path, r.record_index,
                             r.line_no, r.field_path, r.detector, r.length,
+                            r.decode_depth, r.outer_field_path, r.inner_path,
                         )
                         for r in risks
+                    ],
+                )
+            if decode_issues:
+                conn.executemany(
+                    """INSERT INTO bundle_decode_issues (job_id, source_path,
+                       record_index, line_no, field_path, decoder, reason,
+                       decode_depth, detail)
+                       VALUES (?,?,?,?,?,?,?,?,?)""",
+                    [
+                        (
+                            job_id, d.source_path or file_row.path, d.record_index,
+                            d.line_no, d.field_path, d.decoder, d.reason,
+                            d.decode_depth, d.detail,
+                        )
+                        for d in decode_issues
                     ],
                 )
 
@@ -1310,6 +1386,9 @@ class Database:
                 path=r["path"], status=r["status"], reason=r["reason"],
                 format=r["format"], records=r["records"], lines=r["lines"],
                 audit_entries=r["audit_entries"], risk_findings=r["risk_findings"],
+                decode_issues=(
+                    r["decode_issues"] if r.keys().count("decode_issues") else 0
+                ),
                 output_path=r["output_path"], size_in=r["size_in"],
                 size_out=r["size_out"],
             )
@@ -1423,13 +1502,17 @@ class Database:
             field_path=r["field_path"], key_name=r["key_name"],
             rule_id=r["rule_id"], rule_name=r["rule_name"], action=r["action"],
             match_type=r["match_type"], hit_by=json.loads(r["hit_by_json"]),
-            occurrences=r["occurrences"], source_path=r["source_path"],
+            occurrences=r["occurrences"], decode_depth=r["decode_depth"],
+            outer_field_path=r["outer_field_path"], inner_path=r["inner_path"],
+            source_path=r["source_path"],
         )
 
     def _bundle_risk_row(self, r: sqlite3.Row) -> RiskFinding:
         return RiskFinding(
             record_index=r["record_index"], line_no=r["line_no"],
             field_path=r["field_path"], detector=r["detector"], length=r["length"],
+            decode_depth=r["decode_depth"],
+            outer_field_path=r["outer_field_path"], inner_path=r["inner_path"],
             source_path=r["source_path"],
         )
 
@@ -1465,6 +1548,24 @@ class Database:
         return RiskPage(
             job_id=job_id, total=total, limit=limit, offset=offset,
             items=[self._bundle_risk_row(r) for r in rows],
+        )
+
+    def paginate_bundle_decode_issues(
+        self, job_id: str, *, limit: int, offset: int
+    ) -> DecodeIssuePage:
+        with self._conn() as conn:
+            total = conn.execute(
+                "SELECT COUNT(*) AS c FROM bundle_decode_issues WHERE job_id=?",
+                (job_id,),
+            ).fetchone()["c"]
+            rows = conn.execute(
+                """SELECT * FROM bundle_decode_issues WHERE job_id=?
+                   ORDER BY id ASC LIMIT ? OFFSET ?""",
+                (job_id, limit, offset),
+            ).fetchall()
+        return DecodeIssuePage(
+            job_id=job_id, total=total, limit=limit, offset=offset,
+            items=[self._decode_issue_row(r, with_source=True) for r in rows],
         )
 
     def resumable_bundle_jobs(self) -> list[sqlite3.Row]:
@@ -1863,11 +1964,13 @@ class Database:
         避免外键/悬挂锁残留。
         """
         if job_kind == "batch":
-            tables = ("audit", "risks", "jobs")
+            tables = ("audit", "risks", "decode_issues", "jobs")
         elif job_kind == "stream":
-            tables = ("stream_audit", "stream_risks", "stream_jobs")
+            tables = ("stream_audit", "stream_risks", "stream_decode_issues",
+                      "stream_jobs")
         elif job_kind == "bundle":
-            tables = ("bundle_audit", "bundle_risks", "bundle_files", "bundle_jobs")
+            tables = ("bundle_audit", "bundle_risks", "bundle_decode_issues",
+                      "bundle_files", "bundle_jobs")
         else:  # 防御：未知类型不动数据库
             return
         job_tables = {"jobs", "stream_jobs", "bundle_jobs"}

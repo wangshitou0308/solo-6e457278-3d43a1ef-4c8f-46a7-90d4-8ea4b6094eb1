@@ -350,6 +350,7 @@ def run_stream_job(job_id: str, get_db: Callable[[], Database],
 
     pending_audit: list[AuditEntry] = []
     pending_risks: list[RiskFinding] = []
+    pending_issues: list[DecodeIssue] = []
     since_checkpoint = 0
     last_line_no = job.last_line_no
     # 引擎每轮（含本进程内续跑）从零计数 fields_scanned，需要加上检查点基线
@@ -359,7 +360,7 @@ def run_stream_job(job_id: str, get_db: Callable[[], Database],
 
     def write_checkpoint() -> None:
         """先 fsync 输出，再提交数据库检查点（崩溃安全顺序）。"""
-        nonlocal audit_total, risk_total
+        nonlocal audit_total, risk_total, issue_total
         out.flush()
         os.fsync(out.fileno())
         output_bytes = out.tell()
@@ -376,11 +377,15 @@ def run_stream_job(job_id: str, get_db: Callable[[], Database],
             output_bytes=output_bytes,
             audit=pending_audit,
             risks=pending_risks,
+            decode_issues=pending_issues,
+            decode_issue_count=issue_total + len(pending_issues),
         )
         audit_total += len(pending_audit)
         risk_total += len(pending_risks)
+        issue_total += len(pending_issues)
         pending_audit.clear()
         pending_risks.clear()
+        pending_issues.clear()
 
     try:
         with open(src, "rb") as fh:

@@ -14,6 +14,7 @@ from .crypto import (
 from .detectors import scan, _merge_spans
 from .embedded import (
     DecodeError,
+    QuerySegment,
     decode_json_string,
     encode_json_string,
     encode_query_value,
@@ -21,6 +22,7 @@ from .embedded import (
     parse_query_segments,
     query_expanded_bytes,
     render_segment,
+    rewrite_raw_value,
     split_url_query,
 )
 from .models import (
@@ -295,6 +297,16 @@ def _mask_whole(value: Any, char: str, prefix: int, suffix: int) -> Any:
 # ---------- 引擎 ----------
 
 
+def _splice_edits(text: str, edits: list[tuple[int, int, str]]) -> str:
+    """把片段替换应用到文本：全部命中按起点统一降序替换，只依赖自身起点
+    之前的文本长度，不会因为别的替换改变长度而发生位置偏移、留下或截断
+    已命中原文。"""
+    out = text
+    for s, e, replacement in sorted(edits, key=lambda x: (x[0], x[1]), reverse=True):
+        out = out[:s] + replacement + out[e:]
+    return out
+
+
 class RedactionEngine:
     def __init__(self, strategy: Strategy, key: MasterKey, is_ndjson: bool = False,
                  collect_coverage: bool = False,
@@ -535,12 +547,13 @@ class RedactionEngine:
                           ctx: _DecodeCtx, child_ctx: _DecodeCtx) -> str:
         try:
             parts = split_url_query(value)
+            segments = parse_query_segments(parts.query)
         except DecodeError as exc:
             self._record_decode_issue(
                 idx, path, "url_query", "decode_failed", ctx, str(exc))
             return value
-        new_query = self._process_query(
-            parts.query, idx, path, ctx, child_ctx, "url_query")
+        new_query = self._process_segments(
+            segments, idx, path, ctx, child_ctx, "url_query")
         if new_query is None:
             return value  # 展开超限，已记录待复核
         self._decoded_fields.add((idx, path))
@@ -550,22 +563,27 @@ class RedactionEngine:
 
     def _decode_form_body(self, value: str, idx: int, path: str,
                           ctx: _DecodeCtx, child_ctx: _DecodeCtx) -> str:
-        new_body = self._process_query(
-            value, idx, path, ctx, child_ctx, "form_urlencoded")
+        try:
+            segments = parse_query_segments(value)
+        except DecodeError as exc:
+            self._record_decode_issue(
+                idx, path, "form_urlencoded", "decode_failed", ctx, str(exc))
+            return value
+        new_body = self._process_segments(
+            segments, idx, path, ctx, child_ctx, "form_urlencoded")
         if new_body is None:
             return value  # 展开超限，已记录待复核
         self._decoded_fields.add((idx, path))
         return new_body
 
-    def _process_query(self, query: str, idx: int, path: str,
-                       ctx: _DecodeCtx, child_ctx: _DecodeCtx,
-                       kind: str) -> str | None:
+    def _process_segments(self, segments: list[QuerySegment], idx: int,
+                          path: str, ctx: _DecodeCtx, child_ctx: _DecodeCtx,
+                          kind: str) -> str | None:
         """逐段处理查询串/表单体，返回新串；展开超限返回 None（已记录待复核）。
 
         参数顺序、重复键、空值与旗标参数全部保留；未被规则改写的段原样
-        回写（原始百分号编码逐字节保留），只有被改写的段重新编码。
+        回写（原始百分号编码逐字节保留），内容规则只重写命中片段。
         """
-        segments = parse_query_segments(query)
         expanded = query_expanded_bytes(segments)
         if expanded > self.max_decode_bytes:
             self._record_decode_issue(
@@ -576,23 +594,60 @@ class RedactionEngine:
         out: list[str] = []
         for seg in segments:
             param_path = f"{path}.{seg.key}" if path else seg.key
-            new_value = self._apply_leaf(seg.value, idx, param_path, seg.key,
-                                         child_ctx)
-            if new_value is None:
-                # delete：置空、保留键与位置
-                out.append(seg.raw_key + "=")
-                # 删除后无残留内容可扫
-            elif new_value == seg.value:
-                out.append(seg.raw)  # 未改写：原始编码逐字节保留
-                self._scan_risks(seg.value, idx, param_path, child_ctx)
-            else:
-                out.append(seg.raw_key + "=" + encode_query_value(new_value))
-                self._scan_risks(new_value, idx, param_path, child_ctx)
+            out.append(self._process_segment(seg, idx, param_path, child_ctx))
         return "&".join(out)
 
-    def _apply_content_rules(self, text: str, idx: int, path: str, key: str | None,
-                             ctx: _DecodeCtx = _ROOT_CTX) -> str:
-        # 候选片段按规则定义顺序贪心占位，重叠片段归先定义的规则
+    def _process_segment(self, seg: QuerySegment, idx: int, param_path: str,
+                         child_ctx: _DecodeCtx) -> str:
+        """处理单个查询/表单参数段，返回回写文本。
+
+        * 整字段规则/嵌套解码器命中：整个参数值被改写（delete 置空保留键）；
+        * 内容规则：只改写命中片段，未命中部分的原始编码逐字节保留；
+        * 未命中任何规则：整段原样回写。
+        """
+        self.fields_scanned += 1
+
+        # 1) 整字段规则：按策略顺序第一个命中即生效，动作作用于整个参数值
+        for cr in self.field_rules:
+            if cr.field_matches(param_path, seg.key):
+                self._record_audit(idx, param_path, seg.key, cr, "field",
+                                   ["field_match"], ctx=child_ctx)
+                self._record_coverage(idx, param_path, seg.key, cr, "field",
+                                      ("field_match",), (0, len(seg.value)))
+                if param_path:
+                    self._fully_handled.add((idx, param_path))
+                new_value = self._field_action(seg.value, cr)
+                return render_segment(
+                    seg.raw_key,
+                    None if new_value is None else str(new_value),
+                )
+
+        # 2) 嵌套解码器：参数值本身是内嵌结构（如 JSON 字符串）
+        if self.decoders:
+            decoder = next(
+                (d for d in self.decoders if d.matches(param_path, seg.key)), None)
+            if decoder is not None:
+                new_value = self._apply_decoder(
+                    seg.value, idx, param_path, seg.key, child_ctx, decoder)
+                # 解码失败已记录待复核并返回原值；解码成功的内层已完成风险扫描
+                self._scan_risks(new_value, idx, param_path, child_ctx)
+                if new_value == seg.value:
+                    return seg.raw
+                return seg.raw_key + "=" + encode_query_value(new_value)
+
+        # 3) 内容规则：只改写命中片段，保留其余部分的原始百分号编码
+        edits = self._content_edits(seg.value, idx, param_path, seg.key, child_ctx)
+        if not edits:
+            self._scan_risks(seg.value, idx, param_path, child_ctx)
+            return seg.raw
+        self._scan_risks(_splice_edits(seg.value, edits), idx, param_path,
+                         child_ctx)
+        return seg.raw_key + "=" + rewrite_raw_value(
+            seg.raw_value or "", seg.value_offsets, edits)
+
+    def _content_edits(self, text: str, idx: int, path: str, key: str | None,
+                       ctx: _DecodeCtx = _ROOT_CTX) -> list[tuple[int, int, str]]:
+        """计算内容规则的片段替换（并记录审计/覆盖）；无命中返回空列表。"""
         taken: list[tuple[int, int]] = []
 
         def _free(spans: list[tuple[int, int]]) -> list[tuple[int, int]]:
@@ -657,16 +712,11 @@ class RedactionEngine:
                 else:
                     replacement = self._token_str(original)
                 edits.append((s, e, replacement))
+        return edits
 
-        if not edits:
-            return text
-
-        # 全部命中按起点统一降序替换：只依赖自身起点之前的文本长度，
-        # 不会因为别的替换改变长度而发生位置偏移、留下或截断已命中原文
-        out = text
-        for s, e, replacement in sorted(edits, key=lambda x: (x[0], x[1]), reverse=True):
-            out = out[:s] + replacement + out[e:]
-        return out
+    def _apply_content_rules(self, text: str, idx: int, path: str, key: str | None,
+                             ctx: _DecodeCtx = _ROOT_CTX) -> str:
+        return _splice_edits(text, self._content_edits(text, idx, path, key, ctx))
 
     # -- 递归遍历 --
     def _walk(self, node: Any, idx: int, path: str, key: str | None,

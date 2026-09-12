@@ -5,19 +5,22 @@
 * ``json_string``：``json.loads`` / ``json.dumps``（ensure_ascii=False）；
   仅对象/数组视为可展开的内嵌结构（标量由调用方回退为普通内容规则处理）。
 * ``url_query``：把 URL 拆成 非查询部分 / 查询串 / 片段；查询串按 ``&`` 切段，
-  保留参数顺序、重复查询键、空值、无 ``=`` 的旗标参数，以及**未修改段的
-  原始百分号编码**（只有被规则改写的段才重新编码）。
+  保留参数顺序、重复查询键、空值、无 ``=`` 的旗标参数，以及**未修改部分的
+  原始百分号编码**（只有被规则命中的片段才重新编码）。
 * ``form_urlencoded``：整串即表单体，与查询串同一套段处理。
 
-解码后的键/值按 ``unquote_plus`` 还原（``+`` 视为空格，与表单编码一致）；
-被改写值的回写编码为 ``quote_plus``（``*`` 保持字面，掩码结果可读）。
+解码后的键/值按表单规则还原（``+`` 视为空格）；非法百分号序列（``%`` 后
+不是两个十六进制字符、或解码后不是合法 UTF-8）一律视为解码失败。
+被改写片段的回写编码为 ``quote_plus``（``*`` 保持字面，掩码结果可读）。
 """
 from __future__ import annotations
 
 import json
 from dataclasses import dataclass
 from typing import Any
-from urllib.parse import quote_plus, unquote_plus
+from urllib.parse import quote_plus
+
+_HEX = frozenset("0123456789abcdefABCDEF")
 
 
 class DecodeError(ValueError):
@@ -77,6 +80,49 @@ def split_url_query(value: str) -> UrlParts:
                     fragment=rest[hash_idx:])
 
 
+def decode_value_mapped(raw: str) -> tuple[str, tuple[int, ...]]:
+    """把查询键/值按表单规则解码为文本，并给出解码字符到原串的偏移映射。
+
+    返回 ``(解码文本, offsets)``：``offsets[i]`` 是解码后第 ``i`` 个字符在
+    原始（未解码）串中的起始下标，末尾含哨兵 ``len(raw)``；构成同一 UTF-8
+    字符的连续百分号三字节组映射到该组起始位置。``+`` 解码为空格。
+
+    非法百分号序列（``%`` 后不是两个十六进制字符）或解码结果不是合法
+    UTF-8 时抛 :class:`DecodeError`。
+    """
+    raw_bytes = bytearray()
+    byte_offsets: list[int] = []  # 每个解码字节在原串中的起始偏移
+    i, n = 0, len(raw)
+    while i < n:
+        ch = raw[i]
+        if ch == "%":
+            if i + 2 >= n or raw[i + 1] not in _HEX or raw[i + 2] not in _HEX:
+                raise DecodeError(f"非法百分号编码序列（原串偏移 {i}）")
+            raw_bytes.append(int(raw[i + 1 : i + 3], 16))
+            byte_offsets.append(i)
+            i += 3
+        elif ch == "+":
+            raw_bytes.append(0x20)
+            byte_offsets.append(i)
+            i += 1
+        else:
+            encoded = ch.encode("utf-8")
+            raw_bytes.extend(encoded)
+            byte_offsets.extend([i] * len(encoded))
+            i += 1
+    try:
+        text = bytes(raw_bytes).decode("utf-8")
+    except UnicodeDecodeError as exc:
+        raise DecodeError(f"百分号解码后不是合法 UTF-8：{exc.reason}") from exc
+    offsets: list[int] = []
+    byte_pos = 0
+    for char in text:
+        offsets.append(byte_offsets[byte_pos])
+        byte_pos += len(char.encode("utf-8"))
+    offsets.append(n)
+    return text, tuple(offsets)
+
+
 @dataclass(frozen=True)
 class QuerySegment:
     """查询串/表单体中的一个参数段（``key``、``key=``、``key=value`` 三种形态）。"""
@@ -86,10 +132,14 @@ class QuerySegment:
     raw_value: str | None  # 原始值；None 表示无 "=" 的旗标参数
     key: str  # 百分号解码后的键（用于字段路径与键名匹配）
     value: str  # 百分号解码后的值（旗标参数为 ""）
+    value_offsets: tuple[int, ...]  # value 各字符在 raw_value 中的偏移（片段级回写用）
 
 
 def parse_query_segments(query: str) -> list[QuerySegment]:
-    """把查询串/表单体按 ``&`` 切成参数段，保留顺序、重复键与空值。"""
+    """把查询串/表单体按 ``&`` 切成参数段，保留顺序、重复键与空值。
+
+    任一键/值含非法百分号序列时抛 :class:`DecodeError`（整串按解码失败处理）。
+    """
     if query == "":
         return []
     segments: list[QuerySegment] = []
@@ -98,13 +148,19 @@ def parse_query_segments(query: str) -> list[QuerySegment]:
             raw_key, raw_value = part.split("=", 1)
         else:
             raw_key, raw_value = part, None
+        key, _key_offsets = decode_value_mapped(raw_key)
+        if raw_value is None:
+            value, value_offsets = "", (0,)
+        else:
+            value, value_offsets = decode_value_mapped(raw_value)
         segments.append(
             QuerySegment(
                 raw=part,
                 raw_key=raw_key,
                 raw_value=raw_value,
-                key=unquote_plus(raw_key),
-                value=unquote_plus(raw_value) if raw_value is not None else "",
+                key=key,
+                value=value,
+                value_offsets=value_offsets,
             )
         )
     return segments
@@ -119,7 +175,7 @@ def query_expanded_bytes(segments: list[QuerySegment]) -> int:
 
 
 def encode_query_value(value: str) -> str:
-    """回写被规则改写的参数值：表单风格百分号编码（空格为 ``+``）。
+    """回写被规则改写的文本：表单风格百分号编码（空格为 ``+``）。
 
     ``*`` 是 RFC 3986 sub-delim，在查询串/表单体中合法，保持字面可让
     掩码结果（如 ``a***``）直接可读；令牌（``T-…``，base32）无需编码。
@@ -127,8 +183,22 @@ def encode_query_value(value: str) -> str:
     return quote_plus(value, safe="*")
 
 
+def rewrite_raw_value(raw_value: str, offsets: tuple[int, ...],
+                      edits: list[tuple[int, int, str]]) -> str:
+    """把解码坐标系下的片段替换应用到原始（未解码）参数值。
+
+    只改写命中的片段（替换文本按表单规则编码），未命中部分的原始
+    百分号编码（``%20``、``+``、大小写hex 等）逐字节保留。
+    """
+    out = raw_value
+    for s, e, replacement in sorted(edits, key=lambda x: (x[0], x[1]), reverse=True):
+        raw_s, raw_e = offsets[s], offsets[e]
+        out = out[:raw_s] + encode_query_value(replacement) + out[raw_e:]
+    return out
+
+
 def render_segment(raw_key: str, new_value: str | None) -> str:
-    """渲染被改写的参数段；``new_value=None`` 表示 delete（置空、保留键）。"""
+    """渲染被整体改写的参数段；``new_value=None`` 表示 delete（置空、保留键）。"""
     if new_value is None:
         return raw_key + "="
     return raw_key + "=" + encode_query_value(new_value)
