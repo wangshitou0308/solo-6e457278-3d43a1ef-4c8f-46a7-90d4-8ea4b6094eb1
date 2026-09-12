@@ -25,6 +25,11 @@
 * ``GET  /api/v1/bundle-jobs/{job_id}/risks`` 分页残留风险（带来源路径）
 * ``GET  /api/v1/bundle-jobs/{job_id}/manifest`` 处理清单（跳过/失败原因）
 * ``GET  /api/v1/bundle-jobs/{job_id}/download`` 下载结果 ZIP（脱敏文件+清单）
+* ``POST /api/v1/upload-sessions``      断点续传会话：声明类型/总字节/整体摘要/策略/关联域
+* ``GET  /api/v1/upload-sessions/{session_id}`` 上传进度（已收/缺失区间）
+* ``PUT  /api/v1/upload-sessions/{session_id}/chunks`` Content-Range 乱序分片上传
+* ``POST /api/v1/upload-sessions/{session_id}/abort`` 终止会话并清理暂存
+* ``POST /api/v1/upload-sessions/{session_id}/complete`` 校验完整性并转入脱敏作业
 * ``GET  /api/v1/{jobs,stream-jobs,bundle-jobs}/{job_id}/receipt`` 完整性凭证查询
 * ``GET  /api/v1/{jobs,stream-jobs,bundle-jobs}/{job_id}/receipt/download`` 凭证下载
 * ``POST /api/v1/{jobs,stream-jobs,bundle-jobs}/{job_id}/receipt/verify`` 凭证校验
@@ -40,9 +45,11 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import re
 import sqlite3
 import threading
 import uuid
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Callable
 
@@ -52,7 +59,7 @@ from fastapi import Body, FastAPI, File, Form, Header, HTTPException, Query, Req
 from fastapi.responses import FileResponse, JSONResponse, Response
 from fastapi.openapi.utils import get_openapi
 
-from . import config, receipts
+from . import config, receipts, retention, upload_sessions
 from .bundle_jobs import (
     build_manifest,
     bundle_registry,
@@ -70,10 +77,9 @@ from .crypto import (
     validate_token_context,
 )
 from .crypto import resolve_token_domain
-from .database import Database
+from .database import Database, utcnow_iso
 from .engine import run_strategy
 from .parsing import ParsedBatch, PayloadError, parse_batch_indexed
-from . import retention
 from .models import (
     BatchPayload,
     CleanupExecuteRequest,
@@ -83,6 +89,7 @@ from .models import (
     CleanupPreviewResponse,
     CreateJobRequest,
     CreateRetentionLockRequest,
+    CreateUploadSessionRequest,
     DryRunRequest,
     JobDetail,
     JobList,
@@ -96,6 +103,7 @@ from .models import (
     Strategy,
     StrategyDiffRequest,
     StrategyDiffResponse,
+    UploadSessionModel,
     UpsertRetentionRuleRequest,
 )
 from .samples import sample_ndjson, sample_strategy_dict
@@ -113,11 +121,13 @@ MAX_BODY_BYTES = 10 * 1024 * 1024  # 10 MiB，小批量 JSON 接口的请求体�
 # 流式/诊断包上传走 multipart 落盘，不受小批量请求体上限约束
 STREAM_UPLOAD_PATH = "/api/v1/stream-jobs"
 BUNDLE_UPLOAD_PATH = "/api/v1/bundle-jobs"
+# 断点续传分片（PUT .../chunks）流式落盘，同样豁免小批量请求体上限
+UPLOAD_SESSIONS_PREFIX = "/api/v1/upload-sessions"
 UPLOAD_CHUNK = 1024 * 1024  # 1 MiB：multipart 流式落盘的拷贝块大小
 
 app = FastAPI(
     title="本地日志脱敏 API",
-    version="1.6.0",
+    version="1.7.0",
     description=(
         "供后端团队提交故障样本前使用的本地日志脱敏服务。支持按字段路径/键名/正则/内置识别器"
         "（邮箱、手机号、IP、访问令牌、身份证、银行卡）命中，动作包括删除、掩码与基于本地"
@@ -154,6 +164,16 @@ app = FastAPI(
         "只在结果 ZIP 的 redaction-manifest.json 清单列明原因。审计与残留风险带来源路径"
         "与行号/记录位置，不含原值；同一 Idempotency-Key 仅在压缩包与策略均一致时回放，"
         "否则 409；支持进度查询、取消与重启续跑，终态清理原始包，成功后原子发布结果 ZIP。\n\n"
+        "## 断点续传上传会话（upload-sessions）\n"
+        "网络不稳时 NDJSON 与 ZIP 诊断包不必整包重传：先声明式创建会话（文件类型、"
+        "总字节数、整体 SHA-256、脱敏策略与 token_context，可带 Idempotency-Key），"
+        "再用 `Content-Range: bytes <start>-<end>/<total>` 乱序提交分片；分片以 0600 "
+        "权限流式暂存并逐片登记 SHA-256 索引，进度接口返回已收/缺失区间。相同区间内容"
+        "一致的重传幂等回放（200）；区间重叠冲突、越界或逐片摘要不符一律拒绝且保留已有"
+        "分片。会话与分片索引在服务重启后恢复；过期或终止时清理暂存文件。完成时要求分片"
+        "恰好覆盖全部字节并通过整体 SHA-256 校验：NDJSON 转入既有流式作业，ZIP 经原有"
+        "安全检查后转入诊断包作业，策略、令牌关联域与 Idempotency-Key 全部沿用创建时的"
+        "声明；完成后会话禁止继续写入。\n\n"
         "## 脱敏结果完整性凭证（receipt）\n"
         "小批量、流式 NDJSON 与诊断包作业在**成功发布结果**时生成独立 JSON 凭证：记录"
         "格式版本、输入与规范化策略摘要、关联域指纹、统计计数与输出文件摘要（诊断包另列"
@@ -197,11 +217,13 @@ def get_master_key() -> MasterKey:
 
 @asynccontextmanager
 async def lifespan(_app: FastAPI):
-    # 服务启动：确保目录就位，并从安全检查点恢复未完成的流式/诊断包/清理作业
+    # 服务启动：确保目录就位，并从安全检查点恢复未完成的流式/诊断包/清理/上传会话
     ensure_stream_dirs()
     ensure_bundle_dirs()
+    upload_sessions.ensure_upload_dirs()
     recover_stream_jobs(get_db, get_master_key)
     recover_bundle_jobs(get_db, get_master_key)
+    upload_sessions.recover_upload_sessions(get_db)
     retention.recover_cleanup_plans(get_db)
     yield
 
@@ -257,9 +279,15 @@ def _run_response(result: RunResult) -> dict[str, Any]:
 
 @app.middleware("http")
 async def _limit_body(request: Request, call_next):
-    # multipart 流式上传逐块落盘、不读入内存，豁免小批量 10 MiB 请求体上限
-    exempt = request.method == "POST" and request.url.path in (
-        STREAM_UPLOAD_PATH, BUNDLE_UPLOAD_PATH,
+    # multipart 流式上传与断点续传分片逐块落盘、不读入内存，豁免小批量 10 MiB 上限
+    path = request.url.path
+    exempt = (
+        request.method == "POST"
+        and path in (STREAM_UPLOAD_PATH, BUNDLE_UPLOAD_PATH)
+    ) or (
+        request.method == "PUT"
+        and path.startswith(UPLOAD_SESSIONS_PREFIX + "/")
+        and path.endswith("/chunks")
     )
     cl = request.headers.get("content-length")
     if not exempt and cl and cl.isdigit() and int(cl) > MAX_BODY_BYTES:
@@ -1136,6 +1164,644 @@ def download_bundle_job(job_id: str):
         media_type="application/zip",
         filename=f"redacted-{name}",
     )
+
+
+# ---------- 断点续传上传会话 ----------
+
+
+def _ensure_upload_recovery() -> None:
+    """未触发 lifespan 的部署形态（如测试/嵌入式）下惰性恢复一次。"""
+    upload_sessions.ensure_upload_dirs()
+    upload_sessions.recover_upload_sessions(get_db)
+
+
+def _require_upload_session(session_id: str):
+    row = get_db().get_upload_session(session_id)
+    if row is None:
+        raise HTTPException(status_code=404, detail=f"上传会话不存在: {session_id}")
+    return row
+
+
+def _lazy_expire_session(row):
+    """访问时惰性过期：到期的 uploading 会话置为 expired 并清理暂存。"""
+    if row["status"] == "uploading" and row["expires_at"] <= utcnow_iso():
+        upload_sessions.abort_session(get_db(), row["id"], status="expired")
+        row = get_db().get_upload_session(row["id"])
+    return row
+
+
+def _session_not_uploading(row) -> HTTPException:
+    return HTTPException(
+        status_code=409,
+        detail={"message": f"会话状态为 {row['status']}，不再接受分片写入",
+                "status": row["status"]},
+    )
+
+
+def _session_view(row) -> dict[str, Any]:
+    return upload_sessions.session_to_model(row, get_db())
+
+
+def _validate_idempotency_header(idempotency_key: str | None) -> str | None:
+    if idempotency_key is not None:
+        idempotency_key = idempotency_key.strip()
+        if len(idempotency_key) > 128:
+            raise HTTPException(status_code=400, detail="Idempotency-Key 最长 128 字符")
+    return idempotency_key
+
+
+def _session_declaration_matches(row, *, kind: str, bytes_total: int,
+                                 content_sha: str, strategy_sha: str,
+                                 domain_id: str | None) -> bool:
+    """会话级幂等回放判定：声明五元组（类型/总字节/整体摘要/策略/关联域）一致。"""
+    return (
+        row["kind"] == kind
+        and row["bytes_total"] == bytes_total
+        and row["content_sha256"] == content_sha
+        and row["strategy_sha256"] == strategy_sha
+        and (row["domain_id"] or "") == (domain_id or "")
+    )
+
+
+def _job_row_for_session(kind: str, job_id: str):
+    if kind == "ndjson":
+        return get_db().get_stream_job(job_id)
+    return get_db().get_bundle_job(job_id)
+
+
+def _job_dict_for_session(kind: str, job_id: str) -> dict[str, Any] | None:
+    job = _job_row_for_session(kind, job_id)
+    if job is None:
+        return None
+    return job.model_dump(mode="json")
+
+
+@app.post(
+    "/api/v1/upload-sessions",
+    tags=["upload-sessions"],
+    summary="创建断点续传上传会话（声明类型/总字节/整体摘要/策略/关联域）",
+    description=(
+        "网络不稳时不必整包重传：先创建会话，声明 `kind`（ndjson/zip）、"
+        "`bytes_total`（总字节数）、`content_sha256`（整体 SHA-256）、脱敏策略与"
+        "可选 `token_context`（最长 128 字符，只持久化不可逆域标识）；随后用 "
+        "`PUT .../chunks` 按 `Content-Range` 乱序提交分片，全部覆盖后调用 "
+        "`.../complete` 转入对应的脱敏作业。\n\n"
+        "会话默认 24 小时过期（`expires_in_seconds` 可调，最长 7 天）；过期或终止"
+        "时暂存文件被清理。携带 `Idempotency-Key` 时：相同键且**类型、总字节、整体"
+        "摘要、规范化策略与关联域**五者一致才回放既有会话（200），任一不同返回 "
+        "**409**；该键在完成时继续绑定转入的流式/诊断包作业。"
+    ),
+    status_code=201,
+    responses={
+        200: {"description": "幂等命中，回放既有会话"},
+        201: {"description": "会话已创建，可开始上传分片"},
+        400: {"description": "Idempotency-Key 非法"},
+        409: {"description": "Idempotency-Key 冲突（同键声明不同）"},
+        413: {"description": "ZIP 声明大小超过上传上限"},
+        422: {"description": "策略非法、摘要格式非法或 token_context 超长"},
+    },
+)
+def create_upload_session(
+    req: CreateUploadSessionRequest,
+    idempotency_key: str | None = Header(
+        default=None, alias="Idempotency-Key",
+        description="同一键只回放声明（类型/总字节/摘要/策略/关联域）一致的会话；"
+                    "完成时该键继续绑定转入的脱敏作业",
+    ),
+) -> JSONResponse:
+    _ensure_upload_recovery()
+    idempotency_key = _validate_idempotency_header(idempotency_key)
+
+    # 关联域在创建任何文件/记录之前解析；只持久化不可逆域标识
+    domain_hex = domain_id_hex(get_master_key(), req.token_context)
+
+    strategy_canonical = req.strategy.model_dump_json()
+    strategy_sha = hashlib.sha256(strategy_canonical.encode("utf-8")).hexdigest()
+
+    # ZIP 声明大小不得超过展开总量上限（与 multipart 上传同一约束）
+    if req.kind == "zip" and req.bytes_total > max_total_bytes():
+        raise HTTPException(
+            status_code=413,
+            detail={"message": f"声明的压缩包大小超过上传上限（{max_total_bytes()} 字节）"},
+        )
+
+    default_name = "upload.ndjson" if req.kind == "ndjson" else "bundle.zip"
+    source_name = Path(req.source_filename or default_name).name or default_name
+
+    if idempotency_key:
+        # 会话级回放：五元组一致回放，任一不同 409
+        existing = get_db().get_upload_session_by_idempotency(idempotency_key)
+        if existing is not None:
+            if not _session_declaration_matches(
+                existing, kind=req.kind, bytes_total=req.bytes_total,
+                content_sha=req.content_sha256, strategy_sha=strategy_sha,
+                domain_id=domain_hex,
+            ):
+                raise HTTPException(
+                    status_code=409,
+                    detail={"message": "Idempotency-Key 已用于声明不同的上传会话",
+                            "existing_session_id": existing["id"]},
+                )
+            return JSONResponse(
+                status_code=200,
+                content={"replayed": True, "session": _session_view(existing)},
+            )
+        # 快速失败：该键已绑定到内容/策略/关联域不同的既有作业
+        row = (get_db().get_stream_idempotent(idempotency_key)
+               if req.kind == "ndjson"
+               else get_db().get_bundle_idempotent(idempotency_key))
+        if row is not None:
+            _check_idempotency_triplet(
+                row, content_sha=req.content_sha256, strategy_sha=strategy_sha,
+                domain_id=domain_hex,
+            )
+
+    session_id = uuid.uuid4().hex
+    ttl = req.expires_in_seconds or upload_sessions.session_ttl_seconds()
+    expires_at = (
+        datetime.now(timezone.utc) + timedelta(seconds=ttl)
+    ).isoformat(timespec="seconds")
+
+    # 先建 0600 暂存文件，再落库；落库失败（并发同键）立即清理
+    staged = upload_sessions.create_staged_file(session_id)
+    try:
+        row = get_db().create_upload_session(
+            session_id=session_id,
+            idempotency_key=idempotency_key,
+            kind=req.kind,
+            source_filename=source_name,
+            bytes_total=req.bytes_total,
+            content_sha256=req.content_sha256,
+            strategy_json=strategy_canonical,
+            strategy_sha256=strategy_sha,
+            domain_id=domain_hex,
+            key_fingerprint=key_fingerprint(get_master_key()),
+            expires_at=expires_at,
+        )
+    except sqlite3.IntegrityError:
+        staged.unlink(missing_ok=True)
+        winner = (
+            get_db().get_upload_session_by_idempotency(idempotency_key)
+            if idempotency_key else None
+        )
+        if winner is not None:
+            if not _session_declaration_matches(
+                winner, kind=req.kind, bytes_total=req.bytes_total,
+                content_sha=req.content_sha256, strategy_sha=strategy_sha,
+                domain_id=domain_hex,
+            ):
+                raise HTTPException(
+                    status_code=409,
+                    detail={"message": "Idempotency-Key 已用于声明不同的上传会话",
+                            "existing_session_id": winner["id"]},
+                )
+            return JSONResponse(
+                status_code=200,
+                content={"replayed": True, "session": _session_view(winner)},
+            )
+        raise
+    return JSONResponse(
+        status_code=201, content={"replayed": False, "session": _session_view(row)}
+    )
+
+
+@app.get(
+    "/api/v1/upload-sessions/{session_id}",
+    tags=["upload-sessions"],
+    summary="上传会话状态与进度（已收/缺失区间）",
+    description="返回会话状态、已接收字节区间（合并相邻后）、仍缺失区间与进度百分比；"
+                "客户端据此只重传缺失分片。",
+    response_model=UploadSessionModel,
+    responses={404: {"description": "会话不存在"}},
+)
+def get_upload_session(session_id: str) -> dict[str, Any]:
+    _ensure_upload_recovery()
+    row = _lazy_expire_session(_require_upload_session(session_id))
+    return _session_view(row)
+
+
+def _parse_chunk_digest_header(value: str | None) -> str | None:
+    if value is None:
+        return None
+    digest = value.strip().lower()
+    if not re.fullmatch(r"[0-9a-f]{64}", digest):
+        raise HTTPException(
+            status_code=400,
+            detail={"message": "X-Chunk-SHA256 必须是 64 位 hex 的 SHA-256 摘要"},
+        )
+    return digest
+
+
+async def _drain_chunk_body(request: Request, fd: int, offset: int,
+                            limit: int) -> tuple[str, int]:
+    """把请求体流式写入 fd 的 [offset, offset+limit) 区域，返回 (sha256, 实际字节数)。
+
+    逐块 pwrite 落盘、不读入内存；超出声明长度的字节不落盘也不计入摘要
+    （调用方据实际长度与声明长度不符拒绝请求）。
+    """
+    digest = hashlib.sha256()
+    received = 0
+    pos = offset
+    async for block in request.stream():
+        if not block:
+            continue
+        received += len(block)
+        overflow = received - limit
+        keep = block if overflow <= 0 else block[: len(block) - overflow]
+        if keep:
+            digest.update(keep)
+            os.pwrite(fd, keep, pos)
+            pos += len(keep)
+    return digest.hexdigest(), received
+
+
+def _check_chunk_length(declared_sha: str | None, computed_sha: str,
+                        received: int, expected: int) -> None:
+    """长度与逐片摘要校验：不符即拒绝（已写入的未登记字节不进索引，无害）。"""
+    if received != expected:
+        raise HTTPException(
+            status_code=400,
+            detail={"message": f"请求体长度 {received} 与 Content-Range 声明的 "
+                               f"{expected} 字节不符"},
+        )
+    if declared_sha is not None and declared_sha != computed_sha:
+        raise HTTPException(
+            status_code=422,
+            detail={"message": "分片内容与 X-Chunk-SHA256 声明的摘要不符"},
+        )
+
+
+@app.put(
+    "/api/v1/upload-sessions/{session_id}/chunks",
+    tags=["upload-sessions"],
+    summary="按 Content-Range 上传一个分片（可乱序、可幂等重传）",
+    description=(
+        "请求头 `Content-Range: bytes <start>-<end>/<total>` 声明分片区间"
+        "（`end` 为闭区间，`<total>` 必须等于会话声明的总字节数），请求体为该区间"
+        "的原始字节；可选 `X-Chunk-SHA256` 声明本分片摘要（不符即 422）。\n\n"
+        "* 分片以 **0600** 权限流式暂存并 fsync 后才登记索引，服务重启后进度不丢；\n"
+        "* **相同区间、内容一致**的重传幂等回放（200，`replayed=true`），不重复落盘；\n"
+        "* 与已登记分片**重叠冲突**、区间**越界**/总长不符、或同区间**摘要不符**一律"
+        "拒绝（409），**已有分片原样保留**；\n"
+        "* 会话完成/终止/过期后禁止继续写入（409）。"
+    ),
+    openapi_extra={
+        "requestBody": {
+            "required": True,
+            "content": {
+                "application/octet-stream": {
+                    "schema": {"type": "string", "format": "binary",
+                               "description": "Content-Range 声明区间的原始字节"}
+                }
+            },
+        }
+    },
+    responses={
+        200: {"description": "分片已登记（或幂等回放）"},
+        400: {"description": "Content-Range 格式非法或请求体长度与声明不符"},
+        404: {"description": "会话不存在"},
+        409: {"description": "区间越界/总长不符、重叠冲突、同区间摘要不符或会话已终态"},
+        422: {"description": "分片内容与 X-Chunk-SHA256 声明摘要不符"},
+    },
+)
+async def put_upload_chunk(
+    session_id: str,
+    request: Request,
+    content_range: str | None = Header(
+        default=None, alias="Content-Range",
+        description="bytes <start>-<end>/<total>（end 闭区间；total 须等于会话声明总长）",
+    ),
+    x_chunk_sha256: str | None = Header(
+        default=None, alias="X-Chunk-SHA256",
+        description="可选：本分片内容的 SHA-256（64 位 hex），不符即拒绝",
+    ),
+) -> dict[str, Any]:
+    _ensure_upload_recovery()
+    row = _lazy_expire_session(_require_upload_session(session_id))
+    if row["status"] != "uploading":
+        raise _session_not_uploading(row)
+
+    bytes_total = row["bytes_total"]
+    try:
+        start, end = upload_sessions.parse_content_range(content_range, bytes_total)
+    except upload_sessions.ContentRangeError as exc:
+        raise HTTPException(
+            status_code=409 if exc.out_of_bounds else 400,
+            detail={"message": str(exc)},
+        ) from exc
+    expected = end - start
+    declared_sha = _parse_chunk_digest_header(x_chunk_sha256)
+
+    # 同一会话的分片写入/索引登记串行化，避免索引与暂存文件竞争
+    lock = upload_sessions.session_lock(session_id)
+    with lock:
+        row = _lazy_expire_session(_require_upload_session(session_id))
+        if row["status"] != "uploading":
+            raise _session_not_uploading(row)
+
+        overlapping = get_db().find_overlapping_chunks(session_id, start, end)
+        exact = (
+            overlapping[0]
+            if len(overlapping) == 1
+            and overlapping[0]["start"] == start
+            and overlapping[0]["end"] == end
+            else None
+        )
+        if overlapping and exact is None:
+            conflicts = [
+                {"start": c["start"], "end": c["end"], "bytes": c["end"] - c["start"]}
+                for c in overlapping
+            ]
+            raise HTTPException(
+                status_code=409,
+                detail={"message": "分片区间与已登记分片重叠冲突，已有分片保持不变",
+                        "conflicting_ranges": conflicts},
+            )
+
+        if exact is not None:
+            # 同区间重传：内容一致才幂等回放；先落到临时文件比对，绝不动已登记分片
+            tmp = upload_sessions.uploads_dir() / f".tmp-{session_id}-{uuid.uuid4().hex}"
+            fd = os.open(str(tmp), os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+            try:
+                computed, received = await _drain_chunk_body(request, fd, 0, expected)
+            finally:
+                os.close(fd)
+            tmp.unlink(missing_ok=True)
+            _check_chunk_length(declared_sha, computed, received, expected)
+            if computed != exact["sha256"]:
+                raise HTTPException(
+                    status_code=409,
+                    detail={"message": "相同区间的重传内容与已登记分片摘要不符，"
+                                       "已有分片保持不变"},
+                )
+            return {"replayed": True, "session": _session_view(row)}
+
+        # 新区间：直接流式写入暂存文件对应偏移，fsync 后登记索引
+        # （恢复对账重置索引后暂存文件可能缺失，此处按 0600 惰性重建）
+        staged = upload_sessions.ensure_staged_file(session_id)
+        fd = os.open(str(staged), os.O_WRONLY)
+        try:
+            computed, received = await _drain_chunk_body(request, fd, start, expected)
+            _check_chunk_length(declared_sha, computed, received, expected)
+            os.fsync(fd)
+        finally:
+            os.close(fd)
+        try:
+            get_db().add_upload_chunk(session_id, start, end, computed)
+        except sqlite3.IntegrityError as exc:
+            # 并发登记同一区间（跨进程）：以先登记者为准，按冲突处理
+            raise HTTPException(
+                status_code=409,
+                detail={"message": "分片区间已被并发请求登记，已有分片保持不变"},
+            ) from exc
+        row = get_db().get_upload_session(session_id)
+        return {"replayed": False, "session": _session_view(row)}
+
+
+@app.post(
+    "/api/v1/upload-sessions/{session_id}/abort",
+    tags=["upload-sessions"],
+    summary="终止上传会话并清理暂存文件",
+    description="终止意图立即生效：会话置为 aborted，暂存文件与分片索引被清理，"
+                "此后任何分片写入都会被拒绝（409）。重复终止幂等回放（200）。",
+    responses={
+        404: {"description": "会话不存在"},
+        409: {"description": "会话已完成/失败/过期，无法终止"},
+    },
+)
+def abort_upload_session(session_id: str) -> dict[str, Any]:
+    _ensure_upload_recovery()
+    row = _lazy_expire_session(_require_upload_session(session_id))
+    if row["status"] == "aborted":
+        return {"aborted": True, "session": _session_view(row)}
+    if row["status"] != "uploading":
+        raise HTTPException(
+            status_code=409,
+            detail={"message": f"会话已处于终态 {row['status']}，无法终止",
+                    "status": row["status"]},
+        )
+    lock = upload_sessions.session_lock(session_id)
+    with lock:
+        row = _lazy_expire_session(_require_upload_session(session_id))
+        if row["status"] == "aborted":
+            return {"aborted": True, "session": _session_view(row)}
+        if row["status"] != "uploading":
+            raise HTTPException(
+                status_code=409,
+                detail={"message": f"会话已处于终态 {row['status']}，无法终止",
+                        "status": row["status"]},
+            )
+        upload_sessions.abort_session(get_db(), session_id, status="aborted")
+    row = get_db().get_upload_session(session_id)
+    return {"aborted": True, "session": _session_view(row)}
+
+
+def _finalize_session_replay(row, job_id: str) -> JSONResponse:
+    """完成接口的幂等回放：会话指向既有作业（不重复创建），清理暂存。"""
+    db = get_db()
+    db.update_upload_session_status(row["id"], "completed", job_id=job_id)
+    upload_sessions.cleanup_session_files(row["id"])
+    db.delete_upload_chunks(row["id"])
+    latest = db.get_upload_session(row["id"])
+    return JSONResponse(
+        status_code=200,
+        content={
+            "replayed": True,
+            "session": _session_view(latest),
+            "job": _job_dict_for_session(row["kind"], job_id),
+        },
+    )
+
+
+@app.post(
+    "/api/v1/upload-sessions/{session_id}/complete",
+    tags=["upload-sessions"],
+    summary="完成上传会话：校验完整性并转入脱敏作业",
+    description=(
+        "完成必须满足：分片恰好覆盖 `[0, bytes_total)` 全部字节，且整体 SHA-256 "
+        "与创建时声明一致；不满足返回 409（会话保持 uploading，已登记分片保留，"
+        "可补齐或修正后重试）。\n\n"
+        "校验通过后：NDJSON 转入既有流式作业，ZIP 先过原有安全检查（不通过则会话"
+        "置 failed、清理暂存并返回 422 及全部原因）再转入诊断包作业；策略、令牌"
+        "关联域与 Idempotency-Key 全部沿用创建时的声明（同键已有一致作业时回放"
+        "该作业，不同则 409）。完成后会话禁止继续写入，重复完成幂等回放（200）。"
+    ),
+    responses={
+        200: {"description": "幂等命中：会话已完成或同键作业已存在"},
+        201: {"description": "已转入脱敏作业（流式/诊断包）"},
+        404: {"description": "会话不存在"},
+        409: {"description": "未覆盖全部字节、整体摘要不符、幂等冲突或会话已终态"},
+        422: {"description": "ZIP 未通过安全校验（会话置 failed 并清理暂存）"},
+    },
+)
+def complete_upload_session(session_id: str) -> JSONResponse:
+    _ensure_upload_recovery()
+    row = _lazy_expire_session(_require_upload_session(session_id))
+    if row["status"] == "completed" and row["job_id"]:
+        return JSONResponse(
+            status_code=200,
+            content={
+                "replayed": True,
+                "session": _session_view(row),
+                "job": _job_dict_for_session(row["kind"], row["job_id"]),
+            },
+        )
+    if row["status"] != "uploading":
+        raise HTTPException(
+            status_code=409,
+            detail={"message": f"会话状态为 {row['status']}，无法完成",
+                    "status": row["status"]},
+        )
+
+    lock = upload_sessions.session_lock(session_id)
+    with lock:
+        row = _lazy_expire_session(_require_upload_session(session_id))
+        if row["status"] == "completed" and row["job_id"]:
+            return JSONResponse(
+                status_code=200,
+                content={
+                    "replayed": True,
+                    "session": _session_view(row),
+                    "job": _job_dict_for_session(row["kind"], row["job_id"]),
+                },
+            )
+        if row["status"] != "uploading":
+            raise HTTPException(
+                status_code=409,
+                detail={"message": f"会话状态为 {row['status']}，无法完成",
+                        "status": row["status"]},
+            )
+
+        db = get_db()
+        bytes_total = row["bytes_total"]
+        chunks = db.upload_chunks(session_id)
+        merged = upload_sessions.merge_ranges(
+            [(c["start"], c["end"]) for c in chunks]
+        )
+        if not upload_sessions.ranges_fully_cover(merged, bytes_total):
+            gaps = upload_sessions.missing_ranges(bytes_total, merged)
+            raise HTTPException(
+                status_code=409,
+                detail={
+                    "message": "尚未覆盖全部字节，无法完成",
+                    "missing_ranges": [
+                        {"start": s, "end": e, "bytes": e - s} for s, e in gaps
+                    ],
+                },
+            )
+
+        staged = upload_sessions.staged_path(session_id)
+        if not staged.is_file() or staged.stat().st_size != bytes_total:
+            raise HTTPException(
+                status_code=409,
+                detail={"message": "暂存文件缺失或大小与声明不符，无法完成"},
+            )
+        actual_sha, _size = receipts.sha256_file(staged)
+        if actual_sha != row["content_sha256"]:
+            raise HTTPException(
+                status_code=409,
+                detail={"message": "整体 SHA-256 与创建时声明不符；已登记分片保留，"
+                                   "请核对后终止会话重新上传"},
+            )
+
+        # ZIP 先过原有安全检查；不通过则会话置 failed 并清理暂存
+        entries = None
+        if row["kind"] == "zip":
+            try:
+                entries = validate_bundle(staged)
+            except BundleRejection as exc:
+                upload_sessions.abort_session(
+                    db, session_id, status="failed",
+                    error_message="压缩包未通过安全校验：" + "；".join(exc.reasons),
+                )
+                raise HTTPException(
+                    status_code=422,
+                    detail={"message": "压缩包未通过安全校验", "reasons": exc.reasons},
+                ) from exc
+
+        key = row["idempotency_key"]
+        if key:
+            existing = (db.get_stream_idempotent(key) if row["kind"] == "ndjson"
+                        else db.get_bundle_idempotent(key))
+            if existing is not None:
+                # 同键作业已存在：三元组一致则复用该作业（不重复创建），否则 409
+                _check_idempotency_triplet(
+                    existing, content_sha=row["content_sha256"],
+                    strategy_sha=row["strategy_sha256"],
+                    domain_id=row["domain_id"],
+                )
+                return _finalize_session_replay(row, existing["id"])
+
+        # 转入对应作业：硬链接（零拷贝）安置原始文件，落库成功后启动 worker
+        job_id = uuid.uuid4().hex
+        if row["kind"] == "ndjson":
+            raw = raw_path(job_id)
+        else:
+            raw = bundle_raw_path(job_id)
+        upload_sessions.link_or_copy_staged(staged, raw)
+        try:
+            if row["kind"] == "ndjson":
+                db.create_stream_job(
+                    job_id=job_id,
+                    idempotency_key=key,
+                    strategy_json=row["strategy_json"],
+                    strategy_sha256=row["strategy_sha256"],
+                    source_filename=row["source_filename"],
+                    content_sha256=row["content_sha256"],
+                    bytes_total=bytes_total,
+                    key_fingerprint=row["key_fingerprint"],
+                    domain_id=row["domain_id"],
+                )
+            else:
+                db.create_bundle_job(
+                    job_id=job_id,
+                    idempotency_key=key,
+                    strategy_json=row["strategy_json"],
+                    strategy_sha256=row["strategy_sha256"],
+                    source_filename=row["source_filename"],
+                    content_sha256=row["content_sha256"],
+                    bytes_total=bytes_total,
+                    files_total=len(entries or []),
+                    key_fingerprint=row["key_fingerprint"],
+                    domain_id=row["domain_id"],
+                )
+        except sqlite3.IntegrityError:
+            # 并发同键：以先落库的作业为准；暂存文件仍在（硬链接只删新链接）
+            raw.unlink(missing_ok=True)
+            winner = (
+                (db.get_stream_idempotent(key) if row["kind"] == "ndjson"
+                 else db.get_bundle_idempotent(key)) if key else None
+            )
+            if winner is not None:
+                _check_idempotency_triplet(
+                    winner, content_sha=row["content_sha256"],
+                    strategy_sha=row["strategy_sha256"],
+                    domain_id=row["domain_id"],
+                )
+                return _finalize_session_replay(row, winner["id"])
+            raise
+
+        # 会话置 completed 并清理暂存与分片索引，然后启动后台作业
+        db.update_upload_session_status(session_id, "completed", job_id=job_id)
+        upload_sessions.cleanup_session_files(session_id)
+        db.delete_upload_chunks(session_id)
+        if row["kind"] == "ndjson":
+            stream_registry.start(
+                job_id, lambda: run_stream_job(job_id, get_db, get_master_key)
+            )
+        else:
+            bundle_registry.start(
+                job_id, lambda: run_bundle_job(job_id, get_db, get_master_key)
+            )
+        latest = db.get_upload_session(session_id)
+        return JSONResponse(
+            status_code=201,
+            content={
+                "replayed": False,
+                "session": _session_view(latest),
+                "job": _job_dict_for_session(row["kind"], job_id),
+            },
+        )
 
 
 # ---------- 脱敏结果完整性凭证 ----------

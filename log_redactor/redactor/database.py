@@ -280,6 +280,39 @@ CREATE TABLE IF NOT EXISTS retention_audit (
 );
 CREATE INDEX IF NOT EXISTS idx_retention_audit_ts ON retention_audit(ts, id);
 CREATE INDEX IF NOT EXISTS idx_retention_audit_plan ON retention_audit(plan_id);
+
+-- 断点续传上传会话：声明式创建、Content-Range 乱序分片、完成后转入作业
+CREATE TABLE IF NOT EXISTS upload_sessions (
+    id TEXT PRIMARY KEY,
+    idempotency_key TEXT UNIQUE,
+    created_at TEXT NOT NULL,
+    updated_at TEXT,
+    -- uploading=接收分片；completed=已转入作业；aborted=已终止；
+    -- expired=已过期；failed=完成校验失败（如 ZIP 安全校验）
+    status TEXT NOT NULL,
+    kind TEXT NOT NULL,
+    source_filename TEXT NOT NULL,
+    bytes_total INTEGER NOT NULL,
+    content_sha256 TEXT NOT NULL,
+    strategy_json TEXT NOT NULL,
+    strategy_sha256 TEXT NOT NULL,
+    domain_id TEXT,
+    key_fingerprint TEXT NOT NULL,
+    expires_at TEXT NOT NULL,
+    job_id TEXT,
+    error_message TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_upload_sessions_status ON upload_sessions(status);
+-- 分片索引：已接收区间（end 开区间）与逐片 SHA-256；重启后据此恢复进度
+CREATE TABLE IF NOT EXISTS upload_chunks (
+    session_id TEXT NOT NULL,
+    start INTEGER NOT NULL,
+    end INTEGER NOT NULL,
+    sha256 TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    PRIMARY KEY (session_id, start, end)
+);
+CREATE INDEX IF NOT EXISTS idx_upload_chunks_session ON upload_chunks(session_id);
 """
 
 
@@ -1709,4 +1742,154 @@ class Database:
                 "UPDATE retention_locks SET released_at=?, release_reason='expired' "
                 "WHERE job_kind=? AND job_id=? AND released_at=''",
                 (utcnow_iso(), job_kind, job_id),
+            )
+
+    # ---------- 断点续传上传会话 ----------
+
+    def create_upload_session(
+        self,
+        *,
+        session_id: str,
+        idempotency_key: str | None,
+        kind: str,
+        source_filename: str,
+        bytes_total: int,
+        content_sha256: str,
+        strategy_json: str,
+        strategy_sha256: str,
+        domain_id: str | None,
+        key_fingerprint: str,
+        expires_at: str,
+    ) -> sqlite3.Row:
+        now = utcnow_iso()
+        with self._lock, self._conn() as conn:
+            conn.execute(
+                """INSERT INTO upload_sessions
+                   (id, idempotency_key, created_at, updated_at, status, kind,
+                    source_filename, bytes_total, content_sha256, strategy_json,
+                    strategy_sha256, domain_id, key_fingerprint, expires_at)
+                   VALUES (?,?,?,?, 'uploading', ?,?,?,?,?,?,?,?,?)""",
+                (
+                    session_id, idempotency_key, now, now, kind, source_filename,
+                    bytes_total, content_sha256, strategy_json, strategy_sha256,
+                    domain_id, key_fingerprint, expires_at,
+                ),
+            )
+            return conn.execute(
+                "SELECT * FROM upload_sessions WHERE id=?", (session_id,)
+            ).fetchone()
+
+    def get_upload_session(self, session_id: str) -> sqlite3.Row | None:
+        with self._conn() as conn:
+            return conn.execute(
+                "SELECT * FROM upload_sessions WHERE id=?", (session_id,)
+            ).fetchone()
+
+    def get_upload_session_by_idempotency(self, key: str) -> sqlite3.Row | None:
+        with self._conn() as conn:
+            return conn.execute(
+                "SELECT * FROM upload_sessions WHERE idempotency_key=?", (key,)
+            ).fetchone()
+
+    def update_upload_session_status(
+        self,
+        session_id: str,
+        status: str,
+        *,
+        job_id: str | None = None,
+        error_message: str | None = None,
+    ) -> sqlite3.Row | None:
+        with self._lock, self._conn() as conn:
+            conn.execute(
+                """UPDATE upload_sessions SET status=?, updated_at=?,
+                   job_id=COALESCE(?, job_id), error_message=? WHERE id=?""",
+                (status, utcnow_iso(), job_id, error_message, session_id),
+            )
+            return conn.execute(
+                "SELECT * FROM upload_sessions WHERE id=?", (session_id,)
+            ).fetchone()
+
+    def touch_upload_session(self, session_id: str) -> None:
+        with self._lock, self._conn() as conn:
+            conn.execute(
+                "UPDATE upload_sessions SET updated_at=? WHERE id=?",
+                (utcnow_iso(), session_id),
+            )
+
+    def expire_due_upload_sessions(self, now_iso: str | None = None) -> list[str]:
+        """把已过期的 uploading 会话置为 expired，返回本次置期的会话 id。"""
+        stamp = now_iso or utcnow_iso()
+        with self._lock, self._conn() as conn:
+            rows = conn.execute(
+                "SELECT id FROM upload_sessions WHERE status='uploading' "
+                "AND expires_at<=?",
+                (stamp,),
+            ).fetchall()
+            ids = [r["id"] for r in rows]
+            if ids:
+                conn.execute(
+                    "UPDATE upload_sessions SET status='expired', updated_at=? "
+                    "WHERE status='uploading' AND expires_at<=?",
+                    (stamp, stamp),
+                )
+        return ids
+
+    def resumable_upload_sessions(self) -> list[sqlite3.Row]:
+        """重启后需要核对暂存状态的会话（仍在接收分片的）。"""
+        with self._conn() as conn:
+            return conn.execute(
+                "SELECT * FROM upload_sessions WHERE status='uploading' "
+                "ORDER BY created_at ASC"
+            ).fetchall()
+
+    # ---------- 上传分片索引 ----------
+
+    def add_upload_chunk(
+        self, session_id: str, start: int, end: int, sha256: str
+    ) -> None:
+        """登记一个已落盘分片（end 为开区间）；重复区间由唯一约束拦截。"""
+        with self._lock, self._conn() as conn:
+            conn.execute(
+                """INSERT INTO upload_chunks (session_id, start, end, sha256,
+                   created_at) VALUES (?,?,?,?,?)""",
+                (session_id, start, end, sha256, utcnow_iso()),
+            )
+            conn.execute(
+                "UPDATE upload_sessions SET updated_at=? WHERE id=?",
+                (utcnow_iso(), session_id),
+            )
+
+    def upload_chunks(self, session_id: str) -> list[sqlite3.Row]:
+        with self._conn() as conn:
+            return conn.execute(
+                "SELECT * FROM upload_chunks WHERE session_id=? ORDER BY start ASC",
+                (session_id,),
+            ).fetchall()
+
+    def find_overlapping_chunks(
+        self, session_id: str, start: int, end: int
+    ) -> list[sqlite3.Row]:
+        """与 [start, end) 相交（含相邻边界不算相交）的已登记分片。"""
+        with self._conn() as conn:
+            return conn.execute(
+                "SELECT * FROM upload_chunks WHERE session_id=? "
+                "AND start < ? AND end > ? ORDER BY start ASC",
+                (session_id, end, start),
+            ).fetchall()
+
+    def upload_chunk_stats(self, session_id: str) -> tuple[int, int]:
+        """返回 (已覆盖字节数, 最大已登记终点)；无分片时为 (0, 0)。"""
+        with self._conn() as conn:
+            row = conn.execute(
+                "SELECT COALESCE(SUM(end - start), 0) AS covered, "
+                "COALESCE(MAX(end), 0) AS max_end FROM upload_chunks "
+                "WHERE session_id=?",
+                (session_id,),
+            ).fetchone()
+        return int(row["covered"]), int(row["max_end"])
+
+    def delete_upload_chunks(self, session_id: str) -> None:
+        with self._lock, self._conn() as conn:
+            conn.execute(
+                "DELETE FROM upload_chunks WHERE session_id=?", (session_id,)
             )

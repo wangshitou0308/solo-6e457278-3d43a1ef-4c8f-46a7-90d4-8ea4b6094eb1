@@ -629,6 +629,117 @@ class BundleJobList(BaseModel):
     total: int
 
 
+# ---------- 断点续传上传会话 ----------
+
+UploadKind = Literal["ndjson", "zip"]
+UploadSessionStatus = Literal["uploading", "completed", "aborted", "expired", "failed"]
+
+_SHA256_HEX = re.compile(r"^[0-9a-f]{64}$")
+
+
+class CreateUploadSessionRequest(BaseModel):
+    """创建断点续传上传会话：声明文件类型、总字节数、整体 SHA-256、策略与关联域。
+
+    创建后客户端用 ``Content-Range`` 乱序提交分片，全部字节覆盖且整体摘要
+    校验通过后才能完成并转入对应的脱敏作业。
+    """
+
+    kind: UploadKind = Field(
+        description="文件类型：ndjson=NDJSON 日志（转入流式作业）；zip=ZIP 诊断包"
+                    "（完成时经安全校验后转入诊断包作业）",
+    )
+    bytes_total: int = Field(
+        ge=1, description="文件总字节数；分片 Content-Range 的总长必须与此一致",
+    )
+    content_sha256: str = Field(
+        description="整个文件的 SHA-256（64 位小写 hex）；完成时逐字节校验",
+    )
+    strategy: Strategy = Field(description="脱敏策略（与小批量接口同一结构）")
+    source_filename: str | None = Field(
+        default=None,
+        max_length=256,
+        description="原始文件名（仅展示用）；缺省按类型取 upload.ndjson / bundle.zip",
+    )
+    token_context: str | None = Field(
+        default=None,
+        max_length=MAX_TOKEN_CONTEXT,
+        description=(
+            "令牌关联域上下文（最长 128 字符）。只持久化不可逆域标识（域指纹），"
+            "不保存本字段原文；完成会话转入作业时沿用该关联域。"
+            "未传（或纯空白）时沿用全局映射。"
+        ),
+    )
+    expires_in_seconds: int | None = Field(
+        default=None,
+        ge=60,
+        le=7 * 24 * 3600,
+        description="会话有效期（秒），默认 86400（24 小时），最长 7 天；"
+                    "过期会话的暂存文件被清理且不再接受分片",
+    )
+
+    @field_validator("content_sha256")
+    @classmethod
+    def _check_sha256(cls, v: str) -> str:
+        if not _SHA256_HEX.match(v):
+            raise ValueError("content_sha256 必须是 64 位小写 hex 的 SHA-256 摘要")
+        return v
+
+    @field_validator("token_context")
+    @classmethod
+    def _normalize_token_context(cls, v: str | None) -> str | None:
+        if v is None:
+            return None
+        v = v.strip()
+        return v or None
+
+
+class ByteRange(BaseModel):
+    """一段字节区间（``end`` 为开区间）。"""
+
+    start: int = Field(ge=0, description="区间起点（含）")
+    end: int = Field(ge=0, description="区间终点（不含）")
+    bytes: int = Field(ge=0, description="区间长度（end - start）")
+
+
+class UploadSessionModel(BaseModel):
+    """断点续传上传会话的状态与进度（不含任何文件内容）。"""
+
+    id: str
+    idempotency_key: str | None = None
+    created_at: str
+    updated_at: str | None = None
+    status: UploadSessionStatus = Field(
+        description="uploading=接收分片中；completed=已完成并转入作业（禁止再写）；"
+                    "aborted=已终止；expired=已过期；failed=完成校验失败（如 ZIP 安全校验）",
+    )
+    kind: UploadKind
+    source_filename: str
+    bytes_total: int = Field(description="创建时声明的文件总字节数")
+    bytes_received: int = Field(description="已索引分片覆盖的字节数（去重后）")
+    content_sha256: str = Field(description="创建时声明的整体 SHA-256")
+    strategy_name: str
+    strategy_version: str
+    strategy_sha256: str = Field(description="规范化策略 SHA-256，参与幂等一致性判定")
+    key_fingerprint: str
+    domain_fingerprint: str = Field(
+        default="global",
+        description="令牌关联域指纹：global=全局映射；dom:<hex>=隔离域",
+    )
+    expires_at: str = Field(description="会话过期时间（UTC ISO 8601）")
+    received_ranges: list[ByteRange] = Field(
+        default_factory=list, description="已接收并索引的字节区间（合并相邻后）",
+    )
+    missing_ranges: list[ByteRange] = Field(
+        default_factory=list, description="仍缺失的字节区间（完成前必须补齐）",
+    )
+    progress_pct: float = 0.0
+    job_id: str | None = Field(
+        default=None, description="完成会话后转入的流式/诊断包作业 id",
+    )
+    job_url: str | None = Field(default=None, description="转入作业的查询地址")
+    error_message: str | None = None
+
+
 # ---------- 脱敏结果完整性凭证 ----------
 
 ReceiptVerdict = Literal[
