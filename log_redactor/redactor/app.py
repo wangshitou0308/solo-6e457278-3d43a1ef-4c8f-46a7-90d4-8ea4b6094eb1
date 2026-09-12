@@ -39,6 +39,7 @@ import hashlib
 import json
 import os
 import sqlite3
+import threading
 import uuid
 from pathlib import Path
 from typing import Any, Callable
@@ -69,20 +70,32 @@ from .crypto import (
 from .crypto import resolve_token_domain
 from .database import Database
 from .engine import run_strategy
+from .parsing import ParsedBatch, PayloadError, parse_batch_indexed
+from . import retention
 from .models import (
     BatchPayload,
+    CleanupExecuteRequest,
+    CleanupPlanList,
+    CleanupPlanModel,
+    CleanupPreviewRequest,
+    CleanupPreviewResponse,
     CreateJobRequest,
+    CreateRetentionLockRequest,
     DryRunRequest,
     JobDetail,
     JobList,
     JobModel,
     ReceiptVerifyResponse,
+    RetentionAuditPage,
+    RetentionLockList,
+    RetentionLockModel,
+    RetentionPolicyResponse,
     RunResult,
     Strategy,
     StrategyDiffRequest,
     StrategyDiffResponse,
+    UpsertRetentionRuleRequest,
 )
-from .parsing import ParsedBatch, PayloadError, parse_batch_indexed
 from .samples import sample_ndjson, sample_strategy_dict
 from .strategy_diff import run_strategy_diff
 from .stream_jobs import (
@@ -102,7 +115,7 @@ UPLOAD_CHUNK = 1024 * 1024  # 1 MiB：multipart 流式落盘的拷贝块大小
 
 app = FastAPI(
     title="本地日志脱敏 API",
-    version="1.5.0",
+    version="1.6.0",
     description=(
         "供后端团队提交故障样本前使用的本地日志脱敏服务。支持按字段路径/键名/正则/内置识别器"
         "（邮箱、手机号、IP、访问令牌、身份证、银行卡）命中，动作包括删除、掩码与基于本地"
@@ -146,7 +159,17 @@ app = FastAPI(
         "凭证由主密钥派生的凭证子密钥按固定字段顺序计算 HMAC-SHA256 标签。三类作业均提供"
         "凭证查询、下载与校验接口；校验重算标签与现有结果摘要，区分凭证被改动、结果缺失、"
         "内容不符、密钥不匹配与格式不支持，**不重新脱敏、不返回文件内容**。取消/失败的"
-        "异步作业不生成凭证；幂等回放指向同一凭证；重启后仍可校验已发布结果。"
+        "异步作业不生成凭证；幂等回放指向同一凭证；重启后仍可校验已发布结果。\n\n"
+        "## 本地数据保留与安全清理（retention）\n"
+        "统一管理三类作业（小批量 `batch`、流式 NDJSON `stream`、诊断包 `bundle`）的"
+        "记录、结果文件与完整性凭证的保留期限：可按**作业类型 × 终态 × 是否需复核**"
+        "配置保留天数（含永久保留），内置默认策略可覆盖或删除自定义覆盖后回退；可为指定"
+        "作业设置带原因与到期时间的**保留锁**。清理预览只返回待删作业、文件类别与预计"
+        "释放空间，**不读取、不返回任何日志或审计内容**。执行清理必须回传预览摘要与"
+        "目标指纹：目标发生变化（新增/删除文件、锁、期限等）一律拒绝（409）；保留锁"
+        "未到期、运行中作业与复核期限未满的结果不得删除。执行先持久化清理计划，再仅在"
+        "限定数据目录内删除文件并随后删除关联数据库记录；文件缺失按已删处理（幂等），"
+        "符号链接与越界路径拒绝跟随并记录，部分失败可重试，**服务重启后自动继续**。"
     ),
     contact={"name": "platform-security"},
 )
@@ -172,11 +195,12 @@ def get_master_key() -> MasterKey:
 
 @asynccontextmanager
 async def lifespan(_app: FastAPI):
-    # 服务启动：确保目录就位，并从安全检查点恢复未完成的流式/诊断包作业
+    # 服务启动：确保目录就位，并从安全检查点恢复未完成的流式/诊断包/清理作业
     ensure_stream_dirs()
     ensure_bundle_dirs()
     recover_stream_jobs(get_db, get_master_key)
     recover_bundle_jobs(get_db, get_master_key)
+    retention.recover_cleanup_plans(get_db)
     yield
 
 
@@ -1371,6 +1395,407 @@ def verify_bundle_job_receipt(
         output_path=bundle_final_output_path(job_id),
     )
     return ReceiptVerifyResponse(**verdict)
+
+
+# ---------- 本地数据保留与安全清理 ----------
+
+
+def _parse_cleanup_now(now: Any) -> object | None:
+    """预览/执行请求中的 now 统一规范化为感知 UTC datetime。"""
+    return retention._now(now)  # noqa: SLF001 - 同包时间规范化
+
+
+def _preview_dict_to_response(preview: dict[str, Any]) -> CleanupPreviewResponse:
+    return CleanupPreviewResponse(**{k: v for k, v in preview.items()
+                                     if k != "job_kinds"})
+
+
+def _start_cleanup_plan(plan_id: str) -> None:
+    """后台执行已持久化的清理计划；同步快速完成也在同一线程串行删除。"""
+    def _run() -> None:
+        try:
+            retention.run_cleanup_plan(plan_id, get_db)
+        except Exception:
+            # 计划保持 running/pending，重启或重试时继续
+            pass
+
+    thread = threading.Thread(target=_run, name=f"cleanup-plan-{plan_id}", daemon=True)
+    thread.start()
+
+
+@app.get(
+    "/api/v1/retention/policy",
+    tags=["retention"],
+    summary="查询保留策略（内置默认规则 + 自定义覆盖）",
+)
+def get_retention_policy() -> RetentionPolicyResponse:
+    return RetentionPolicyResponse(rules=retention.get_policy(get_db()))
+
+
+@app.put(
+    "/api/v1/retention/rules",
+    tags=["retention"],
+    summary="设置保留期限规则（按作业类型×终态×复核状态，幂等 upsert）",
+    description="重复提交同一规则键即覆盖；`retention_days=null` 表示永久保留。"
+                "内置默认规则被覆盖后可通过 DELETE 回退。",
+)
+def put_retention_rule(
+    req: UpsertRetentionRuleRequest,
+    idempotency_key: str | None = Header(default=None, alias="Idempotency-Key"),
+) -> dict[str, Any]:
+    _ = idempotency_key  # upsert 本身幂等；保留头以统一调用约定
+    get_db().upsert_retention_rule(
+        job_kind=req.job_kind, terminal_status=req.terminal_status,
+        needs_review=req.needs_review, retention_days=req.retention_days,
+    )
+    get_db().add_retention_audit(
+        "policy.rule.set",
+        job_kind=req.job_kind,
+        detail={"terminal_status": req.terminal_status,
+                "needs_review": req.needs_review,
+                "retention_days": req.retention_days},
+    )
+    return {"updated": True, "rules": [r.model_dump() for r in retention.get_policy(get_db())]}
+
+
+@app.delete(
+    "/api/v1/retention/rules/{job_kind}/{terminal_status}/{needs_review}",
+    tags=["retention"],
+    summary="删除自定义保留规则（回退到内置默认）",
+    responses={
+        404: {"description": "规则不存在，或该键为内置默认规则（无自定义覆盖可删）"},
+    },
+)
+def delete_retention_rule(job_kind: str, terminal_status: str, needs_review: str):
+    if (job_kind not in retention.JOB_KINDS
+            or terminal_status not in retention.TERMINAL_STATUSES
+            or needs_review not in ("true", "false", "any")):
+        raise HTTPException(status_code=400, detail="非法规则键")
+    deleted = get_db().delete_retention_rule(
+        job_kind=job_kind, terminal_status=terminal_status, needs_review=needs_review
+    )
+    if not deleted:
+        raise HTTPException(
+            status_code=404,
+            detail="自定义规则不存在（内置默认规则不可删除，可覆盖为永久保留）",
+        )
+    get_db().add_retention_audit(
+        "policy.rule.deleted", job_kind=job_kind,
+        detail={"terminal_status": terminal_status, "needs_review": needs_review},
+    )
+    return {"deleted": True, "rules": [r.model_dump() for r in retention.get_policy(get_db())]}
+
+
+@app.put(
+    "/api/v1/retention/locks",
+    tags=["retention"],
+    summary="为指定作业设置保留锁（带原因与到期时间）",
+    description="同一作业已有生效中的锁返回 409（带原因/到期不同也算冲突）；"
+                "原锁已到期则自动失效后建立新锁。",
+    responses={
+        200: {"description": "保留锁已建立（幂等重放时返回同一把锁）"},
+        404: {"description": "目标作业不存在"},
+        409: {"description": "该作业已有生效中的保留锁"},
+        422: {"description": "到期时间非法（过期/无法解析）"},
+    },
+)
+def put_retention_lock(
+    req: CreateRetentionLockRequest,
+    idempotency_key: str | None = Header(default=None, alias="Idempotency-Key"),
+) -> dict[str, Any]:
+    _ = idempotency_key
+    db = get_db()
+    if not retention.job_exists(db, req.job_kind, req.job_id):
+        raise HTTPException(status_code=404,
+                            detail=f"作业不存在: {req.job_kind}/{req.job_id}")
+    current = retention._now()  # noqa: SLF001
+    existing = db.active_retention_lock(req.job_kind, req.job_id)
+    if existing is not None:
+        exp = retention.parse_iso(existing["expires_at"])
+        if exp is not None and exp > current:
+            # 完全相同的请求幂等回放；原因或到期不同则冲突
+            if (existing["reason"] == req.reason
+                    and retention._expires_key(exp) == retention._expires_key(req.expires_at)):  # noqa: SLF001
+                return {"replayed": True,
+                        "lock": retention.lock_row_to_model(existing, current).model_dump(mode="json")}
+            raise HTTPException(
+                status_code=409,
+                detail={"message": "该作业已有生效中的保留锁",
+                        "lock": retention.lock_row_to_model(existing, current).model_dump(mode="json")},
+            )
+    try:
+        lock = retention.create_lock(
+            db, job_kind=req.job_kind, job_id=req.job_id, reason=req.reason,
+            expires_at=req.expires_at, now=current,
+        )
+    except retention.LockConflictError as exc:
+        raise HTTPException(status_code=409, detail={"message": str(exc), **exc.identity}) from exc
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail={"message": str(exc)}) from exc
+    return {"replayed": False, "lock": lock.model_dump(mode="json")}
+
+
+@app.delete(
+    "/api/v1/retention/locks/{job_kind}/{job_id}",
+    tags=["retention"],
+    summary="提前释放保留锁",
+    responses={404: {"description": "没有生效中的锁"}},
+)
+def release_retention_lock(job_kind: str, job_id: str) -> dict[str, Any]:
+    if job_kind not in retention.JOB_KINDS:
+        raise HTTPException(status_code=400, detail="非法作业类型")
+    row = get_db().release_retention_lock(job_kind, job_id)
+    if row is None:
+        raise HTTPException(status_code=404, detail="没有生效中的保留锁")
+    get_db().add_retention_audit(
+        "lock.released", job_kind=job_kind, job_id=job_id,
+        detail={"reason": "manual_release"},
+    )
+    current = retention._now()  # noqa: SLF001
+    return {"released": True,
+            "lock": retention.lock_row_to_model(row, current).model_dump(mode="json")}
+
+
+@app.get(
+    "/api/v1/retention/locks",
+    tags=["retention"],
+    summary="查询保留锁（可按状态/作业类型过滤、分页）",
+)
+def list_retention_locks(
+    state: str | None = Query(default=None, description="active/expired/released"),
+    job_kind: str | None = Query(default=None, description="batch/stream/bundle"),
+    limit: int = Query(default=50, ge=1, le=200),
+    offset: int = Query(default=0, ge=0),
+) -> RetentionLockList:
+    if state is not None and state not in ("active", "expired", "released"):
+        raise HTTPException(status_code=400, detail="非法 state 过滤值")
+    if job_kind is not None and job_kind not in retention.JOB_KINDS:
+        raise HTTPException(status_code=400, detail="非法 job_kind 过滤值")
+    rows, total = get_db().list_retention_locks(
+        state=state, job_kind=job_kind, limit=limit, offset=offset
+    )
+    current = retention._now()  # noqa: SLF001
+    return RetentionLockList(
+        total=total,
+        items=[retention.lock_row_to_model(r, current) for r in rows],
+    )
+
+
+@app.post(
+    "/api/v1/retention/cleanup/preview",
+    tags=["retention"],
+    summary="清理预览：待删作业、文件类别与预计释放空间",
+    description=(
+        "只读取作业元数据与文件 stat（类别/相对路径/大小），**绝不打开或返回"
+        "任何日志、结果或审计内容**。排除：运行中（queued/running）作业、"
+        "保留锁未到期、期限未满与命中永久保留规则的作业（计数见 `blocked`）。"
+        "相同数据状态下重复预览幂等（`target_fingerprint` 相同）。"
+    ),
+    response_model=CleanupPreviewResponse,
+)
+def post_cleanup_preview(req: CleanupPreviewRequest) -> CleanupPreviewResponse:
+    if req.job_kinds is not None:
+        bad = [k for k in req.job_kinds if k not in retention.JOB_KINDS]
+        if bad:
+            raise HTTPException(status_code=400, detail=f"非法作业类型: {bad}")
+    preview = retention.build_preview(
+        get_db(),
+        job_kinds=tuple(req.job_kinds) if req.job_kinds else None,
+        now=req.now,
+    )
+    return _preview_dict_to_response(preview)
+
+
+@app.post(
+    "/api/v1/retention/cleanup/execute",
+    tags=["retention"],
+    summary="执行清理（须提交预览摘要；目标变化时拒绝，幂等）",
+    description=(
+        "请求体必须原样回传预览摘要（preview_id、target_fingerprint、各计数、"
+        "job_kinds）。服务以相同参数**重新计算目标**：指纹或任一计数不一致即"
+        "**409 拒绝**（目标发生变化，请重新预览后提交）。空预览返回 400。\n\n"
+        "执行先**持久化清理计划**（plan + 逐项），再后台串行删除；同幂等键或"
+        "同目标指纹的重复提交回放既有计划。文件缺失按已删处理（幂等），符号链接"
+        "/越界路径拒绝跟随并记录，部分失败可重试，服务重启后自动继续。"
+    ),
+    status_code=202,
+    responses={
+        200: {"description": "幂等命中，回放既有清理计划"},
+        202: {"description": "计划已持久化并开始执行"},
+        400: {"description": "预览摘要不完整或没有任何待删作业"},
+        409: {"description": "目标已变化（指纹/计数与当前预览不一致）"},
+    },
+)
+def post_cleanup_execute(
+    req: CleanupExecuteRequest,
+    idempotency_key: str | None = Header(default=None, alias="Idempotency-Key"),
+) -> JSONResponse:
+    if idempotency_key is not None:
+        idempotency_key = idempotency_key.strip()
+        if len(idempotency_key) > 128:
+            raise HTTPException(status_code=400, detail="Idempotency-Key 最长 128 字符")
+    if req.preview_id != req.target_fingerprint:
+        raise HTTPException(status_code=400, detail="preview_id 与 target_fingerprint 不一致")
+    kinds = tuple(req.job_kinds) if req.job_kinds else None
+    if kinds is not None:
+        bad = [k for k in kinds if k not in retention.JOB_KINDS]
+        if bad:
+            raise HTTPException(status_code=400, detail=f"非法作业类型: {list(bad)}")
+
+    # 幂等键一旦创建过计划就永久标识该计划：带键重复提交（无论目标当前是否
+    # 已被本计划清空）恒回放，这是“重复请求保持幂等”的最强保证。
+    if idempotency_key:
+        existing = get_db().get_cleanup_plan_by_idempotency(idempotency_key)
+        if existing is not None:
+            plan = retention._plan_model(get_db(), existing)  # noqa: SLF001
+            return JSONResponse(
+                status_code=200,
+                content={"replayed": True, "plan": plan.model_dump(mode="json")},
+            )
+
+    current = retention.build_preview(get_db(), job_kinds=kinds, now=req.now)
+
+    # 首次执行：目标发生变化（文件增减、加锁、期限调整等）一律拒绝，要求重新预览
+    if current["target_fingerprint"] != req.target_fingerprint:
+        raise HTTPException(
+            status_code=409,
+            detail={"message": "清理目标自预览后已发生变化，请重新预览后提交",
+                    "current_fingerprint": current["target_fingerprint"],
+                    "submitted_fingerprint": req.target_fingerprint},
+        )
+    if (current["job_count"] != req.job_count
+            or current["file_count"] != req.file_count
+            or current["bytes_total"] != req.bytes_total):
+        raise HTTPException(
+            status_code=409,
+            detail={"message": "预览摘要计数与当前目标不一致，请重新预览后提交",
+                    "current": {"job_count": current["job_count"],
+                                "file_count": current["file_count"],
+                                "bytes_total": current["bytes_total"]}},
+        )
+    if current["job_count"] == 0:
+        raise HTTPException(status_code=400, detail="没有任何待删作业；无需执行清理")
+
+    # 无幂等键时：目标未变化且同指纹计划已存在（执行中/已完成）即回放
+    existing = get_db().find_cleanup_plan_by_fingerprint(req.target_fingerprint)
+    if existing is not None:
+        plan = retention._plan_model(get_db(), existing)  # noqa: SLF001
+        return JSONResponse(
+            status_code=200,
+            content={"replayed": True, "plan": plan.model_dump(mode="json")},
+        )
+
+    plan_id, _replayed = retention.persist_plan(
+        get_db(), preview=current, idempotency_key=idempotency_key
+    )
+    _start_cleanup_plan(plan_id)
+    plan = retention.get_plan(get_db(), plan_id)
+    return JSONResponse(
+        status_code=202,
+        content={"replayed": False, "plan": plan.model_dump(mode="json")},
+    )
+
+
+def _require_plan(plan_id: str) -> CleanupPlanModel:
+    plan = retention.get_plan(get_db(), plan_id)
+    if plan is None:
+        raise HTTPException(status_code=404, detail=f"清理计划不存在: {plan_id}")
+    return plan
+
+
+@app.get(
+    "/api/v1/retention/cleanup/plans",
+    tags=["retention"],
+    summary="清理计划列表（可按状态过滤、分页）",
+)
+def list_cleanup_plans(
+    status: str | None = Query(
+        default=None, description="pending/running/succeeded/partial/failed"),
+    limit: int = Query(default=50, ge=1, le=200),
+    offset: int = Query(default=0, ge=0),
+) -> CleanupPlanList:
+    if status is not None and status not in (
+        "pending", "running", "succeeded", "partial", "failed"
+    ):
+        raise HTTPException(status_code=400, detail="非法 status 过滤值")
+    rows, total = get_db().list_cleanup_plans(
+        status=status, limit=limit, offset=offset
+    )
+    return CleanupPlanList(
+        total=total, items=[retention._plan_model(get_db(), r) for r in rows]  # noqa: SLF001
+    )
+
+
+@app.get(
+    "/api/v1/retention/cleanup/plans/{plan_id}",
+    tags=["retention"],
+    summary="清理计划进度与逐项结果（含逐文件删除结果/错误）",
+    responses={404: {"description": "清理计划不存在"}},
+)
+def get_cleanup_plan(plan_id: str) -> CleanupPlanModel:
+    return _require_plan(plan_id)
+
+
+@app.post(
+    "/api/v1/retention/cleanup/plans/{plan_id}/retry",
+    tags=["retention"],
+    summary="重试清理计划中失败/未完成的作业项（幂等）",
+    description=(
+        "只重试状态为 failed 的作业项（文件缺失会按已删处理，其余安全守卫重新"
+        "复核）。全部成功则计划转为 succeeded；仍有失败转为 partial。"
+    ),
+    responses={
+        200: {"description": "计划已完成或无失败项，返回当前计划"},
+        202: {"description": "已开始重试"},
+        404: {"description": "清理计划不存在"},
+        409: {"description": "计划已成功，无需重试"},
+    },
+)
+def retry_cleanup_plan(plan_id: str) -> JSONResponse:
+    plan = _require_plan(plan_id)
+    if plan.status == "succeeded":
+        raise HTTPException(status_code=409, detail="清理计划已成功完成，无需重试")
+    reset = get_db().reset_failed_plan_items(plan_id)
+    if reset == 0 and plan.status != "failed":
+        # 没有失败项可重试（可能全部 pending 等待重启续跑）：直接继续执行
+        _start_cleanup_plan(plan_id)
+        return JSONResponse(status_code=202,
+                            content={"retried": 0, "plan": _require_plan(plan_id).model_dump(mode="json")})
+    _start_cleanup_plan(plan_id)
+    return JSONResponse(
+        status_code=202,
+        content={"retried_items": reset,
+                 "plan": _require_plan(plan_id).model_dump(mode="json")},
+    )
+
+
+@app.get(
+    "/api/v1/retention/audit",
+    tags=["retention"],
+    summary="保留/清理审计查询（可按计划/作业/动作过滤、分页）",
+    description="审计只含动作、目标标识、结果与计数，**不含任何日志或结果内容**。",
+)
+def get_retention_audit(
+    plan_id: str | None = Query(default=None),
+    job_kind: str | None = Query(default=None),
+    job_id: str | None = Query(default=None),
+    action: str | None = Query(
+        default=None,
+        description="policy.rule.set/policy.rule.deleted/lock.created/lock.released/"
+                    "cleanup.plan.created/cleanup.plan.started/cleanup.item.done/"
+                    "cleanup.item.failed/cleanup.plan.finished/cleanup.plan.retried",
+    ),
+    limit: int = Query(default=100, ge=1, le=1000),
+    offset: int = Query(default=0, ge=0),
+) -> RetentionAuditPage:
+    if job_kind is not None and job_kind not in retention.JOB_KINDS:
+        raise HTTPException(status_code=400, detail="非法 job_kind 过滤值")
+    rows, total = get_db().list_retention_audit(
+        plan_id=plan_id, job_kind=job_kind, job_id=job_id, action=action,
+        limit=limit, offset=offset,
+    )
+    items = retention.audit_rows_to_models(rows)
+    return RetentionAuditPage(total=total, limit=limit, offset=offset, items=items)
 
 
 # ---------- 错误处理 ----------

@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import re
+from datetime import datetime
 from typing import Any, Literal
 
 from pydantic import BaseModel, Field, field_validator, model_validator
@@ -657,3 +658,216 @@ class ReceiptVerifyResponse(BaseModel):
         description="各校验阶段结果（ok/failed/skipped）：format/binding/structure/"
                     "key/tag/result/content"
     )
+
+
+# ---------- 本地数据保留与安全清理 ----------
+
+RetentionJobKind = Literal["batch", "stream", "bundle"]
+# 终态：batch 只有成功终态；异步作业还包括失败/取消
+RetentionTerminalStatus = Literal["succeeded", "failed", "cancelled"]
+# 规则键中的“是否需复核”维度：true/false 精确匹配，any=两者皆适用
+ReviewScope = Literal["true", "false", "any"]
+CleanupPlanStatus = Literal["pending", "running", "succeeded", "partial", "failed"]
+LockState = Literal["active", "expired", "released"]
+FileOutcome = Literal["deleted", "missing", "symlink_refused", "path_refused", "failed"]
+
+
+class RetentionRuleModel(BaseModel):
+    """单条保留期限规则：(作业类型, 终态, 需复核) 三元组唯一。"""
+
+    job_kind: RetentionJobKind
+    terminal_status: RetentionTerminalStatus
+    needs_review: ReviewScope = Field(
+        description="true/false=仅匹配对应复核状态；any=两者皆适用"
+    )
+    retention_days: float | None = Field(
+        ge=0,
+        description="自终态时间起的保留天数（小数可用，如 0.5=12 小时）；null=永久保留",
+    )
+    builtin: bool = Field(default=False, description="内置默认规则不可删除，只能覆盖")
+    updated_at: str
+
+
+class RetentionPolicyResponse(BaseModel):
+    """生效中的保留策略：内置默认规则 + 调用方覆盖（含永久保留）。"""
+
+    rules: list[RetentionRuleModel]
+
+
+class UpsertRetentionRuleRequest(BaseModel):
+    job_kind: RetentionJobKind
+    terminal_status: RetentionTerminalStatus
+    needs_review: ReviewScope = "any"
+    retention_days: float | None = Field(
+        default=None, ge=0, description="保留天数；null=永久保留（覆盖内置期限）"
+    )
+
+
+class RetentionLockModel(BaseModel):
+    """作业保留锁：带原因与到期时间；到期前该作业不得被清理。"""
+
+    job_kind: RetentionJobKind
+    job_id: str
+    reason: str = Field(min_length=1, max_length=512, description="加锁原因（不含敏感值）")
+    expires_at: datetime = Field(description="到期时间（UTC ISO 8601）；到期后自动失效")
+    created_at: str
+    state: LockState = Field(description="active=生效中；expired=已到期；released=已释放")
+
+
+class CreateRetentionLockRequest(BaseModel):
+    job_kind: RetentionJobKind
+    job_id: str = Field(min_length=1, max_length=128)
+    reason: str = Field(min_length=1, max_length=512)
+    expires_at: datetime
+
+
+class RetentionLockList(BaseModel):
+    total: int
+    items: list[RetentionLockModel]
+
+
+class PreviewFileEntry(BaseModel):
+    """预览中的单个待删文件类别条目（只有相对路径/类别/大小，绝不读取内容）。"""
+
+    category: str = Field(
+        description="result/receipt/raw_input/partial_output/bundle_staging 等类别"
+    )
+    path: str = Field(description="相对数据目录的路径（仅用于核对，不返回任何日志内容）")
+    bytes: int
+    note: str | None = Field(
+        default=None,
+        description="symlink=该路径是符号链接（执行时拒绝）；out_of_tree=越界路径；"
+                    "contains_symlink=暂存目录内含符号链接；null=普通文件",
+    )
+
+
+class PreviewItem(BaseModel):
+    """预览中的单个待删作业（不含日志内容、审计内容）。"""
+
+    job_kind: RetentionJobKind
+    job_id: str
+    terminal_status: RetentionTerminalStatus
+    needs_review: bool
+    completed_at: str
+    retention_days: float | None
+    rule_source: Literal["builtin", "custom"] = Field(
+        description="命中的期限规则来源；null 期限表示永久保留，不会出现在预览中"
+    )
+    expired: bool
+    files: list[PreviewFileEntry]
+    bytes_total: int = Field(description="预计释放字节数（现存文件大小之和）")
+
+
+class CleanupPreviewRequest(BaseModel):
+    """清理预览请求；不传任何过滤即按当前策略扫描全部终态作业。"""
+
+    job_kinds: list[RetentionJobKind] | None = Field(
+        default=None, description="仅预览这些作业类型；null=全部三类"
+    )
+    now: datetime | None = Field(
+        default=None,
+        description="评估用当前时间（UTC ISO 8601），默认服务当前时间；便于复测期限",
+    )
+
+
+class CleanupPreviewResponse(BaseModel):
+    """清理预览：待删作业、文件类别与预计释放空间；不读取或返回任何日志内容。"""
+
+    preview_id: str = Field(description="本次预览的稳定标识（内容指纹，重复预览幂等）")
+    generated_at: str
+    target_fingerprint: str = Field(
+        description="待删目标摘要：作业三元组 + 文件(类别,路径,大小) 规范化哈希"
+    )
+    items: list[PreviewItem]
+    job_count: int
+    file_count: int
+    bytes_total: int = Field(description="预计释放字节数合计")
+    by_category: dict[str, int] = Field(description="各文件类别的预计释放字节数")
+    blocked: dict[str, int] = Field(
+        description="未入选计数：locked=保留锁拦截；retained=期限未满；"
+                    "running=仍在运行；permanent=命中永久保留规则",
+    )
+
+
+class CleanupExecuteRequest(BaseModel):
+    """执行清理必须回传预览摘要；目标发生变化时拒绝执行（409）。"""
+
+    preview_id: str = Field(description="预览接口返回的 preview_id（等于 target_fingerprint）")
+    target_fingerprint: str = Field(description="预览接口返回的目标指纹")
+    job_count: int = Field(ge=0)
+    file_count: int = Field(ge=0)
+    bytes_total: int = Field(ge=0)
+    job_kinds: list[RetentionJobKind] | None = Field(
+        default=None,
+        description="预览时使用的作业类型过滤；必须与预览一致，默认全部三类",
+    )
+    now: datetime | None = Field(
+        default=None,
+        description="评估用当前时间；与预览一致时目标判定才可复现，默认服务当前时间",
+    )
+
+
+class PlanItemModel(BaseModel):
+    """清理计划中单个作业项的执行结果（计划先持久化，删除逐项推进、可重试）。"""
+
+    job_kind: RetentionJobKind
+    job_id: str
+    status: Literal["pending", "done", "failed", "skipped"]
+    planned_files: list[PreviewFileEntry]
+    processed: int = 0
+    deleted_bytes: int = 0
+    outcomes: list[dict[str, Any]] = Field(
+        default_factory=list,
+        description="逐文件结果：category/path/outcome(deleted|missing|symlink_refused|"
+                    "path_refused|failed)/bytes/error",
+    )
+
+
+class CleanupPlanModel(BaseModel):
+    """清理作业（持久化的计划 + 执行进度 + 结果）。"""
+
+    plan_id: str
+    idempotency_key: str | None = None
+    status: CleanupPlanStatus
+    created_at: str
+    updated_at: str | None = None
+    started_at: str | None = None
+    finished_at: str | None = None
+    target_fingerprint: str
+    submitted_preview: dict[str, Any]
+    jobs_total: int
+    jobs_done: int = 0
+    jobs_failed: int = 0
+    files_processed: int = 0
+    bytes_deleted: int = 0
+    error: str | None = None
+    items: list[PlanItemModel] = Field(default_factory=list)
+
+
+class CleanupPlanList(BaseModel):
+    total: int
+    items: list[CleanupPlanModel]
+
+
+class RetentionAuditEntry(BaseModel):
+    """保留/清理审计条目（只含动作、目标与计数，绝不含日志内容）。"""
+
+    id: int
+    ts: str
+    action: str = Field(
+        description="policy.rule.set / policy.rule.deleted / lock.created / "
+                    "lock.released / cleanup.plan.created / cleanup.plan.started / "
+                    "cleanup.item.done / cleanup.item.failed / cleanup.plan.finished / "
+                    "cleanup.plan.retried"
+    )
+    job_kind: str | None = None
+    job_id: str | None = None
+    plan_id: str | None = None
+    detail: dict[str, Any] = Field(default_factory=dict)
+
+
+class RetentionAuditPage(BaseModel):
+    total: int
+    limit: int
+    offset: int
+    items: list[RetentionAuditEntry]

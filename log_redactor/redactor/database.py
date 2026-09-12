@@ -210,6 +210,76 @@ CREATE TABLE IF NOT EXISTS bundle_risks (
 );
 CREATE INDEX IF NOT EXISTS idx_bundle_audit_job ON bundle_audit(job_id);
 CREATE INDEX IF NOT EXISTS idx_bundle_risks_job ON bundle_risks(job_id);
+
+-- 本地数据保留与安全清理：策略规则、保留锁、清理计划与审计
+CREATE TABLE IF NOT EXISTS retention_rules (
+    job_kind TEXT NOT NULL,
+    terminal_status TEXT NOT NULL,
+    needs_review TEXT NOT NULL,
+    retention_days REAL,
+    builtin INTEGER NOT NULL DEFAULT 0,
+    updated_at TEXT NOT NULL,
+    PRIMARY KEY (job_kind, terminal_status, needs_review)
+);
+CREATE TABLE IF NOT EXISTS retention_locks (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    job_kind TEXT NOT NULL,
+    job_id TEXT NOT NULL,
+    reason TEXT NOT NULL,
+    expires_at TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    -- 未释放为 ''（保证唯一约束生效）；释放/失效后写入 ISO 时间
+    released_at TEXT NOT NULL DEFAULT '',
+    -- ''=生效中（released_at 也为空）；'released'=提前释放；'expired'=到期失效
+    release_reason TEXT NOT NULL DEFAULT '',
+    -- 同一作业至多存在一把未释放（含未到期）的锁
+    UNIQUE(job_kind, job_id, released_at)
+);
+CREATE INDEX IF NOT EXISTS idx_retention_locks_job ON retention_locks(job_kind, job_id);
+CREATE TABLE IF NOT EXISTS cleanup_plans (
+    id TEXT PRIMARY KEY,
+    idempotency_key TEXT UNIQUE,
+    status TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    updated_at TEXT,
+    started_at TEXT,
+    finished_at TEXT,
+    target_fingerprint TEXT NOT NULL,
+    submitted_preview_json TEXT NOT NULL,
+    jobs_total INTEGER NOT NULL DEFAULT 0,
+    jobs_done INTEGER NOT NULL DEFAULT 0,
+    jobs_failed INTEGER NOT NULL DEFAULT 0,
+    files_processed INTEGER NOT NULL DEFAULT 0,
+    bytes_deleted INTEGER NOT NULL DEFAULT 0,
+    error TEXT
+);
+CREATE TABLE IF NOT EXISTS cleanup_plan_items (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    plan_id TEXT NOT NULL,
+    job_kind TEXT NOT NULL,
+    job_id TEXT NOT NULL,
+    status TEXT NOT NULL DEFAULT 'pending',
+    planned_files_json TEXT NOT NULL DEFAULT '[]',
+    processed INTEGER NOT NULL DEFAULT 0,
+    deleted_bytes INTEGER NOT NULL DEFAULT 0,
+    outcomes_json TEXT NOT NULL DEFAULT '[]',
+    seq INTEGER NOT NULL,
+    terminal_status TEXT NOT NULL DEFAULT 'succeeded',
+    needs_review INTEGER NOT NULL DEFAULT 0,
+    UNIQUE(plan_id, job_kind, job_id)
+);
+CREATE INDEX IF NOT EXISTS idx_cleanup_items_plan ON cleanup_plan_items(plan_id);
+CREATE TABLE IF NOT EXISTS retention_audit (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    ts TEXT NOT NULL,
+    action TEXT NOT NULL,
+    job_kind TEXT,
+    job_id TEXT,
+    plan_id TEXT,
+    detail_json TEXT NOT NULL DEFAULT '{}'
+);
+CREATE INDEX IF NOT EXISTS idx_retention_audit_ts ON retention_audit(ts, id);
+CREATE INDEX IF NOT EXISTS idx_retention_audit_plan ON retention_audit(plan_id);
 """
 
 
@@ -267,6 +337,35 @@ class Database:
             if "content_bytes" not in jobs_cols:
                 conn.execute(
                     "ALTER TABLE jobs ADD COLUMN content_bytes INTEGER NOT NULL DEFAULT 0"
+                )
+            # 保留策略：首次初始化内置默认期限（仅当规则表为空时，不覆盖既有配置）
+            from .retention import DEFAULT_RETENTION_RULES
+
+            count = conn.execute("SELECT COUNT(*) AS c FROM retention_rules").fetchone()["c"]
+            if count == 0:
+                now = utcnow_iso()
+                conn.executemany(
+                    """INSERT OR IGNORE INTO retention_rules
+                       (job_kind, terminal_status, needs_review, retention_days,
+                        builtin, updated_at) VALUES (?,?,?,?,1,?)""",
+                    [
+                        (job_kind, status, review, days, now)
+                        for job_kind, status, review, days in DEFAULT_RETENTION_RULES
+                    ],
+                )
+            # 清理计划项终态/复核位（开发期表结构升级）
+            item_cols = {
+                r["name"] for r in conn.execute("PRAGMA table_info(cleanup_plan_items)")
+            }
+            if item_cols and "terminal_status" not in item_cols:
+                conn.execute(
+                    "ALTER TABLE cleanup_plan_items ADD COLUMN "
+                    "terminal_status TEXT NOT NULL DEFAULT 'succeeded'"
+                )
+            if item_cols and "needs_review" not in item_cols:
+                conn.execute(
+                    "ALTER TABLE cleanup_plan_items ADD COLUMN "
+                    "needs_review INTEGER NOT NULL DEFAULT 0"
                 )
 
     # ---------- 写入 ----------
@@ -1186,3 +1285,366 @@ class Database:
                 "SELECT * FROM bundle_jobs WHERE status IN ('queued','running') "
                 "ORDER BY created_at ASC"
             ).fetchall()
+
+    # ---------- 保留策略规则 ----------
+
+    def list_retention_rules(self) -> list[sqlite3.Row]:
+        with self._conn() as conn:
+            return conn.execute(
+                "SELECT * FROM retention_rules "
+                "ORDER BY job_kind, terminal_status, needs_review"
+            ).fetchall()
+
+    def upsert_retention_rule(
+        self,
+        *,
+        job_kind: str,
+        terminal_status: str,
+        needs_review: str,
+        retention_days: float | None,
+    ) -> None:
+        with self._lock, self._conn() as conn:
+            conn.execute(
+                """INSERT INTO retention_rules
+                   (job_kind, terminal_status, needs_review, retention_days,
+                    builtin, updated_at)
+                   VALUES (?,?,?,?,0,?)
+                   ON CONFLICT(job_kind, terminal_status, needs_review) DO UPDATE SET
+                     retention_days=excluded.retention_days,
+                     builtin=0,
+                     updated_at=excluded.updated_at""",
+                (job_kind, terminal_status, needs_review, retention_days, utcnow_iso()),
+            )
+
+    def delete_retention_rule(
+        self, *, job_kind: str, terminal_status: str, needs_review: str
+    ) -> bool:
+        """删除调用方自定义规则；内置规则与不存在的键返回 False。"""
+        with self._lock, self._conn() as conn:
+            cur = conn.execute(
+                "DELETE FROM retention_rules WHERE job_kind=? AND terminal_status=? "
+                "AND needs_review=? AND builtin=0",
+                (job_kind, terminal_status, needs_review),
+            )
+            return cur.rowcount > 0
+
+    def get_retention_rule(
+        self, *, job_kind: str, terminal_status: str, needs_review: str
+    ) -> sqlite3.Row | None:
+        with self._conn() as conn:
+            return conn.execute(
+                "SELECT * FROM retention_rules WHERE job_kind=? AND terminal_status=? "
+                "AND needs_review=?",
+                (job_kind, terminal_status, needs_review),
+            ).fetchone()
+
+    # ---------- 保留锁 ----------
+
+    def active_retention_lock(self, job_kind: str, job_id: str) -> sqlite3.Row | None:
+        """取未释放的锁（过期与否由调用方按 expires_at 判定）。"""
+        with self._conn() as conn:
+            return conn.execute(
+                "SELECT * FROM retention_locks WHERE job_kind=? AND job_id=? "
+                "AND released_at='' ORDER BY id DESC LIMIT 1",
+                (job_kind, job_id),
+            ).fetchone()
+
+    def create_retention_lock(
+        self, *, job_kind: str, job_id: str, reason: str, expires_at: str
+    ) -> sqlite3.Row:
+        """创建保留锁；同一作业已有未释放锁时由调用方处理冲突/过期失效。"""
+        now = utcnow_iso()
+        with self._lock, self._conn() as conn:
+            cur = conn.execute(
+                """INSERT INTO retention_locks
+                   (job_kind, job_id, reason, expires_at, created_at, released_at)
+                   VALUES (?,?,?,?,?,'')""",
+                (job_kind, job_id, reason, expires_at, now),
+            )
+            row = conn.execute(
+                "SELECT * FROM retention_locks WHERE id=?", (cur.lastrowid,)
+            ).fetchone()
+        return row
+
+    def expire_retention_lock(self, lock_id: int) -> None:
+        """既有未释放锁已过期：标记失效（released_at 记录失效时间）。"""
+        with self._lock, self._conn() as conn:
+            conn.execute(
+                "UPDATE retention_locks SET released_at=? WHERE id=? AND released_at=''",
+                (utcnow_iso(), lock_id),
+            )
+
+    def release_retention_lock(self, job_kind: str, job_id: str) -> sqlite3.Row | None:
+        """主动释放未到期的锁；没有未释放锁时返回 None。"""
+        with self._lock, self._conn() as conn:
+            cur = conn.execute(
+                "UPDATE retention_locks SET released_at=? "
+                "WHERE job_kind=? AND job_id=? AND released_at=''",
+                (utcnow_iso(), job_kind, job_id),
+            )
+            if cur.rowcount == 0:
+                return None
+            return conn.execute(
+                "SELECT * FROM retention_locks WHERE job_kind=? AND job_id=? "
+                "ORDER BY id DESC LIMIT 1",
+                (job_kind, job_id),
+            ).fetchone()
+
+    def list_retention_locks(
+        self, *, state: str | None, job_kind: str | None, limit: int, offset: int
+    ) -> tuple[list[sqlite3.Row], int]:
+        where: list[str] = []
+        params: list[Any] = []
+        if state in ("active", "expired", "released"):
+            where.append(
+                "released_at=''" if state == "active"
+                else "released_at<>'' AND (expires_at < ?)"
+                if state == "expired"
+                else "released_at<>'' AND (expires_at >= ?)"
+            )
+            if state in ("expired", "released"):
+                params.append(utcnow_iso())
+        if job_kind is not None:
+            where.append("job_kind=?")
+            params.append(job_kind)
+        clause = ("WHERE " + " AND ".join(where)) if where else ""
+        with self._conn() as conn:
+            total = conn.execute(
+                f"SELECT COUNT(*) AS c FROM retention_locks {clause}", params
+            ).fetchone()["c"]
+            rows = conn.execute(
+                f"SELECT * FROM retention_locks {clause} "
+                "ORDER BY id DESC LIMIT ? OFFSET ?",
+                params + [limit, offset],
+            ).fetchall()
+        return rows, total
+
+    def expire_locks_for_job(self, job_kind: str, job_id: str) -> None:
+        """作业被删除时，其保留锁随之失效，避免悬挂的 active 锁。"""
+        with self._lock, self._conn() as conn:
+            conn.execute(
+                "UPDATE retention_locks SET released_at=? "
+                "WHERE job_kind=? AND job_id=? AND released_at=''",
+                (utcnow_iso(), job_kind, job_id),
+            )
+
+    # ---------- 清理计划（跨三类作业的只读查询） ----------
+
+    def get_any_job(self, job_kind: str, job_id: str) -> sqlite3.Row | None:
+        """按类型取作业原始行（清理守卫复核状态用）。"""
+        table = {"batch": "jobs", "stream": "stream_jobs",
+                 "bundle": "bundle_jobs"}.get(job_kind)
+        if table is None:
+            return None
+        with self._conn() as conn:
+            return conn.execute(
+                f"SELECT * FROM {table} WHERE id=?", (job_id,)
+            ).fetchone()
+
+    # ---------- 清理计划 ----------
+
+    def create_cleanup_plan(
+        self,
+        *,
+        plan_id: str,
+        idempotency_key: str | None,
+        target_fingerprint: str,
+        submitted_preview: dict[str, Any],
+        # (job_kind, job_id, planned_files_json, terminal_status, needs_review)
+        items: list[tuple[str, str, str, str, bool]],
+    ) -> None:
+        """清理计划先持久化（计划头 + 全部待删作业项），随后 worker 才开始删除。"""
+        now = utcnow_iso()
+        with self._lock, self._conn() as conn:
+            conn.execute(
+                """INSERT INTO cleanup_plans
+                   (id, idempotency_key, status, created_at, updated_at,
+                    target_fingerprint, submitted_preview_json, jobs_total)
+                   VALUES (?,?, 'pending', ?, ?, ?, ?, ?)""",
+                (plan_id, idempotency_key, now, now,
+                 target_fingerprint, json.dumps(submitted_preview, ensure_ascii=False),
+                 len(items)),
+            )
+            conn.executemany(
+                """INSERT INTO cleanup_plan_items
+                   (plan_id, job_kind, job_id, status, planned_files_json, seq,
+                    terminal_status, needs_review)
+                   VALUES (?,?,?, 'pending', ?, ?, ?, ?)""",
+                [
+                    (plan_id, job_kind, job_id, files_json, seq,
+                     terminal_status, int(needs_review))
+                    for seq, (job_kind, job_id, files_json,
+                              terminal_status, needs_review) in enumerate(items)
+                ],
+            )
+
+    def get_cleanup_plan_row(self, plan_id: str) -> sqlite3.Row | None:
+        with self._conn() as conn:
+            return conn.execute(
+                "SELECT * FROM cleanup_plans WHERE id=?", (plan_id,)
+            ).fetchone()
+
+    def get_cleanup_plan_by_idempotency(self, key: str) -> sqlite3.Row | None:
+        with self._conn() as conn:
+            return conn.execute(
+                "SELECT * FROM cleanup_plans WHERE idempotency_key=?", (key,)
+            ).fetchone()
+
+    def find_cleanup_plan_by_fingerprint(self, target_fingerprint: str) -> sqlite3.Row | None:
+        """找同目标指纹的最近计划（无幂等键时的重复执行幂等回放）。"""
+        with self._conn() as conn:
+            return conn.execute(
+                "SELECT * FROM cleanup_plans WHERE target_fingerprint=? "
+                "ORDER BY created_at DESC, id DESC LIMIT 1",
+                (target_fingerprint,),
+            ).fetchone()
+
+    def cleanup_plan_items(self, plan_id: str) -> list[sqlite3.Row]:
+        with self._conn() as conn:
+            return conn.execute(
+                "SELECT * FROM cleanup_plan_items WHERE plan_id=? ORDER BY seq ASC",
+                (plan_id,),
+            ).fetchall()
+
+    def list_cleanup_plans(self, *, status: str | None, limit: int, offset: int,
+                           ) -> tuple[list[sqlite3.Row], int]:
+        where = "WHERE status=?" if status is not None else ""
+        params: tuple[Any, ...] = (status,) if status is not None else ()
+        with self._conn() as conn:
+            total = conn.execute(
+                f"SELECT COUNT(*) AS c FROM cleanup_plans {where}", params
+            ).fetchone()["c"]
+            rows = conn.execute(
+                f"SELECT * FROM cleanup_plans {where} "
+                "ORDER BY created_at DESC, id DESC LIMIT ? OFFSET ?",
+                params + (limit, offset),
+            ).fetchall()
+        return list(rows), total
+
+    def resumable_cleanup_plans(self) -> list[sqlite3.Row]:
+        """服务重启后继续的清理计划：未全部完成（含运行中被中断）。"""
+        with self._conn() as conn:
+            return conn.execute(
+                "SELECT * FROM cleanup_plans WHERE status IN ('pending','running') "
+                "ORDER BY created_at ASC"
+            ).fetchall()
+
+    def mark_cleanup_plan_running(self, plan_id: str) -> None:
+        with self._lock, self._conn() as conn:
+            conn.execute(
+                "UPDATE cleanup_plans SET status='running', updated_at=?, "
+                "started_at=COALESCE(started_at, ?) WHERE id=? AND status IN "
+                "('pending','running')",
+                (utcnow_iso(), utcnow_iso(), plan_id),
+            )
+
+    def mark_cleanup_plan_finished(
+        self, plan_id: str, *, status: str, jobs_failed: int,
+        files_processed: int, bytes_deleted: int, error: str | None
+    ) -> None:
+        with self._lock, self._conn() as conn:
+            conn.execute(
+                """UPDATE cleanup_plans SET status=?, updated_at=?, finished_at=?,
+                   jobs_failed=?, files_processed=?, bytes_deleted=?, error=?
+                   WHERE id=?""",
+                (status, utcnow_iso(), utcnow_iso(), jobs_failed,
+                 files_processed, bytes_deleted, error, plan_id),
+            )
+
+    def update_cleanup_progress(
+        self, plan_id: str, *, jobs_done: int, jobs_failed: int,
+        files_processed: int, bytes_deleted: int
+    ) -> None:
+        with self._lock, self._conn() as conn:
+            conn.execute(
+                """UPDATE cleanup_plans SET updated_at=?, jobs_done=?, jobs_failed=?,
+                   files_processed=?, bytes_deleted=? WHERE id=?""",
+                (utcnow_iso(), jobs_done, jobs_failed, files_processed,
+                 bytes_deleted, plan_id),
+            )
+
+    def mark_plan_item(
+        self, item_id: int, *, status: str, processed: int,
+        deleted_bytes: int, outcomes: list[dict[str, Any]]
+    ) -> None:
+        with self._lock, self._conn() as conn:
+            conn.execute(
+                """UPDATE cleanup_plan_items SET status=?, processed=?,
+                   deleted_bytes=?, outcomes_json=? WHERE id=?""",
+                (status, processed, deleted_bytes,
+                 json.dumps(outcomes, ensure_ascii=False), item_id),
+            )
+
+    def reset_failed_plan_items(self, plan_id: str) -> int:
+        """重试：把失败作业项复位为 pending，返回复位条数。"""
+        with self._lock, self._conn() as conn:
+            cur = conn.execute(
+                "UPDATE cleanup_plan_items SET status='pending' "
+                "WHERE plan_id=? AND status='failed'",
+                (plan_id,),
+            )
+            return cur.rowcount
+
+    # ---------- 保留/清理审计 ----------
+
+    def add_retention_audit(
+        self, action: str, *, job_kind: str | None = None, job_id: str | None = None,
+        plan_id: str | None = None, detail: dict[str, Any] | None = None
+    ) -> None:
+        with self._lock, self._conn() as conn:
+            conn.execute(
+                "INSERT INTO retention_audit (ts, action, job_kind, job_id, "
+                "plan_id, detail_json) VALUES (?,?,?,?,?,?)",
+                (utcnow_iso(), action, job_kind, job_id, plan_id,
+                 json.dumps(detail or {}, ensure_ascii=False)),
+            )
+
+    def list_retention_audit(
+        self, *, plan_id: str | None, job_kind: str | None, job_id: str | None,
+        action: str | None, limit: int, offset: int
+    ) -> tuple[list[sqlite3.Row], int]:
+        where: list[str] = []
+        params: list[Any] = []
+        for col, val in (("plan_id", plan_id), ("job_kind", job_kind),
+                         ("job_id", job_id), ("action", action)):
+            if val is not None:
+                where.append(f"{col}=?")
+                params.append(val)
+        clause = ("WHERE " + " AND ".join(where)) if where else ""
+        with self._conn() as conn:
+            total = conn.execute(
+                f"SELECT COUNT(*) AS c FROM retention_audit {clause}", params
+            ).fetchone()["c"]
+            rows = conn.execute(
+                f"SELECT * FROM retention_audit {clause} "
+                "ORDER BY id DESC LIMIT ? OFFSET ?",
+                params + [limit, offset],
+            ).fetchall()
+        return list(rows), total
+
+    # ---------- 清理删除：文件先删、记录随后（限定本服务数据目录） ----------
+
+    def delete_job_records(self, job_kind: str, job_id: str) -> None:
+        """删除指定作业的全部数据库记录（审计/风险/作业行/保留锁）。
+
+        仅在该作业的文件删除成功后调用；按 审计→风险→作业行→锁 的顺序，
+        避免外键/悬挂锁残留。
+        """
+        if job_kind == "batch":
+            tables = ("audit", "risks", "jobs")
+        elif job_kind == "stream":
+            tables = ("stream_audit", "stream_risks", "stream_jobs")
+        elif job_kind == "bundle":
+            tables = ("bundle_audit", "bundle_risks", "bundle_files", "bundle_jobs")
+        else:  # 防御：未知类型不动数据库
+            return
+        job_tables = {"jobs", "stream_jobs", "bundle_jobs"}
+        with self._lock, self._conn() as conn:
+            for table in tables:
+                col = "id" if table in job_tables else "job_id"
+                conn.execute(f"DELETE FROM {table} WHERE {col}=?", (job_id,))
+            conn.execute(
+                "UPDATE retention_locks SET released_at=? "
+                "WHERE job_kind=? AND job_id=? AND released_at=''",
+                (utcnow_iso(), job_kind, job_id),
+            )
