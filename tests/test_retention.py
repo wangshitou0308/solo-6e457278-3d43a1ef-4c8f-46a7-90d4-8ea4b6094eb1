@@ -49,7 +49,11 @@ def _create_batch(client, key="b1", content=None):
 
 def _age_job(db_path: Path, table: str, job_id: str, days: float) -> None:
     """把作业完成时间回拨 days 天（保留期按服务当前时间评估，不能拨未来 now）。"""
-    old = (datetime.now(timezone.utc) - timedelta(days=days)
+    _age_job_seconds(db_path, table, job_id, int(days * 86400))
+
+
+def _age_job_seconds(db_path: Path, table: str, job_id: str, seconds: int) -> None:
+    old = (datetime.now(timezone.utc) - timedelta(seconds=seconds)
            ).isoformat(timespec="seconds")
     with sqlite3.connect(db_path) as conn:
         if table == "jobs":
@@ -66,24 +70,42 @@ def _preview(client, kinds=None):
     return client.post("/api/v1/retention/cleanup/preview", json=body).json()
 
 
-def _wait_plan(client, plan_id, timeout=10.0, after_ts: float | None = None):
+def _plan_epoch(value):
+    from datetime import timezone as tz
+    try:
+        dt = datetime.fromisoformat((value or "").replace("Z", "+00:00"))
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=tz.utc)
+        return dt.timestamp()
+    except ValueError:
+        return 0.0
+
+
+def _wait_plan(client, plan_id, timeout=10.0, *, after_updated: str | None = None):
+    """等待计划终结；给 after_updated 时只接受 updated_at 晚于该值的终态，
+    避免重试时读到上一轮的 partial。"""
     import time
     end = time.time() + timeout
-    seen_terminal = None
-    # 重试场景：状态可能短暂停留在上一轮的 partial；要求终态稳定 200ms
+    threshold = _plan_epoch(after_updated)
+    # 终态需稳定 300ms，确认没有更新一轮执行正在写入
     stable_since = None
+    last = None
     while time.time() < end:
         p = client.get(f"/api/v1/retention/cleanup/plans/{plan_id}").json()
+        last = p
         if p["status"] in ("succeeded", "partial", "failed"):
-            now = time.time()
-            if stable_since is None:
-                stable_since = now
-            elif now - stable_since >= 0.2:
-                return p
+            fresh = (after_updated is None
+                     or _plan_epoch(p["updated_at"]) >= threshold)
+            if fresh:
+                now = time.time()
+                if stable_since is None:
+                    stable_since = now
+                elif now - stable_since >= 0.3:
+                    return p
         else:
             stable_since = None
         time.sleep(0.02)
-    raise AssertionError("清理计划超时未终结")
+    raise AssertionError(f"清理计划超时未终结: {last and last['status']}")
 
 
 def _execute_preview(client, pv, key=None, status=202):
@@ -111,10 +133,73 @@ def test_future_now_rejected_in_preview_and_execute(client):
     past = _iso(datetime.now(timezone.utc) - timedelta(days=400))
     r = client.post("/api/v1/retention/cleanup/preview", json={"now": past})
     assert r.status_code == 400
-    # ±5 分钟内的时钟偏差允许
-    near = _iso(datetime.now(timezone.utc) + timedelta(minutes=2))
+    # 秒级时钟偏差（未来 2 秒）允许
+    near = _iso(datetime.now(timezone.utc) + timedelta(seconds=2))
     assert client.post("/api/v1/retention/cleanup/preview",
                        json={"now": near}).status_code == 200
+    # 超过秒级容错的未来时间（3 分钟）拒绝：不能提前清理临近到期的作业
+    soon = _iso(datetime.now(timezone.utc) + timedelta(minutes=3))
+    assert client.post("/api/v1/retention/cleanup/preview",
+                       json={"now": soon}).status_code == 400
+
+
+def test_execute_rejects_future_now_even_for_idempotent_replay(
+        client, isolated_data):
+    """复用已有 Idempotency-Key 同时传未来 now：时间校验先于回放，返回 400。"""
+    job = _create_batch(client)
+    client.put("/api/v1/retention/rules", json={
+        "job_kind": "batch", "terminal_status": "succeeded",
+        "needs_review": "true", "retention_days": 0})
+    _age_job(isolated_data["settings"].db_path, "jobs", job["id"], 1)
+    pv = _preview(client)
+    key = "replay-time-1"
+    # 首次执行成功，建立该幂等键的计划
+    ok = client.post("/api/v1/retention/cleanup/execute", json={
+        "preview_id": pv["preview_id"], "target_fingerprint": pv["target_fingerprint"],
+        "job_count": pv["job_count"], "file_count": pv["file_count"],
+        "bytes_total": pv["bytes_total"]}, headers={"Idempotency-Key": key})
+    assert ok.status_code == 202
+    _wait_plan(client, ok.json()["plan"]["plan_id"])
+    # 同一键 + 未来 now：必须 400，而不是 200/replayed=true
+    future = _iso(datetime.now(timezone.utc) + timedelta(minutes=3))
+    r = client.post("/api/v1/retention/cleanup/execute", json={
+        "preview_id": pv["preview_id"], "target_fingerprint": pv["target_fingerprint"],
+        "job_count": pv["job_count"], "file_count": pv["file_count"],
+        "bytes_total": pv["bytes_total"], "now": future},
+        headers={"Idempotency-Key": key})
+    assert r.status_code == 400, r.status_code
+
+
+def test_preview_execute_consistent_near_deadline(client, isolated_data):
+    """距到期很近（约 120 秒）的作业：用 3 分钟后的 now 预览被拒，无法提前纳入；
+
+    只有真正到期后（回拨完成时间模拟时间流逝）预览、执行、计划状态才一致成功。
+    """
+    job = _create_batch(client)
+    client.put("/api/v1/retention/rules", json={
+        "job_kind": "batch", "terminal_status": "succeeded",
+        "needs_review": "true", "retention_days": 1})
+    # 完成于 23 小时 58 分前：距到期约 120 秒，现在不应入选
+    _age_job_seconds(isolated_data["settings"].db_path, "jobs", job["id"],
+                     23 * 3600 + 58 * 60)
+    pv_now = _preview(client)
+    assert job["id"] not in [i["job_id"] for i in pv_now["items"]]
+    assert pv_now["blocked"]["retained"] >= 1
+    # 3 分钟后的 now 被拒（否则会提前约 2 分钟清理）
+    soon = _iso(datetime.now(timezone.utc) + timedelta(minutes=3))
+    r = client.post("/api/v1/retention/cleanup/preview", json={"now": soon})
+    assert r.status_code == 400
+    # 时间真正走过到期点（回拨到 1 天 + 1 分钟前）：预览入选、执行成功、无 partial
+    _age_job_seconds(isolated_data["settings"].db_path, "jobs", job["id"],
+                     24 * 3600 + 60)
+    pv = _preview(client)
+    assert any(i["job_id"] == job["id"] for i in pv["items"])
+    resp = _execute_preview(client, pv, key="near-deadline-1")
+    plan = _wait_plan(client, resp["plan"]["plan_id"])
+    assert plan["status"] == "succeeded", plan["status"]
+    assert all(
+        o["outcome"] != "guard_refused"
+        for it in plan["items"] for o in it["outcomes"])
 
 
 def test_fresh_job_cannot_be_cleaned_early_even_with_zero_rule(client, isolated_data):
@@ -478,9 +563,10 @@ def test_symlink_to_locked_job_target_refused(client, isolated_data):
 
     # 移除符号链接（缺失）后重试：成功并清掉受害作业记录
     link.unlink()
+    before_updated = plan["updated_at"]
     rt = client.post(f"/api/v1/retention/cleanup/plans/{plan['plan_id']}/retry")
     assert rt.status_code == 202
-    plan2 = _wait_plan(client, plan["plan_id"])
+    plan2 = _wait_plan(client, plan["plan_id"], after_updated=before_updated)
     assert plan2["status"] == "succeeded"
     assert client.get(f"/api/v1/jobs/{victim['id']}").status_code == 404
     assert client.get(f"/api/v1/jobs/{locked['id']}").status_code == 200

@@ -76,10 +76,10 @@ _plan_generation: dict[str, int] = {}
 _plan_threads: dict[str, threading.Thread] = {}
 _threads_lock = threading.Lock()
 
-# 允许的时钟偏差上限：调用方可显式传入 now 做可复现评估，但明显的未来/过去
-# 时间会让“刚完成、仍在保留期内”的作业被提前清理，因此只允许 ±5 分钟偏差，
-# 超出范围一律拒绝（400）。
-MAX_NOW_SKEW = timedelta(minutes=5)
+# 评估时间 now 的允许偏差。未来时间会让“仍在保留期内”的作业被提前清理，
+# 因此未来方向只允许秒级时钟偏差；过去方向只可能让保留更保守（少删），放宽到 5 分钟。
+MAX_NOW_FUTURE_SKEW = timedelta(seconds=5)
+MAX_NOW_PAST_SKEW = timedelta(minutes=5)
 
 
 # ---------- 时间 ----------
@@ -98,19 +98,31 @@ class UnsafePathError(Exception):
 
 
 class InvalidNowError(ValueError):
-    """显式传入的评估时间 now 与服务当前时间偏差过大。"""
+    """显式传入的评估时间 now 不被接受（未来时间或距当前过远）。"""
 
 
 def validate_now(now: datetime | None) -> datetime | None:
-    """规范化显式评估时间并拒绝明显的未来/过去时间（只允许时钟偏差）。"""
+    """规范化显式评估时间并拒绝可提前清理的未来时间。
+
+    * ``now`` 比服务当前时间快超过 :data:`MAX_NOW_FUTURE_SKEW`：拒绝（防止把
+      保留期未满的作业纳入目标，杜绝“预览入选、执行守卫又拒绝”的不一致）；
+    * 比当前时间慢超过 :data:`MAX_NOW_PAST_SKEW`：拒绝（明显的陈旧时间戳）；
+    * 偏差内视为时钟偏差，规范化为 UTC 后采用。
+    """
     if now is None:
         return None
     value = _now(now)
-    if abs(value - _now()) > MAX_NOW_SKEW:
+    current = _now()
+    delta = value - current
+    if delta > MAX_NOW_FUTURE_SKEW:
         raise InvalidNowError(
-            "评估时间 now 与服务当前时间偏差超过 "
-            f"{int(MAX_NOW_SKEW.total_seconds() // 60)} 分钟；保留期限只能按"
-            "服务当前时间评估，禁止用未来时间提前清理"
+            f"评估时间 now 不得晚于服务当前时间 {int(MAX_NOW_FUTURE_SKEW.total_seconds())}"
+            " 秒以上；保留期限只能按服务当前时间评估，禁止用未来时间提前清理"
+        )
+    if -delta > MAX_NOW_PAST_SKEW:
+        raise InvalidNowError(
+            "评估时间 now 早于服务当前时间超过 "
+            f"{int(MAX_NOW_PAST_SKEW.total_seconds() // 60)} 分钟"
         )
     return value
 
@@ -810,16 +822,18 @@ def get_plan(db: Database, plan_id: str) -> CleanupPlanModel | None:
 
 def _guards_pass(
     db: Database, *, job_kind: str, job_id: str,
-    planned_status: str, planned_review: bool, now: datetime,
+    planned_status: str, planned_review: bool,
+    lock_now: datetime, retention_now: datetime,
 ) -> tuple[bool, str | None]:
     """执行前的逐作业复核（目标变化的最后一道防线）：
 
     * 作业必须仍存在、仍处于计划时的终态（运行中作业不得删除）；
-    * 生效中的保留锁不得删除；
-    * 按**当前**策略与终态/复核位重新解析期限，已不满足过期条件不得删除
-      （复核期限未满的结果不得删除）。
+    * 生效中的保留锁不得删除（按**服务墙钟时间**判定，安全方向）；
+    * 按**当前**策略与终态/复核位重新解析期限，已不满足过期条件不得删除。
+      期限复核沿用预览时的同一评估时刻 ``retention_now``，保证“预览入选 ⇒
+      守卫通过”，不会因秒级时钟走动产生 partial/guard_refused。
     """
-    if active_lock(db, job_kind, job_id, now) is not None:
+    if active_lock(db, job_kind, job_id, lock_now) is not None:
         return False, "作业存在生效中的保留锁"
     row = db.get_any_job(job_kind, job_id)
     if row is None:
@@ -844,7 +858,7 @@ def _guards_pass(
         return False, "保留策略已变为永久保留"
     if completed is not None:
         deadline = completed + timedelta(days=float(rule["retention_days"]))
-        if now < deadline:
+        if retention_now < deadline:
             return False, "保留期限尚未届满"
     return True, None
 
@@ -898,7 +912,8 @@ def _prescan_unsafe(planned: list[dict[str, Any]], roots: list[Path]
 
 
 def _delete_item(
-    db: Database, item_row: sqlite3.Row, *, now: datetime
+    db: Database, item_row: sqlite3.Row, *,
+    lock_now: datetime, retention_now: datetime,
 ) -> tuple[str, list[dict[str, Any]], int, int]:
     """删除单个作业项；返回 (status, outcomes, processed_count, deleted_bytes)。
 
@@ -912,7 +927,8 @@ def _delete_item(
     ok, reason = _guards_pass(
         db, job_kind=job_kind, job_id=job_id,
         planned_status=item_row["terminal_status"],
-        planned_review=bool(item_row["needs_review"]), now=now,
+        planned_review=bool(item_row["needs_review"]),
+        lock_now=lock_now, retention_now=retention_now,
     )
     if not ok:
         return "failed", [{
@@ -1043,6 +1059,14 @@ def run_cleanup_plan(
             plan_id=plan_id,
         )
 
+        # 期限复核时刻：首轮执行沿用提交预览时的评估时刻（保证预览入选⇒守卫通过）；
+        # 重试/重启续跑按当前墙钟时间重新复核。保留锁/运行中检查始终用墙钟时间。
+        if retry_failed_only or row["started_at"]:
+            retention_now = current
+        else:
+            submitted = json.loads(row["submitted_preview_json"] or "{}")
+            retention_now = parse_iso(submitted.get("generated_at")) or current
+
         files_processed = 0
         bytes_deleted = 0
         for item_row in db.cleanup_plan_items(plan_id):
@@ -1054,7 +1078,7 @@ def run_cleanup_plan(
             if retry_failed_only and item_row["status"] != "failed":
                 continue
             status, outcomes, processed, item_bytes = _delete_item(
-                db, item_row, now=current
+                db, item_row, lock_now=current, retention_now=retention_now,
             )
             db.mark_plan_item(
                 item_row["id"], status=status, processed=processed,

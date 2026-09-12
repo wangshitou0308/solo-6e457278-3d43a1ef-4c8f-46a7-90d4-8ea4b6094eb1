@@ -1643,6 +1643,13 @@ def post_cleanup_execute(
         if bad:
             raise HTTPException(status_code=400, detail=f"非法作业类型: {list(bad)}")
 
+    # 时间校验先于一切（含幂等回放）：未来 now 绝不能借“回放已有计划”绕过，
+    # 否则会出现预览入选、执行守卫拒绝的不一致。非法 now 一律 400。
+    try:
+        evaluated_now = retention.validate_now(req.now)
+    except retention.InvalidNowError as exc:
+        raise HTTPException(status_code=400, detail={"message": str(exc)}) from exc
+
     # 幂等键一旦创建过计划就永久标识该计划：带键重复提交（无论目标当前是否
     # 已被本计划清空）恒回放，这是“重复请求保持幂等”的最强保证。
     if idempotency_key:
@@ -1654,10 +1661,7 @@ def post_cleanup_execute(
                 content={"replayed": True, "plan": plan.model_dump(mode="json")},
             )
 
-    try:
-        current = retention.build_preview(get_db(), job_kinds=kinds, now=req.now)
-    except retention.InvalidNowError as exc:
-        raise HTTPException(status_code=400, detail={"message": str(exc)}) from exc
+    current = retention.build_preview(get_db(), job_kinds=kinds, now=evaluated_now)
 
     # 首次执行：目标发生变化（文件增减、加锁、期限调整等）一律拒绝，要求重新预览
     if current["target_fingerprint"] != req.target_fingerprint:
