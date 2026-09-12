@@ -2,8 +2,8 @@
   "openapi": "3.1.0",
   "info": {
     "title": "本地日志脱敏 API",
-    "description": "供后端团队提交故障样本前使用的本地日志脱敏服务。支持按字段路径/键名/正则/内置识别器（邮箱、手机号、IP、访问令牌、身份证、银行卡）命中，动作包括删除、掩码与基于本地密钥的确定性令牌化；生成不含原值的审计清单，并对残留高风险内容标记需复核。\n\n## 令牌关联域（token_context）\n小批量、流式 NDJSON、诊断包与策略对照入口均可传 `token_context`（最长 128 字符）。服务用主密钥为上下文计算**不可逆域标识**并派生域专属子密钥：同一主密钥下，相同上下文与同一原值恒为同一替身，不同上下文必为不同替身。服务**只持久化域标识**（对外以域指纹 `dom:<hex>` 展示），**不保存上下文原文**；上下文无法从域指纹逆推。未传时沿用全局映射（域指纹 `global`，替身与历史行为完全一致）；`delete`/`mask` 动作与关联域无关。流式作业与诊断包重启续跑自动沿用创建时的关联域。`Idempotency-Key` 同时绑定内容、策略与关联域，同键换域返回 409；策略对照的基线与候选共用同一关联域。\n\n**隐私取舍**：全局域便于跨作业/跨事件做等值关联分析，但替身本身也是跨批次的稳定连接键；隔离域切断跨上下文的等值连接（同一实体在不同事件中的替身不同），代价是失去跨域关联能力，且需要调用方自行记住上下文取值（服务无法替你找回）。\n\n## 策略变更对照（strategies/diff）\n在同一批 JSON/NDJSON 上以同一主密钥分别执行基线与候选策略（纯内存，不落库、不生成文件），按记录、行号、字段路径与内容命中位置（原文内偏移）对齐：汇总候选新增/失去的覆盖、动作变化、胜出规则变化与残留风险增减；仅规则改名且处理一致时不算覆盖改善。调用方可为新增残留风险、失去处理与输出类型变化设置上限，响应返回 pass/fail 与逐项依据供 CI 放行判定。差异项只含位置、规则、动作、识别器与计数，不回显原始值、正则文本或处理后仍含敏感信息的值。\n\n## 大批量 NDJSON 流式作业（stream-jobs）\n通过 multipart/form-data 上传大文件，原始文件以 0600 权限临时落盘，服务逐行解析、脱敏并定期写入安全检查点（字节偏移/记录数/审计数/风险数），不把整包读入内存；支持 Idempotency-Key 内容校验（同键不同内容返回 409）、取消、服务重启后从检查点继续、格式错误记录行号并终止；成功后原子发布结果文件，未完成作业不可下载。\n\n## 诊断包作业（bundle-jobs）\n通过 multipart/form-data 上传 ZIP 诊断包与脱敏策略，逐个处理包内 .json/.ndjson/.log/.txt 文件：结构化文件走字段+内容规则，纯文本按行应用内容规则，输出保留包内相对路径与原换行风格。拒绝路径穿越、符号链接、重复路径、加密条目及超过文件数/单文件/展开总量/压缩比上限的压缩包；二进制与不支持类型不写入结果，只在结果 ZIP 的 redaction-manifest.json 清单列明原因。审计与残留风险带来源路径与行号/记录位置，不含原值；同一 Idempotency-Key 仅在压缩包与策略均一致时回放，否则 409；支持进度查询、取消与重启续跑，终态清理原始包，成功后原子发布结果 ZIP。\n\n## 脱敏结果完整性凭证（receipt）\n小批量、流式 NDJSON 与诊断包作业在**成功发布结果**时生成独立 JSON 凭证：记录格式版本、输入与规范化策略摘要、关联域指纹、统计计数与输出文件摘要（诊断包另列结果 ZIP 内各文件的路径与摘要），**不含原始值、处理后值、策略正文或密钥材料**。凭证由主密钥派生的凭证子密钥按固定字段顺序计算 HMAC-SHA256 标签。三类作业均提供凭证查询、下载与校验接口；校验重算标签与现有结果摘要，区分凭证被改动、结果缺失、内容不符、密钥不匹配与格式不支持，**不重新脱敏、不返回文件内容**。取消/失败的异步作业不生成凭证；幂等回放指向同一凭证；重启后仍可校验已发布结果。\n\n## 本地数据保留与安全清理（retention）\n统一管理三类作业（小批量 `batch`、流式 NDJSON `stream`、诊断包 `bundle`）的记录、结果文件与完整性凭证的保留期限：可按**作业类型 × 终态 × 是否需复核**配置保留天数（含永久保留），内置默认策略可覆盖或删除自定义覆盖后回退；可为指定作业设置带原因与到期时间的**保留锁**。清理预览只返回待删作业、文件类别与预计释放空间，**不读取、不返回任何日志或审计内容**。执行清理必须回传预览摘要与目标指纹：目标发生变化（新增/删除文件、锁、期限等）一律拒绝（409）；保留锁未到期、运行中作业与复核期限未满的结果不得删除。执行先持久化清理计划，再仅在限定数据目录内删除文件并随后删除关联数据库记录；文件缺失按已删处理（幂等），符号链接与越界路径拒绝跟随并记录，部分失败可重试，**服务重启后自动继续**。",
-    "version": "1.6.0"
+    "description": "供后端团队提交故障样本前使用的本地日志脱敏服务。支持按字段路径/键名/正则/内置识别器（邮箱、手机号、IP、访问令牌、身份证、银行卡）命中，动作包括删除、掩码与基于本地密钥的确定性令牌化；生成不含原值的审计清单，并对残留高风险内容标记需复核。\n\n## 令牌关联域（token_context）\n小批量、流式 NDJSON、诊断包与策略对照入口均可传 `token_context`（最长 128 字符）。服务用主密钥为上下文计算**不可逆域标识**并派生域专属子密钥：同一主密钥下，相同上下文与同一原值恒为同一替身，不同上下文必为不同替身。服务**只持久化域标识**（对外以域指纹 `dom:<hex>` 展示），**不保存上下文原文**；上下文无法从域指纹逆推。未传时沿用全局映射（域指纹 `global`，替身与历史行为完全一致）；`delete`/`mask` 动作与关联域无关。流式作业与诊断包重启续跑自动沿用创建时的关联域。`Idempotency-Key` 同时绑定内容、策略与关联域，同键换域返回 409；策略对照的基线与候选共用同一关联域。\n\n**隐私取舍**：全局域便于跨作业/跨事件做等值关联分析，但替身本身也是跨批次的稳定连接键；隔离域切断跨上下文的等值连接（同一实体在不同事件中的替身不同），代价是失去跨域关联能力，且需要调用方自行记住上下文取值（服务无法替你找回）。\n\n## 策略变更对照（strategies/diff）\n在同一批 JSON/NDJSON 上以同一主密钥分别执行基线与候选策略（纯内存，不落库、不生成文件），按记录、行号、字段路径与内容命中位置（原文内偏移）对齐：汇总候选新增/失去的覆盖、动作变化、胜出规则变化与残留风险增减；仅规则改名且处理一致时不算覆盖改善。调用方可为新增残留风险、失去处理与输出类型变化设置上限，响应返回 pass/fail 与逐项依据供 CI 放行判定。差异项只含位置、规则、动作、识别器与计数，不回显原始值、正则文本或处理后仍含敏感信息的值。\n\n## 大批量 NDJSON 流式作业（stream-jobs）\n通过 multipart/form-data 上传大文件，原始文件以 0600 权限临时落盘，服务逐行解析、脱敏并定期写入安全检查点（字节偏移/记录数/审计数/风险数），不把整包读入内存；支持 Idempotency-Key 内容校验（同键不同内容返回 409）、取消、服务重启后从检查点继续、格式错误记录行号并终止；成功后原子发布结果文件，未完成作业不可下载。\n\n## 诊断包作业（bundle-jobs）\n通过 multipart/form-data 上传 ZIP 诊断包与脱敏策略，逐个处理包内 .json/.ndjson/.log/.txt 文件：结构化文件走字段+内容规则，纯文本按行应用内容规则，输出保留包内相对路径与原换行风格。拒绝路径穿越、符号链接、重复路径、加密条目及超过文件数/单文件/展开总量/压缩比上限的压缩包；二进制与不支持类型不写入结果，只在结果 ZIP 的 redaction-manifest.json 清单列明原因。审计与残留风险带来源路径与行号/记录位置，不含原值；同一 Idempotency-Key 仅在压缩包与策略均一致时回放，否则 409；支持进度查询、取消与重启续跑，终态清理原始包，成功后原子发布结果 ZIP。\n\n## 断点续传上传会话（upload-sessions）\n网络不稳时 NDJSON 与 ZIP 诊断包不必整包重传：先声明式创建会话（文件类型、总字节数、整体 SHA-256、脱敏策略与**必填的 token_context 关联域**——会话不提供全局域回退，可带 Idempotency-Key），再用 `Content-Range: bytes <start>-<end>/<total>` 乱序提交分片；分片以 0600 权限流式暂存并逐片登记 SHA-256 索引，进度接口返回已收/缺失区间。相同区间内容一致的重传幂等回放（200）；区间重叠冲突、越界或逐片摘要不符一律拒绝且保留已有分片。会话与分片索引在服务重启后恢复；除访问时惰性过期外，后台清扫线程按 `REDACTOR_UPLOAD_SWEEP_SECONDS`（默认 60 秒）周期主动清理到期会话的暂存文件。完成时要求分片恰好覆盖全部字节并通过整体 SHA-256 校验：NDJSON 转入既有流式作业，ZIP 经原有安全检查后转入诊断包作业，策略、令牌关联域与 Idempotency-Key 全部沿用创建时的声明；完成后会话禁止继续写入。\n\n## 脱敏结果完整性凭证（receipt）\n小批量、流式 NDJSON 与诊断包作业在**成功发布结果**时生成独立 JSON 凭证：记录格式版本、输入与规范化策略摘要、关联域指纹、统计计数与输出文件摘要（诊断包另列结果 ZIP 内各文件的路径与摘要），**不含原始值、处理后值、策略正文或密钥材料**。凭证由主密钥派生的凭证子密钥按固定字段顺序计算 HMAC-SHA256 标签。三类作业均提供凭证查询、下载与校验接口；校验重算标签与现有结果摘要，区分凭证被改动、结果缺失、内容不符、密钥不匹配与格式不支持，**不重新脱敏、不返回文件内容**。取消/失败的异步作业不生成凭证；幂等回放指向同一凭证；重启后仍可校验已发布结果。\n\n## 本地数据保留与安全清理（retention）\n统一管理三类作业（小批量 `batch`、流式 NDJSON `stream`、诊断包 `bundle`）的记录、结果文件与完整性凭证的保留期限：可按**作业类型 × 终态 × 是否需复核**配置保留天数（含永久保留），内置默认策略可覆盖或删除自定义覆盖后回退；可为指定作业设置带原因与到期时间的**保留锁**。清理预览只返回待删作业、文件类别与预计释放空间，**不读取、不返回任何日志或审计内容**。执行清理必须回传预览摘要与目标指纹：目标发生变化（新增/删除文件、锁、期限等）一律拒绝（409）；保留锁未到期、运行中作业与复核期限未满的结果不得删除。执行先持久化清理计划，再仅在限定数据目录内删除文件并随后删除关联数据库记录；文件缺失按已删处理（幂等），符号链接与越界路径拒绝跟随并记录，部分失败可重试，**服务重启后自动继续**。",
+    "version": "1.7.0"
   },
   "paths": {
     "/healthz": {
@@ -1322,6 +1322,306 @@
                 }
               }
             }
+          }
+        }
+      }
+    },
+    "/api/v1/upload-sessions": {
+      "post": {
+        "tags": [
+          "upload-sessions"
+        ],
+        "summary": "创建断点续传上传会话（声明类型/总字节/整体摘要/策略/关联域）",
+        "description": "网络不稳时不必整包重传：先创建会话，声明 `kind`（ndjson/zip）、`bytes_total`（总字节数）、`content_sha256`（整体 SHA-256）、脱敏策略与**必填** `token_context`（最长 128 字符；断点续传会话必须声明令牌关联域，不提供全局域回退，服务只持久化不可逆域标识）；随后用 `PUT .../chunks` 按 `Content-Range` 乱序提交分片，全部覆盖后调用 `.../complete` 转入对应的脱敏作业。\n\n会话默认 24 小时过期（`expires_in_seconds` 可调，最长 7 天）；除访问时惰性过期外，后台清扫线程按 `REDACTOR_UPLOAD_SWEEP_SECONDS`（默认 60 秒）周期主动清理到期会话的暂存文件。携带 `Idempotency-Key` 时：相同键且**类型、总字节、整体摘要、规范化策略与关联域**五者一致才回放既有会话（200），任一不同返回 **409**；该键在完成时继续绑定转入的流式/诊断包作业。",
+        "operationId": "create_upload_session_api_v1_upload_sessions_post",
+        "parameters": [
+          {
+            "name": "Idempotency-Key",
+            "in": "header",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "description": "同一键只回放声明（类型/总字节/摘要/策略/关联域）一致的会话；完成时该键继续绑定转入的脱敏作业",
+              "title": "Idempotency-Key"
+            },
+            "description": "同一键只回放声明（类型/总字节/摘要/策略/关联域）一致的会话；完成时该键继续绑定转入的脱敏作业"
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/CreateUploadSessionRequest"
+              }
+            }
+          }
+        },
+        "responses": {
+          "201": {
+            "description": "会话已创建，可开始上传分片",
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            }
+          },
+          "200": {
+            "description": "幂等命中，回放既有会话"
+          },
+          "400": {
+            "description": "Idempotency-Key 非法"
+          },
+          "409": {
+            "description": "Idempotency-Key 冲突（同键声明不同）"
+          },
+          "413": {
+            "description": "ZIP 声明大小超过上传上限"
+          },
+          "422": {
+            "description": "策略非法、摘要格式非法或 token_context 超长"
+          }
+        }
+      }
+    },
+    "/api/v1/upload-sessions/{session_id}": {
+      "get": {
+        "tags": [
+          "upload-sessions"
+        ],
+        "summary": "上传会话状态与进度（已收/缺失区间）",
+        "description": "返回会话状态、已接收字节区间（合并相邻后）、仍缺失区间与进度百分比；客户端据此只重传缺失分片。",
+        "operationId": "get_upload_session_api_v1_upload_sessions__session_id__get",
+        "parameters": [
+          {
+            "name": "session_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "title": "Session Id"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/UploadSessionModel"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "会话不存在"
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/upload-sessions/{session_id}/chunks": {
+      "put": {
+        "tags": [
+          "upload-sessions"
+        ],
+        "summary": "按 Content-Range 上传一个分片（可乱序、可幂等重传）",
+        "description": "请求头 `Content-Range: bytes <start>-<end>/<total>` 声明分片区间（`end` 为闭区间，`<total>` 必须等于会话声明的总字节数），请求体为该区间的原始字节；可选 `X-Chunk-SHA256` 声明本分片摘要（不符即 422）。\n\n* 分片以 **0600** 权限流式暂存并 fsync 后才登记索引，服务重启后进度不丢；\n* **相同区间、内容一致**的重传幂等回放（200，`replayed=true`），不重复落盘；\n* 与已登记分片**重叠冲突**、区间**越界**/总长不符、或同区间**摘要不符**一律拒绝（409），**已有分片原样保留**；\n* 会话完成/终止/过期后禁止继续写入（409）。",
+        "operationId": "put_upload_chunk_api_v1_upload_sessions__session_id__chunks_put",
+        "parameters": [
+          {
+            "name": "session_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "title": "Session Id"
+            }
+          },
+          {
+            "name": "Content-Range",
+            "in": "header",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "description": "bytes <start>-<end>/<total>（end 闭区间；total 须等于会话声明总长）",
+              "title": "Content-Range"
+            },
+            "description": "bytes <start>-<end>/<total>（end 闭区间；total 须等于会话声明总长）"
+          },
+          {
+            "name": "X-Chunk-SHA256",
+            "in": "header",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "description": "可选：本分片内容的 SHA-256（64 位 hex），不符即拒绝",
+              "title": "X-Chunk-Sha256"
+            },
+            "description": "可选：本分片内容的 SHA-256（64 位 hex），不符即拒绝"
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "分片已登记（或幂等回放）",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "additionalProperties": true,
+                  "title": "Response Put Upload Chunk Api V1 Upload Sessions  Session Id  Chunks Put"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Content-Range 格式非法或请求体长度与声明不符"
+          },
+          "404": {
+            "description": "会话不存在"
+          },
+          "409": {
+            "description": "区间越界/总长不符、重叠冲突、同区间摘要不符或会话已终态"
+          },
+          "422": {
+            "description": "分片内容与 X-Chunk-SHA256 声明摘要不符"
+          }
+        },
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/octet-stream": {
+              "schema": {
+                "type": "string",
+                "format": "binary",
+                "description": "Content-Range 声明区间的原始字节"
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/upload-sessions/{session_id}/abort": {
+      "post": {
+        "tags": [
+          "upload-sessions"
+        ],
+        "summary": "终止上传会话并清理暂存文件",
+        "description": "终止意图立即生效：会话置为 aborted，暂存文件与分片索引被清理，此后任何分片写入都会被拒绝（409）。重复终止幂等回放（200）。",
+        "operationId": "abort_upload_session_api_v1_upload_sessions__session_id__abort_post",
+        "parameters": [
+          {
+            "name": "session_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "title": "Session Id"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "additionalProperties": true,
+                  "title": "Response Abort Upload Session Api V1 Upload Sessions  Session Id  Abort Post"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "会话不存在"
+          },
+          "409": {
+            "description": "会话已完成/失败/过期，无法终止"
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/upload-sessions/{session_id}/complete": {
+      "post": {
+        "tags": [
+          "upload-sessions"
+        ],
+        "summary": "完成上传会话：校验完整性并转入脱敏作业",
+        "description": "完成必须满足：分片恰好覆盖 `[0, bytes_total)` 全部字节，且整体 SHA-256 与创建时声明一致；不满足返回 409（会话保持 uploading，已登记分片保留，可补齐或修正后重试）。\n\n校验通过后：NDJSON 转入既有流式作业，ZIP 先过原有安全检查（不通过则会话置 failed、清理暂存并返回 422 及全部原因）再转入诊断包作业；策略、令牌关联域与 Idempotency-Key 全部沿用创建时的声明（同键已有一致作业时回放该作业，不同则 409）。完成后会话禁止继续写入，重复完成幂等回放（200）。",
+        "operationId": "complete_upload_session_api_v1_upload_sessions__session_id__complete_post",
+        "parameters": [
+          {
+            "name": "session_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "title": "Session Id"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "幂等命中：会话已完成或同键作业已存在",
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            }
+          },
+          "201": {
+            "description": "已转入脱敏作业（流式/诊断包）"
+          },
+          "404": {
+            "description": "会话不存在"
+          },
+          "409": {
+            "description": "未覆盖全部字节、整体摘要不符、幂等冲突或会话已终态"
+          },
+          "422": {
+            "description": "ZIP 未通过安全校验（会话置 failed 并清理暂存）"
           }
         }
       }
@@ -2772,6 +3072,36 @@
         ],
         "title": "Body_create_stream_job_api_v1_stream_jobs_post"
       },
+      "ByteRange": {
+        "properties": {
+          "start": {
+            "type": "integer",
+            "minimum": 0.0,
+            "title": "Start",
+            "description": "区间起点（含）"
+          },
+          "end": {
+            "type": "integer",
+            "minimum": 0.0,
+            "title": "End",
+            "description": "区间终点（不含）"
+          },
+          "bytes": {
+            "type": "integer",
+            "minimum": 0.0,
+            "title": "Bytes",
+            "description": "区间长度（end - start）"
+          }
+        },
+        "type": "object",
+        "required": [
+          "start",
+          "end",
+          "bytes"
+        ],
+        "title": "ByteRange",
+        "description": "一段字节区间（``end`` 为开区间）。"
+      },
       "CleanupExecuteRequest": {
         "properties": {
           "preview_id": {
@@ -3229,6 +3559,78 @@
           "expires_at"
         ],
         "title": "CreateRetentionLockRequest"
+      },
+      "CreateUploadSessionRequest": {
+        "properties": {
+          "kind": {
+            "type": "string",
+            "enum": [
+              "ndjson",
+              "zip"
+            ],
+            "title": "Kind",
+            "description": "文件类型：ndjson=NDJSON 日志（转入流式作业）；zip=ZIP 诊断包（完成时经安全校验后转入诊断包作业）"
+          },
+          "bytes_total": {
+            "type": "integer",
+            "minimum": 1.0,
+            "title": "Bytes Total",
+            "description": "文件总字节数；分片 Content-Range 的总长必须与此一致"
+          },
+          "content_sha256": {
+            "type": "string",
+            "title": "Content Sha256",
+            "description": "整个文件的 SHA-256（64 位小写 hex）；完成时逐字节校验"
+          },
+          "strategy": {
+            "$ref": "#/components/schemas/Strategy",
+            "description": "脱敏策略（与小批量接口同一结构）"
+          },
+          "source_filename": {
+            "anyOf": [
+              {
+                "type": "string",
+                "maxLength": 256
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Source Filename",
+            "description": "原始文件名（仅展示用）；缺省按类型取 upload.ndjson / bundle.zip"
+          },
+          "token_context": {
+            "type": "string",
+            "maxLength": 128,
+            "minLength": 1,
+            "title": "Token Context",
+            "description": "令牌关联域上下文（**必填**，最长 128 字符）。断点续传会话必须声明隔离域，不提供全局域回退：服务只持久化不可逆域标识（域指纹），不保存本字段原文；完成会话转入作业时沿用该关联域。"
+          },
+          "expires_in_seconds": {
+            "anyOf": [
+              {
+                "type": "integer",
+                "maximum": 604800.0,
+                "minimum": 60.0
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Expires In Seconds",
+            "description": "会话有效期（秒），默认 86400（24 小时），最长 7 天；过期会话的暂存文件被清理且不再接受分片"
+          }
+        },
+        "type": "object",
+        "required": [
+          "kind",
+          "bytes_total",
+          "content_sha256",
+          "strategy",
+          "token_context"
+        ],
+        "title": "CreateUploadSessionRequest",
+        "description": "创建断点续传上传会话：声明文件类型、总字节数、整体 SHA-256、策略与关联域。\n\n创建后客户端用 ``Content-Range`` 乱序提交分片，全部字节覆盖且整体摘要\n校验通过后才能完成并转入对应的脱敏作业。"
       },
       "DiffCheck": {
         "properties": {
@@ -4609,6 +5011,181 @@
         ],
         "title": "TypeChangeItem",
         "description": "同一叶子输出值的 JSON 类型变化（只记录类型名，不记录值）。"
+      },
+      "UploadSessionModel": {
+        "properties": {
+          "id": {
+            "type": "string",
+            "title": "Id"
+          },
+          "idempotency_key": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Idempotency Key"
+          },
+          "created_at": {
+            "type": "string",
+            "title": "Created At"
+          },
+          "updated_at": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Updated At"
+          },
+          "status": {
+            "type": "string",
+            "enum": [
+              "uploading",
+              "completed",
+              "aborted",
+              "expired",
+              "failed"
+            ],
+            "title": "Status",
+            "description": "uploading=接收分片中；completed=已完成并转入作业（禁止再写）；aborted=已终止；expired=已过期；failed=完成校验失败（如 ZIP 安全校验）"
+          },
+          "kind": {
+            "type": "string",
+            "enum": [
+              "ndjson",
+              "zip"
+            ],
+            "title": "Kind"
+          },
+          "source_filename": {
+            "type": "string",
+            "title": "Source Filename"
+          },
+          "bytes_total": {
+            "type": "integer",
+            "title": "Bytes Total",
+            "description": "创建时声明的文件总字节数"
+          },
+          "bytes_received": {
+            "type": "integer",
+            "title": "Bytes Received",
+            "description": "已索引分片覆盖的字节数（去重后）"
+          },
+          "content_sha256": {
+            "type": "string",
+            "title": "Content Sha256",
+            "description": "创建时声明的整体 SHA-256"
+          },
+          "strategy_name": {
+            "type": "string",
+            "title": "Strategy Name"
+          },
+          "strategy_version": {
+            "type": "string",
+            "title": "Strategy Version"
+          },
+          "strategy_sha256": {
+            "type": "string",
+            "title": "Strategy Sha256",
+            "description": "规范化策略 SHA-256，参与幂等一致性判定"
+          },
+          "key_fingerprint": {
+            "type": "string",
+            "title": "Key Fingerprint"
+          },
+          "domain_fingerprint": {
+            "type": "string",
+            "title": "Domain Fingerprint",
+            "description": "令牌关联域指纹：global=全局映射；dom:<hex>=隔离域",
+            "default": "global"
+          },
+          "expires_at": {
+            "type": "string",
+            "title": "Expires At",
+            "description": "会话过期时间（UTC ISO 8601）"
+          },
+          "received_ranges": {
+            "items": {
+              "$ref": "#/components/schemas/ByteRange"
+            },
+            "type": "array",
+            "title": "Received Ranges",
+            "description": "已接收并索引的字节区间（合并相邻后）"
+          },
+          "missing_ranges": {
+            "items": {
+              "$ref": "#/components/schemas/ByteRange"
+            },
+            "type": "array",
+            "title": "Missing Ranges",
+            "description": "仍缺失的字节区间（完成前必须补齐）"
+          },
+          "progress_pct": {
+            "type": "number",
+            "title": "Progress Pct",
+            "default": 0.0
+          },
+          "job_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Job Id",
+            "description": "完成会话后转入的流式/诊断包作业 id"
+          },
+          "job_url": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Job Url",
+            "description": "转入作业的查询地址"
+          },
+          "error_message": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Error Message"
+          }
+        },
+        "type": "object",
+        "required": [
+          "id",
+          "created_at",
+          "status",
+          "kind",
+          "source_filename",
+          "bytes_total",
+          "bytes_received",
+          "content_sha256",
+          "strategy_name",
+          "strategy_version",
+          "strategy_sha256",
+          "key_fingerprint",
+          "expires_at"
+        ],
+        "title": "UploadSessionModel",
+        "description": "断点续传上传会话的状态与进度（不含任何文件内容）。"
       },
       "UpsertRetentionRuleRequest": {
         "properties": {

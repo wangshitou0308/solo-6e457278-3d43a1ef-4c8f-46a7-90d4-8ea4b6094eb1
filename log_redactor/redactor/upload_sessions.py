@@ -3,7 +3,8 @@
 设计要点
 --------
 * 创建会话时声明文件类型（ndjson/zip）、总字节数、整体 SHA-256、脱敏策略与
-  令牌关联域上下文；服务只持久化**不可逆域标识**，不保存上下文原文。
+  **必填**的令牌关联域上下文（不提供全局域回退）；服务只持久化**不可逆域标识**，
+  不保存上下文原文。
 * 分片经 ``Content-Range: bytes <start>-<end>/<total>`` 乱序提交，逐块流式
   写入 ``uploads/{session_id}.part``（**0600** 权限），不以整包进内存；
   每片落盘并 fsync 后才在 ``upload_chunks`` 索引登记 (start, end, sha256)，
@@ -13,8 +14,9 @@
 * 完成时要求分片恰好覆盖 ``[0, bytes_total)`` 且整体 SHA-256 与声明一致；
   NDJSON 直接转入既有流式作业，ZIP 先过原有安全校验再转入诊断包作业，
   策略、令牌关联域与 Idempotency-Key 全部沿用会话创建时的声明。
-* 会话有有效期（默认 24 小时）；过期/终止/失败时清理暂存文件与分片索引，
-  完成后禁止继续写入。
+* 会话有有效期（默认 24 小时）；除访问时惰性过期外，后台清扫线程按
+  ``REDACTOR_UPLOAD_SWEEP_SECONDS``（默认 60 秒）周期主动清理到期会话的
+  暂存文件与分片索引；终止/失败同样立即清理，完成后禁止继续写入。
 """
 from __future__ import annotations
 
@@ -216,24 +218,39 @@ def reset_session_locks() -> None:
 
 
 def session_to_model(row, db: Database) -> dict[str, Any]:
-    """把 upload_sessions 行 + 分片索引组装成 API 视图（不含任何文件内容）。"""
+    """把 upload_sessions 行 + 分片索引组装成 API 视图（不含任何文件内容）。
+
+    进度三要素（bytes_received / received_ranges / missing_ranges）与
+    progress_pct 必须自洽：completed 表示全部字节已接收并转入作业；
+    其他终态（aborted/expired/failed）暂存已清理，已收区间为空。
+    """
     import json as _json
 
     from .models import ByteRange
 
     session_id = row["id"]
     bytes_total = int(row["bytes_total"])
-    chunks = db.upload_chunks(session_id) if row["status"] == "uploading" else []
-    merged = merge_ranges([(int(c["start"]), int(c["end"])) for c in chunks])
-    received = sum(end - start for start, end in merged)
-    gaps = missing_ranges(bytes_total, merged)
-    strategy = _json.loads(row["strategy_json"] or "{}")
     status = row["status"]
+    if status == "uploading":
+        chunks = db.upload_chunks(session_id)
+        merged = merge_ranges([(int(c["start"]), int(c["end"])) for c in chunks])
+        received = sum(end - start for start, end in merged)
+        gaps = missing_ranges(bytes_total, merged)
+    elif status == "completed":
+        merged = [(0, bytes_total)]
+        received = bytes_total
+        gaps = []
+    else:  # aborted / expired / failed：暂存已清理，无已收区间
+        merged = []
+        received = 0
+        gaps = []
+    strategy = _json.loads(row["strategy_json"] or "{}")
     job_id = row["job_id"]
     job_kind = "stream-jobs" if row["kind"] == "ndjson" else "bundle-jobs"
-    pct = round(received * 100.0 / bytes_total, 2) if bytes_total else 0.0
     if status == "completed":
         pct = 100.0
+    else:
+        pct = round(received * 100.0 / bytes_total, 2) if bytes_total else 0.0
     return {
         "id": session_id,
         "idempotency_key": row["idempotency_key"],
@@ -276,6 +293,63 @@ def sweep_expired_sessions(db: Database) -> list[str]:
     return expired_ids
 
 
+# ---------- 后台主动清扫（运行期间定期清理到期会话） ----------
+
+
+def sweep_interval_seconds() -> int:
+    """后台清扫周期（秒）：``REDACTOR_UPLOAD_SWEEP_SECONDS``，默认 60。"""
+    raw = os.environ.get("REDACTOR_UPLOAD_SWEEP_SECONDS", "60")
+    try:
+        value = int(raw)
+    except ValueError:
+        value = 60
+    return max(1, min(value, 3600))
+
+
+_sweeper_lock = threading.Lock()
+_sweeper_thread: threading.Thread | None = None
+_sweeper_stop: threading.Event | None = None
+
+
+def start_sweeper(get_db: Callable[[], Database]) -> None:
+    """启动后台清扫线程：周期性清理到期会话，不依赖客户端再访问。
+
+    幂等：线程存活时不重复启动；线程为 daemon，进程退出即终止。
+    """
+    global _sweeper_thread, _sweeper_stop
+    with _sweeper_lock:
+        if _sweeper_thread is not None and _sweeper_thread.is_alive():
+            return
+        stop = threading.Event()
+        _sweeper_stop = stop
+
+        def _loop() -> None:
+            while not stop.wait(sweep_interval_seconds()):
+                try:
+                    sweep_expired_sessions(get_db())
+                except Exception:
+                    pass  # 清理失败不影响服务，下一周期重试
+
+        _sweeper_thread = threading.Thread(
+            target=_loop, name="upload-session-sweeper", daemon=True
+        )
+        _sweeper_thread.start()
+
+
+def stop_sweeper() -> None:
+    """停止后台清扫线程（测试辅助/进程退出）。"""
+    global _sweeper_thread, _sweeper_stop
+    with _sweeper_lock:
+        stop = _sweeper_stop
+        _sweeper_stop = None
+        thread = _sweeper_thread
+        _sweeper_thread = None
+    if stop is not None:
+        stop.set()
+    if thread is not None:
+        thread.join(timeout=5)
+
+
 def abort_session(db: Database, session_id: str, *, status: str = "aborted",
                   error_message: str | None = None) -> None:
     """终止会话（abort/expired/failed 共用）：置终态、清暂存、清索引。"""
@@ -291,12 +365,15 @@ _recovery_done = False
 
 
 def recover_upload_sessions(get_db: Callable[[], Database]) -> None:
-    """服务启动后恢复上传会话：过期清理、孤儿文件清扫、索引与暂存文件对账。
+    """服务启动后恢复上传会话：过期清理、孤儿文件清扫、索引与暂存文件对账，
+    并启动后台清扫线程在运行期间持续清理到期会话。
 
     * 已过期的 uploading 会话置为 expired 并清理暂存；
     * 暂存文件丢失/小于已登记最大终点的会话，分片索引不可信：清空索引让
       客户端重传（已登记分片必然 fsync 过，正常重启不会走到这里）；
-    * 没有会话记录的孤儿 ``.part``/临时文件直接删除。
+    * 没有会话记录的孤儿 ``.part``/临时文件直接删除；
+    * 后台清扫线程按 ``REDACTOR_UPLOAD_SWEEP_SECONDS``（默认 60 秒）周期
+      清理到期会话，不依赖客户端再次访问。
 
     幂等：只执行一次；测试通过 :func:`reset_upload_recovery` 重置。
     """
@@ -327,13 +404,15 @@ def recover_upload_sessions(get_db: Callable[[], Database]) -> None:
             path.unlink(missing_ok=True)
     for path in uploads_dir().glob(f"{_TMP_PREFIX}*"):
         path.unlink(missing_ok=True)
+    start_sweeper(get_db)
 
 
 def reset_upload_recovery() -> None:
-    """测试辅助：允许再次触发恢复扫描。"""
+    """测试辅助：允许再次触发恢复扫描，并停止后台清扫线程。"""
     global _recovery_done
     with _recovery_lock:
         _recovery_done = False
+    stop_sweeper()
 
 
 def link_or_copy_staged(staged: Path, target: Path) -> None:

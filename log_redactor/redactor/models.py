@@ -660,13 +660,13 @@ class CreateUploadSessionRequest(BaseModel):
         max_length=256,
         description="原始文件名（仅展示用）；缺省按类型取 upload.ndjson / bundle.zip",
     )
-    token_context: str | None = Field(
-        default=None,
+    token_context: str = Field(
+        min_length=1,
         max_length=MAX_TOKEN_CONTEXT,
         description=(
-            "令牌关联域上下文（最长 128 字符）。只持久化不可逆域标识（域指纹），"
+            "令牌关联域上下文（**必填**，最长 128 字符）。断点续传会话必须声明"
+            "隔离域，不提供全局域回退：服务只持久化不可逆域标识（域指纹），"
             "不保存本字段原文；完成会话转入作业时沿用该关联域。"
-            "未传（或纯空白）时沿用全局映射。"
         ),
     )
     expires_in_seconds: int | None = Field(
@@ -686,11 +686,11 @@ class CreateUploadSessionRequest(BaseModel):
 
     @field_validator("token_context")
     @classmethod
-    def _normalize_token_context(cls, v: str | None) -> str | None:
-        if v is None:
-            return None
+    def _normalize_token_context(cls, v: str) -> str:
         v = v.strip()
-        return v or None
+        if not v:
+            raise ValueError("token_context 不能为空（断点续传会话必须声明令牌关联域）")
+        return v
 
 
 class ByteRange(BaseModel):

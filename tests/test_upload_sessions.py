@@ -42,15 +42,14 @@ def _sha(data: bytes) -> str:
 
 
 def _create(client, content: bytes, *, kind="ndjson", key=None, strategy=None,
-            token_context=None, filename=None, expires_in=None):
+            token_context="incident-test", filename=None, expires_in=None):
     body = {
         "kind": kind,
         "bytes_total": len(content),
         "content_sha256": _sha(content),
         "strategy": strategy or SAMPLE_STRATEGY,
+        "token_context": token_context,
     }
-    if token_context is not None:
-        body["token_context"] = token_context
     if filename is not None:
         body["source_filename"] = filename
     if expires_in is not None:
@@ -129,43 +128,63 @@ def test_create_session_declares_metadata(client):
 
 def test_create_session_validation(client):
     content = b'{"a": 1}\n'
+    base = {"kind": "ndjson", "bytes_total": 10, "content_sha256": _sha(content),
+            "strategy": SAMPLE_STRATEGY, "token_context": "incident-test"}
     # 摘要格式非法
-    r = client.post("/api/v1/upload-sessions", json={
-        "kind": "ndjson", "bytes_total": 10, "content_sha256": "not-a-sha",
-        "strategy": SAMPLE_STRATEGY})
+    r = client.post("/api/v1/upload-sessions",
+                    json={**base, "content_sha256": "not-a-sha"})
     assert r.status_code == 422
     # 总字节数非法
-    r = client.post("/api/v1/upload-sessions", json={
-        "kind": "ndjson", "bytes_total": 0, "content_sha256": _sha(content),
-        "strategy": SAMPLE_STRATEGY})
+    r = client.post("/api/v1/upload-sessions", json={**base, "bytes_total": 0})
     assert r.status_code == 422
     # 策略非法（未知识别器）
     r = client.post("/api/v1/upload-sessions", json={
-        "kind": "ndjson", "bytes_total": 10, "content_sha256": _sha(content),
+        **base,
         "strategy": {"name": "x", "rules": [
             {"id": "r1", "name": "n", "match": {"detectors": ["nope"]},
              "action": "mask"}]}})
     assert r.status_code == 422
     # token_context 超长
-    r = client.post("/api/v1/upload-sessions", json={
-        "kind": "ndjson", "bytes_total": 10, "content_sha256": _sha(content),
-        "strategy": SAMPLE_STRATEGY, "token_context": "x" * 129})
+    r = client.post("/api/v1/upload-sessions",
+                    json={**base, "token_context": "x" * 129})
     assert r.status_code == 422
     # kind 非法
-    r = client.post("/api/v1/upload-sessions", json={
-        "kind": "txt", "bytes_total": 10, "content_sha256": _sha(content),
-        "strategy": SAMPLE_STRATEGY})
+    r = client.post("/api/v1/upload-sessions", json={**base, "kind": "txt"})
     assert r.status_code == 422
     # Idempotency-Key 超长
     r = _create(client, content, key="k" * 129)
     assert r.status_code == 400
 
 
+def test_create_requires_token_context(client):
+    """创建契约：token_context 必填，省略或纯空白一律 422，不会落到全局域。"""
+    content = b'{"a": 1}\n'
+    body = {"kind": "ndjson", "bytes_total": len(content),
+            "content_sha256": _sha(content), "strategy": SAMPLE_STRATEGY}
+    # 省略 token_context
+    r = client.post("/api/v1/upload-sessions", json=body)
+    assert r.status_code == 422
+    # 显式 null
+    r = client.post("/api/v1/upload-sessions",
+                    json={**body, "token_context": None})
+    assert r.status_code == 422
+    # 空串 / 纯空白
+    r = client.post("/api/v1/upload-sessions", json={**body, "token_context": ""})
+    assert r.status_code == 422
+    r = client.post("/api/v1/upload-sessions", json={**body, "token_context": "   "})
+    assert r.status_code == 422
+    # 提供后正常创建，且域指纹必为隔离域（绝不出现 global）
+    r = client.post("/api/v1/upload-sessions",
+                    json={**body, "token_context": "incident-required"})
+    assert r.status_code == 201
+    assert r.json()["session"]["domain_fingerprint"].startswith("dom:")
+
+
 def test_create_zip_session_over_cap_rejected(client, monkeypatch):
     monkeypatch.setenv("REDACTOR_BUNDLE_MAX_TOTAL_BYTES", "1024")
     r = client.post("/api/v1/upload-sessions", json={
         "kind": "zip", "bytes_total": 2048, "content_sha256": _sha(b"x" * 2048),
-        "strategy": SAMPLE_STRATEGY})
+        "strategy": SAMPLE_STRATEGY, "token_context": "incident-test"})
     assert r.status_code == 413
 
 
@@ -195,14 +214,15 @@ def test_create_conflicts_with_existing_job_key(client):
     """键已被既有流式作业占用且内容不同：创建会话即 409（快速失败）。"""
     content = sample_ndjson().encode()
     files = {"file": ("logs.ndjson", content, "application/x-ndjson")}
-    data = {"strategy": json.dumps(SAMPLE_STRATEGY)}
+    data = {"strategy": json.dumps(SAMPLE_STRATEGY),
+            "token_context": "incident-test"}
     r = client.post("/api/v1/stream-jobs", files=files, data=data,
                     headers={"Idempotency-Key": "job-key-1"})
     assert r.status_code == 202
     # 同键不同内容 → 409
     r = _create(client, content + b"\n", key="job-key-1")
     assert r.status_code == 409
-    # 同键同内容同策略 → 允许创建（完成时回放到既有作业）
+    # 同键同内容同策略同关联域 → 允许创建（完成时回放到既有作业）
     r = _create(client, content, key="job-key-1")
     assert r.status_code == 201
 
@@ -390,6 +410,39 @@ def test_complete_ndjson_hands_off_to_stream_job(client, isolated_data):
     assert r.json()["job"]["id"] == job["id"]
 
 
+def test_completed_session_progress_is_consistent(client):
+    """完成态会话的进度三要素与 100% 自洽：字节数、已收区间、缺失区间一致。"""
+    content = sample_ndjson().encode()
+    n = len(content)
+    sid = _create(client, content).json()["session"]["id"]
+    _upload_all(client, sid, content)
+    r = client.post(f"/api/v1/upload-sessions/{sid}/complete")
+    assert r.status_code == 201
+    _wait_job(client, "stream-jobs", r.json()["job"]["id"])
+
+    s = client.get(f"/api/v1/upload-sessions/{sid}").json()
+    assert s["status"] == "completed"
+    assert s["progress_pct"] == 100.0
+    # 与 100% 一致：已收字节=总字节、已收区间覆盖整包、缺失区间为空
+    assert s["bytes_received"] == n
+    assert s["received_ranges"] == [{"start": 0, "end": n, "bytes": n}]
+    assert s["missing_ranges"] == []
+
+
+def test_terminal_session_progress_is_zeroed(client):
+    """终止/失败终态：暂存已清理，进度视图归零且不再显示缺失区间。"""
+    content = sample_ndjson().encode()
+    sid = _create(client, content).json()["session"]["id"]
+    _put(client, sid, content[:100], 0, total=len(content))
+    client.post(f"/api/v1/upload-sessions/{sid}/abort")
+    s = client.get(f"/api/v1/upload-sessions/{sid}").json()
+    assert s["status"] == "aborted"
+    assert s["bytes_received"] == 0
+    assert s["received_ranges"] == []
+    assert s["missing_ranges"] == []
+    assert s["progress_pct"] == 0.0
+
+
 def test_complete_requires_full_coverage(client):
     content = sample_ndjson().encode()
     sid = _create(client, content).json()["session"]["id"]
@@ -414,6 +467,7 @@ def test_complete_overall_digest_mismatch_keeps_chunks(client):
         "bytes_total": len(content),
         "content_sha256": _sha(b"different-content"),
         "strategy": SAMPLE_STRATEGY,
+        "token_context": "incident-test",
     }
     sid = client.post("/api/v1/upload-sessions", json=body).json()["session"]["id"]
     _put(client, sid, content, 0, total=len(content))
@@ -430,7 +484,8 @@ def test_complete_replays_to_existing_job_with_same_key(client):
     """同键作业已存在且声明一致：完成不新建作业，会话指向既有作业。"""
     content = sample_ndjson().encode()
     files = {"file": ("logs.ndjson", content, "application/x-ndjson")}
-    data = {"strategy": json.dumps(SAMPLE_STRATEGY)}
+    data = {"strategy": json.dumps(SAMPLE_STRATEGY),
+            "token_context": "incident-test"}
     r = client.post("/api/v1/stream-jobs", files=files, data=data,
                     headers={"Idempotency-Key": "shared-key"})
     assert r.status_code == 202
@@ -561,6 +616,35 @@ def test_expired_session_is_swept(client, isolated_data):
     assert client.post(f"/api/v1/upload-sessions/{sid}/complete").status_code == 409
 
 
+def test_sweeper_cleans_expired_sessions_actively(client, isolated_data, monkeypatch):
+    """后台清扫线程：会话到期后即使不再访问，暂存文件也会被主动清理。"""
+    import time
+
+    # 清扫周期 1 秒（须在首个请求触发清扫线程启动之前设置）
+    monkeypatch.setenv("REDACTOR_UPLOAD_SWEEP_SECONDS", "1")
+    content = sample_ndjson().encode()
+    sid = _create(client, content, expires_in=60).json()["session"]["id"]
+    _put(client, sid, content[:50], 0, total=len(content))
+    staged = isolated_data["data_dir"] / "uploads" / f"{sid}.part"
+    assert staged.exists()
+
+    # 把过期时间拨到过去，此后不再访问任何会话接口
+    from redactor import app as app_mod
+    app_mod.get_db()._conn().execute(
+        "UPDATE upload_sessions SET expires_at='2000-01-01T00:00:00+00:00' "
+        "WHERE id=?", (sid,),
+    ).connection.commit()
+
+    # 不访问任何接口，等待后台线程主动清理（证明不依赖惰性过期）
+    deadline = time.time() + 10
+    while staged.exists() and time.time() < deadline:
+        time.sleep(0.1)
+    assert not staged.exists()
+    # 会话已被置为 expired（数据库状态，非访问触发）
+    row = app_mod.get_db().get_upload_session(sid)
+    assert row["status"] == "expired"
+
+
 # ---------- 重启恢复 ----------
 
 
@@ -642,11 +726,12 @@ def test_completed_session_key_blocks_conflicting_job_upload(client):
     _wait_job(client, "stream-jobs", r.json()["job"]["id"])
 
     files = {"file": ("logs.ndjson", content + b"\n", "application/x-ndjson")}
-    data = {"strategy": json.dumps(SAMPLE_STRATEGY)}
+    data = {"strategy": json.dumps(SAMPLE_STRATEGY),
+            "token_context": "incident-test"}
     r = client.post("/api/v1/stream-jobs", files=files, data=data,
                     headers={"Idempotency-Key": "cross-check-1"})
     assert r.status_code == 409
-    # 同键同内容同策略：回放既有作业
+    # 同键同内容同策略同关联域：回放既有作业
     files = {"file": ("logs.ndjson", content, "application/x-ndjson")}
     r = client.post("/api/v1/stream-jobs", files=files, data=data,
                     headers={"Idempotency-Key": "cross-check-1"})

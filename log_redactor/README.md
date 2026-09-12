@@ -28,6 +28,7 @@
 | 需复核 | 处理后仍被高风险识别器命中的内容写入风险清单，作业 `needs_review=true` |
 | 幂等 | 请求头 `Idempotency-Key` 相同的重复提交直接回放首个作业；回放要求**内容、规范化策略与令牌关联域三者均一致**，任一不同返回 409 |
 | 大批量流式作业 | `POST /api/v1/stream-jobs` 以 multipart 上传 NDJSON 大文件：原始文件 **0600 临时落盘**、逐行脱敏（不读入整包）、安全检查点记录字节/记录/审计/风险进度，可取消、可在**重启后从检查点继续**，成功后原子发布结果；幂等键同时校验文件内容**与策略**摘要 |
+| 断点续传上传会话 | `POST /api/v1/upload-sessions` 声明式创建会话（类型/总字节/整体 SHA-256/策略/必填关联域），`PUT .../chunks` 按 `Content-Range` 乱序分片上传：0600 暂存、逐片 SHA-256 索引、相同区间幂等回放、重叠/越界/摘要不符拒绝且保留分片、重启后恢复、后台线程主动清理到期会话；完成后 NDJSON 转入流式作业、ZIP 经安全检查转入诊断包作业 |
 | 试运行 | `POST /strategies/validate` 即时返回脱敏结果，不写库、不落文件 |
 | 数据保留与安全清理 | 策略/锁/预览/执行/进度/审计全套接口（见下节）；预览不返回任何日志内容，目标变化拒绝执行，符号链接/越界路径拒绝删除，可重试、可在重启后续跑 |
 
@@ -133,6 +134,11 @@ print(json.dumps(json.load(r),ensure_ascii=False,indent=2))'
 | `POST /api/v1/stream-jobs/{id}/cancel` | 取消作业；停在检查点边界，原始文件与未完成输出被清理（取消意图跨重启生效） |
 | `GET /api/v1/stream-jobs/{id}/audit` / `.../risks` | 分页查询审计清单 / 残留风险（`limit`、`offset`） |
 | `GET /api/v1/stream-jobs/{id}/download` | 下载原子发布的 NDJSON 结果；**仅 succeeded 可下载**，未完成返回 409 |
+| `POST /api/v1/upload-sessions` | **断点续传**：创建上传会话（`kind`/`bytes_total`/`content_sha256`/`strategy`/必填 `token_context`，可带 `Idempotency-Key`） |
+| `PUT /api/v1/upload-sessions/{id}/chunks` | 按 `Content-Range` 上传分片（可乱序、可幂等重传，可选 `X-Chunk-SHA256` 逐片摘要） |
+| `GET /api/v1/upload-sessions/{id}` | 上传进度：已收/缺失字节区间、百分比、状态与转入作业 id |
+| `POST /api/v1/upload-sessions/{id}/abort` | 终止会话并清理暂存文件（幂等） |
+| `POST /api/v1/upload-sessions/{id}/complete` | 校验全覆盖+整体摘要后转入流式/诊断包作业；重复完成幂等回放 |
 | `GET /api/v1/sample/strategy` / `.../sample/logs.ndjson` | 可直接启动的示例 |
 | `GET /healthz` | 健康检查 + 主密钥指纹 |
 
@@ -230,6 +236,65 @@ with open("redacted.ndjson", "wb") as out:
   **令牌关联域标识**；同键但文件、策略或关联域任一不同返回 409，不会回放旧策略/旧域的结果
   （仅 JSON 排版差异不算不同策略）。
 - **格式错误**：记录物理行号（空行占行号不占记录序号），作业置 failed，错误行不写入输出。
+
+## 断点续传上传会话（Content-Range 分片）
+
+网络不稳时，NDJSON 与 ZIP 诊断包不必整包重传：先创建**上传会话**声明文件元数据，
+再按 `Content-Range` 乱序提交分片，全部覆盖后一次性转入对应的脱敏作业。
+
+```bash
+# 1) 创建会话：声明类型、总字节数、整体 SHA-256、策略与必填的 token_context
+#    （断点续传会话必须声明令牌关联域，不提供全局域回退）
+curl -sS -X POST http://127.0.0.1:8080/api/v1/upload-sessions \
+  -H 'Content-Type: application/json' \
+  -H 'Idempotency-Key: incident-20260912-big-001' \
+  -d '{"kind":"ndjson","bytes_total":'"$(wc -c < big-logs.ndjson)"',
+       "content_sha256":"'"$(sha256sum big-logs.ndjson | cut -d' ' -f1)"'",
+       "strategy":'"$(cat examples/sample-strategy.json)"',
+       "token_context":"incident-20260912-big-001"}'
+# -> 201 {"replayed": false, "session": {"id": "…", "status": "uploading",
+#     "missing_ranges": [{"start":0,"end":N,"bytes":N}], …}}
+
+# 2) 乱序上传分片（end 为闭区间；可选 X-Chunk-SHA256 逐片摘要）
+curl -sS -X PUT "http://127.0.0.1:8080/api/v1/upload-sessions/$SID/chunks" \
+  -H "Content-Range: bytes 0-1048575/$SIZE" \
+  -H "X-Chunk-SHA256: <该片 SHA-256>" \
+  --data-binary @chunk-000.bin
+# 相同区间内容一致的重传 -> 200 replayed=true（幂等回放）；
+# 重叠冲突 / 越界 / 摘要不符 -> 409/422，已有分片原样保留
+
+# 3) 查询进度：只补传 missing_ranges 里的缺失区间
+curl -sS "http://127.0.0.1:8080/api/v1/upload-sessions/$SID"
+
+# 4) 完成：校验全覆盖 + 整体 SHA-256，NDJSON 转入流式作业、ZIP 先过安全检查
+curl -sS -X POST "http://127.0.0.1:8080/api/v1/upload-sessions/$SID/complete"
+# -> 201 {"replayed": false, "session": {…,"status":"completed"}, "job": {…}}
+# 之后按普通流式/诊断包作业轮询与下载
+
+# 5) 中途放弃：终止会话并清理暂存
+curl -sS -X POST "http://127.0.0.1:8080/api/v1/upload-sessions/$SID/abort"
+```
+
+关键保证：
+
+- **分片落盘即索引**：每片流式写入 `$REDACTOR_DATA_DIR/uploads/{id}.part`（0600），
+  fsync 后才登记 `(start, end, sha256)` 索引——已登记分片必然已在盘上，
+  **服务重启后凭索引直接恢复进度**，客户端只补传缺失区间。
+- **幂等与冲突**：相同区间、内容一致的重传幂等回放；区间重叠、越界/总长不符、
+  同区间内容或声明摘要不符一律拒绝（409/422），**已登记分片不受影响**。
+- **完成校验**：分片必须恰好覆盖 `[0, bytes_total)` 且整体 SHA-256 与声明一致，
+  否则 409（分片保留，可补齐后重试）；ZIP 在完成时过原有安全校验，不通过则会话
+  置 failed 并清理暂存。完成后会话禁止继续写入，重复完成幂等回放。
+- **生命周期**：会话默认 24 小时过期（`expires_in_seconds` 可调，最长 7 天）；
+  除访问时惰性过期外，**后台清扫线程**按 `REDACTOR_UPLOAD_SWEEP_SECONDS`
+  （默认 60 秒）周期主动清理到期会话的暂存文件与分片索引。
+- **契约沿用**：策略、令牌关联域（创建时**必填**，只持久化域指纹）与
+  `Idempotency-Key` 全部沿用到转入的作业；同键已有一致作业时完成即回放，不重复处理。
+
+```bash
+bash examples/resumable-upload.sh            # NDJSON 断点续传完整演示
+KIND=zip bash examples/resumable-upload.sh   # ZIP 诊断包断点续传演示
+```
 
 ## 令牌关联域（token_context）
 
@@ -354,6 +419,8 @@ bash examples/retention-cleanup.sh   # 策略→加锁→预览→执行→进�
 | `REDACTOR_DATA_DIR` | `./data` | SQLite、主密钥、脱敏输出文件（`jobs/`）与流式作业临时/成品文件（`streams/raw|partial|out/`）目录 |
 | `REDACTOR_MASTER_KEY` | 自动生成文件 | 确定性令牌主密钥 |
 | `REDACTOR_CHECKPOINT_RECORDS` | `100` | 流式作业每处理多少条记录做一次安全检查点（1–10000） |
+| `REDACTOR_UPLOAD_SESSION_TTL_SECONDS` | `86400` | 断点续传会话默认有效期（秒，60–604800）；到期会话的暂存文件被清理 |
+| `REDACTOR_UPLOAD_SWEEP_SECONDS` | `60` | 后台清扫线程清理到期上传会话的周期（秒，1–3600） |
 
 小批量 JSON 接口请求体上限 10 MiB；**流式 multipart 上传不受此限**（逐块落盘）。
 SQLite 位于 `$REDACTOR_DATA_DIR/redactor.db`，审计/风险表只存位置与动作，不存任何原始敏感值。
