@@ -29,8 +29,8 @@ from __future__ import annotations
 import hashlib
 import json
 import os
-import shutil
 import sqlite3
+import stat
 import threading
 import uuid
 from datetime import datetime, timedelta, timezone
@@ -39,7 +39,7 @@ from typing import Any, Callable, Iterable
 
 from . import config
 from . import bundle_jobs, stream_jobs
-from .database import Database, utcnow_iso
+from .database import Database
 from .models import (
     CleanupPlanModel,
     PlanItemModel,
@@ -71,6 +71,15 @@ RUNNING_STATUSES = ("queued", "running")
 
 # 清理计划在进程内串行执行（删除本就不应并发）
 _cleanup_run_lock = threading.Lock()
+# 每个计划的执行代次：重试/重启恢复时递增，陈旧 worker 线程发现代次落后即退出
+_plan_generation: dict[str, int] = {}
+_plan_threads: dict[str, threading.Thread] = {}
+_threads_lock = threading.Lock()
+
+# 允许的时钟偏差上限：调用方可显式传入 now 做可复现评估，但明显的未来/过去
+# 时间会让“刚完成、仍在保留期内”的作业被提前清理，因此只允许 ±5 分钟偏差，
+# 超出范围一律拒绝（400）。
+MAX_NOW_SKEW = timedelta(minutes=5)
 
 
 # ---------- 时间 ----------
@@ -82,6 +91,28 @@ def _now(now: datetime | None = None) -> datetime:
     if now.tzinfo is None:
         return now.replace(tzinfo=timezone.utc)
     return now.astimezone(timezone.utc)
+
+
+class UnsafePathError(Exception):
+    """符号链接或越出限定数据目录的路径（删除目标本身或其父路径异常）。"""
+
+
+class InvalidNowError(ValueError):
+    """显式传入的评估时间 now 与服务当前时间偏差过大。"""
+
+
+def validate_now(now: datetime | None) -> datetime | None:
+    """规范化显式评估时间并拒绝明显的未来/过去时间（只允许时钟偏差）。"""
+    if now is None:
+        return None
+    value = _now(now)
+    if abs(value - _now()) > MAX_NOW_SKEW:
+        raise InvalidNowError(
+            "评估时间 now 与服务当前时间偏差超过 "
+            f"{int(MAX_NOW_SKEW.total_seconds() // 60)} 分钟；保留期限只能按"
+            "服务当前时间评估，禁止用未来时间提前清理"
+        )
+    return value
 
 
 def parse_iso(value: str | None) -> datetime | None:
@@ -152,12 +183,17 @@ def resolve_rule(
 # ---------- 保留锁 ----------
 
 
-def _lock_state(row: sqlite3.Row, now: datetime) -> str:
-    """active=未释放且未到期；expired=已到期（含到期后由系统标记释放）；released=提前释放。"""
-    expires = parse_iso(row["expires_at"])
-    if row["released_at"]:
-        return "expired" if (expires is not None and expires <= now) else "released"
-    return "active" if (expires is not None and expires > now) else "expired"
+def _lock_state(row: sqlite3.Row) -> str:
+    """锁状态只依据落库列：未释放=active；提前释放=released；到期失效=expired。
+
+    未释放但已到期的锁由 :func:`active_lock` 惰性标记后才出现在 expired 列表，
+    与清理评估使用完全相同的判定，不存在“两套时间”。
+    """
+    keys = row.keys()
+    reason = row["release_reason"] if "release_reason" in keys else ""
+    if not row["released_at"]:
+        return "active"
+    return reason if reason in ("expired", "released") else "released"
 
 
 def lock_row_to_model(row: sqlite3.Row, now: datetime | None = None) -> RetentionLockModel:
@@ -168,7 +204,7 @@ def lock_row_to_model(row: sqlite3.Row, now: datetime | None = None) -> Retentio
         reason=row["reason"],
         expires_at=parse_iso(row["expires_at"]) or current,
         created_at=row["created_at"],
-        state=_lock_state(row, current),
+        state=_lock_state(row),
     )
 
 
@@ -242,31 +278,43 @@ def _receipt(path: Path) -> Path:
     return receipt_path_for_output(path)
 
 
-def _job_files(job_kind: str, job_id: str) -> list[tuple[str, Path]]:
-    """该作业类型所有可能由本服务产生的文件/目录（终态后）。
+def _canonical_files(db: Database, job_kind: str, job_id: str
+                     ) -> list[tuple[str, Path]]:
+    """作业终态后**应当存在**的规范文件集合（缺失也要在结果中留痕）。
 
-    每项 (category, path)：结果、凭证、（残留的）原始输入、半成品输出、
-    诊断包暂存目录。路径全部由服务端按 job_id 构造，调用方无法注入路径。
+    * batch：按数据库记录的真实格式取 result + receipt；
+    * stream/bundle：仅成功终态有 result + receipt；失败/取消终态正常生命周期里
+      已无成品，规范集合为空，只枚举可能残留的临时文件。
     """
     if job_kind == "batch":
-        jobs_dir = config.settings.data_dir / "jobs"
-        # batch 的扩展名由数据库记录决定；两个候选都枚举，存在才计入
-        return [
-            ("result", jobs_dir / f"{job_id}.json"),
-            ("result", jobs_dir / f"{job_id}.ndjson"),
-            ("receipt", _receipt(jobs_dir / f"{job_id}.json")),
-            ("receipt", _receipt(jobs_dir / f"{job_id}.ndjson")),
-        ]
+        row = db.get_job_receipt_source(job_id)
+        if row is None:
+            return []
+        result = config.settings.data_dir / "jobs" / f"{job_id}.{row['format']}"
+        return [("result", result), ("receipt", _receipt(result))]
+    if job_kind == "stream":
+        job = db.get_stream_job(job_id)
+        if job is not None and job.status == "succeeded" and job.output_filename:
+            result = stream_jobs.final_output_path(job_id)
+            return [("result", result), ("receipt", _receipt(result))]
+        return []
+    job = db.get_bundle_job(job_id)
+    if job is not None and job.status == "succeeded" and job.output_filename:
+        result = bundle_jobs.final_output_path(job_id)
+        return [("result", result), ("receipt", _receipt(result))]
+    return []
+
+
+def _residual_files(job_kind: str, job_id: str) -> list[tuple[str, Path]]:
+    """生命周期结束后**不应残留**、但若出现也要随作业清理的临时文件/目录。"""
+    if job_kind == "batch":
+        return []
     if job_kind == "stream":
         return [
-            ("result", stream_jobs.final_output_path(job_id)),
-            ("receipt", _receipt(stream_jobs.final_output_path(job_id))),
             ("raw_input", stream_jobs.raw_path(job_id)),
             ("partial_output", stream_jobs.partial_output_path(job_id)),
         ]
     return [
-        ("result", bundle_jobs.final_output_path(job_id)),
-        ("receipt", _receipt(bundle_jobs.final_output_path(job_id))),
         ("raw_input", bundle_jobs.raw_path(job_id)),
         ("bundle_staging", bundle_jobs.staging_dir(job_id)),
     ]
@@ -281,80 +329,115 @@ def _allowed_roots() -> list[Path]:
     ]
 
 
+def _lexical_within(path: Path, root: Path) -> bool:
+    """不解析任何符号链接的词法包含判断（os.path.realpath 会把链接当成目标，
+    从而让“链接指向界内目标”绕过检查，这里绝不能用它）。"""
+    try:
+        return path == root or path.is_relative_to(root)
+    except OSError:
+        return False
+
+
 def _is_within_roots(path: Path, roots: Iterable[Path]) -> bool:
+    """词法路径是否落在限定目录内；调用方须先用 ``is_symlink`` 拦截链接。"""
+    lexical = Path(os.path.abspath(str(path)))
+    return any(_lexical_within(lexical, r) for r in roots)
+
+
+def _resolved_within_roots(path: Path, roots: Iterable[Path]) -> bool:
+    """删除后对账用：realpath 解析后仍须在界内（防御父目录被替换为链接）。"""
     try:
         target = Path(os.path.realpath(str(path)))
     except OSError:
         return False
-    for root in roots:
-        if target == root or target.is_relative_to(root):
-            return True
-    return False
+    return any(target == r or target.is_relative_to(r) for r in roots)
+
+
+def _entries_for_path(category: str, path: Path, roots: list[Path],
+                      *, canonical: bool) -> list[PreviewFileEntry]:
+    """把单个规范文件/残留文件或暂存目录转换为预览条目（只 stat，不读内容）。"""
+    rel = _rel(path)
+    if category == "bundle_staging":
+        return _staging_entries(path, roots)
+    # 符号链接：预览不跟随，显式标注（执行时快速失败并记录）
+    if path.is_symlink():
+        return [PreviewFileEntry(category=category, path=rel, bytes=0,
+                                 status="present", note="symlink")]
+    if not path.exists():
+        # 规范集合中的文件缺失也要留痕；残留临时文件缺失则忽略（正常状态）
+        if canonical:
+            return [PreviewFileEntry(category=category, path=rel, bytes=0,
+                                     status="missing")]
+        return []
+    if not _is_within_roots(path, roots):
+        return [PreviewFileEntry(category=category, path=rel, bytes=0,
+                                 status="present", note="out_of_tree")]
+    try:
+        size = path.stat().st_size
+    except OSError:
+        size = 0
+    return [PreviewFileEntry(category=category, path=rel, bytes=size,
+                             status="present")]
+
+
+def _staging_entries(path: Path, roots: list[Path]) -> list[PreviewFileEntry]:
+    """诊断包暂存目录：根条目始终存在；内含符号链接/越界路径时标注。"""
+    rel = _rel(path) + "/"
+    if path.is_symlink():
+        return [PreviewFileEntry(category="bundle_staging", path=rel, bytes=0,
+                                 status="present", note="symlink")]
+    if not path.exists():
+        return []  # 暂存目录是残留项，缺失属正常，不产生 missing 噪声
+    total = 0
+    symlink = False
+    refused = False
+    for child in path.rglob("*"):
+        if child.is_symlink():
+            symlink = True
+            continue
+        if not _is_within_roots(child, roots):
+            refused = True
+            continue
+        if child.is_file():
+            try:
+                total += child.stat().st_size
+            except OSError:
+                pass
+    note = ("contains_out_of_tree_path" if refused
+            else "contains_symlink" if symlink else None)
+    return [PreviewFileEntry(category="bundle_staging", path=rel, bytes=total,
+                             status="present", note=note)]
 
 
 def _existing_file_entries(
-    job_kind: str, job_id: str
+    db: Database, job_kind: str, job_id: str
 ) -> list[PreviewFileEntry]:
-    """枚举现存文件（只 stat，不打开内容）；符号链接标记但不跟随。"""
+    """枚举待删文件：规范集合（缺失也记录）+ 现存残留临时文件。绝不读取内容。"""
     roots = _allowed_roots()
     entries: list[PreviewFileEntry] = []
     seen: set[str] = set()
-    for category, path in _job_files(job_kind, job_id):
-        if not path.exists() and not path.is_symlink():
-            continue
-        rel = _rel(path)
-        if rel in seen:  # batch 的 json/ndjson 候选会产生同一凭证路径，去重
-            continue
-        seen.add(rel)
-        if category == "bundle_staging" and path.is_dir() and not path.is_symlink():
-            # 暂存目录：汇总其中普通文件大小（按类别统计，路径只到目录）
-            total = 0
-            symlink = False
-            refused = False
-            for child in path.rglob("*"):
-                if child.is_symlink():
-                    symlink = True
-                    continue
-                if not _is_within_roots(child, roots):
-                    refused = True
-                    continue
-                if child.is_file():
-                    try:
-                        total += child.stat().st_size
-                    except OSError:
-                        pass
-            note = None
-            if refused:
-                note = "contains_out_of_tree_path"
-            elif symlink:
-                note = "contains_symlink"
-            entries.append(PreviewFileEntry(
-                category=category, path=rel + "/", bytes=total, note=note,
-            ))
-            continue
-        if path.is_symlink():
-            # 预览不跟随符号链接：大小记 0，执行时拒绝并记录
-            entries.append(PreviewFileEntry(
-                category=category, path=rel, bytes=0, note="symlink",
-            ))
-            continue
-        if not _is_within_roots(path, roots):
-            entries.append(PreviewFileEntry(
-                category=category, path=rel, bytes=0, note="out_of_tree",
-            ))
-            continue
-        try:
-            size = path.stat().st_size
-        except OSError:
-            size = 0
-        entries.append(PreviewFileEntry(category=category, path=rel, bytes=size))
+
+    def _add(category: str, path: Path, *, canonical: bool) -> None:
+        for entry in _entries_for_path(category, path, roots, canonical=canonical):
+            if entry.path in seen:
+                continue
+            seen.add(entry.path)
+            entries.append(entry)
+
+    for category, path in _canonical_files(db, job_kind, job_id):
+        _add(category, path, canonical=True)
+    for category, path in _residual_files(job_kind, job_id):
+        _add(category, path, canonical=False)
     return entries
 
 
 def _rel(path: Path) -> str:
+    """相对数据目录的**词法**路径：绝不 resolve（那会跟随符号链接，把待删条目
+    伪装成链接目标的路径，进而误删锁定对象）。"""
     try:
-        return str(path.resolve().relative_to(config.settings.data_dir.resolve()))
-    except (OSError, ValueError):
+        base = os.path.abspath(str(config.settings.data_dir))
+        return os.path.relpath(os.path.abspath(str(path)), base)
+    except OSError:
         return path.name
 
 
@@ -406,11 +489,18 @@ def build_preview(
     db: Database, *, job_kinds: tuple[str, ...] | None = None,
     now: datetime | None = None,
 ) -> dict[str, Any]:
-    """计算清理预览：只读取作业元数据与文件 stat，不读取任何文件内容。"""
-    current = _now(now)
+    """计算清理预览：只读取作业元数据与文件 stat，不读取任何文件内容。
+
+    评估时间默认（且通常应当）为服务当前时间；调用方显式传入的 ``now`` 必须在
+    时钟偏差容限内，否则抛 :class:`InvalidNowError`（由接口层转 400）。
+    """
+    current = validate_now(now) or _now()
     kinds = job_kinds or JOB_KINDS
     blocked = {"locked": 0, "retained": 0, "running": 0, "permanent": 0}
     items: list[PreviewItem] = []
+
+    # 与清理评估同一时间基准：先把已到期但未标记的锁统一置为失效
+    db.expire_due_locks(to_iso(current))
 
     # 运行中作业计数（仅针对被扫描类型）
     if "stream" in kinds:
@@ -440,7 +530,7 @@ def build_preview(
         if current < deadline:
             blocked["retained"] += 1
             continue
-        files = _existing_file_entries(job_kind, job_id)
+        files = _existing_file_entries(db, job_kind, job_id)
         items.append(PreviewItem(
             job_kind=job_kind,
             job_id=job_id,
@@ -451,7 +541,7 @@ def build_preview(
             rule_source="builtin" if rule["builtin"] else "custom",
             expired=True,
             files=files,
-            bytes_total=sum(f.bytes for f in files),
+            bytes_total=sum(f.bytes for f in files if f.status == "present"),
         ))
 
     items.sort(key=lambda i: (i.job_kind, i.completed_at, i.job_id))
@@ -476,15 +566,17 @@ def build_preview(
     }
 
 
-def _canonical_files(item: PreviewItem) -> list[list[Any]]:
-    return [[f.category, f.path, f.bytes] for f in sorted(item.files, key=lambda f: f.path)]
+def _file_fingerprint(item: PreviewItem) -> list[list[Any]]:
+    # 文件状态（present/missing）与注记也进入指纹：文件从缺失变为现存即目标变化
+    return [[f.category, f.path, f.bytes, f.status, f.note or ""]
+            for f in sorted(item.files, key=lambda f: f.path)]
 
 
 def compute_fingerprint(items: list[PreviewItem]) -> str:
-    """目标指纹：作业三元组 + 文件(类别,路径,大小) 的规范化 SHA-256（不读内容）。"""
+    """目标指纹：作业三元组 + 文件(类别,路径,大小,状态) 的规范化 SHA-256（不读内容）。"""
     payload = [
         [i.job_kind, i.job_id, i.terminal_status, str(i.needs_review).lower(),
-         i.completed_at, _canonical_files(i)]
+         i.completed_at, _file_fingerprint(i)]
         for i in items
     ]
     blob = json.dumps(payload, ensure_ascii=False, sort_keys=True,
@@ -495,79 +587,181 @@ def compute_fingerprint(items: list[PreviewItem]) -> str:
 # ---------- 安全删除 ----------
 
 
-class UnsafePathError(Exception):
-    """符号链接或越出限定数据目录的路径。"""
+def _parent_components_safe(path: Path, roots: list[Path]) -> bool:
+    """路径上任一级都不得是符号链接；realpath 必须仍在限定目录内。"""
+    if not _is_within_roots(path, roots):
+        return False
+    parent = path.parent
+    data_root = config.settings.data_dir.resolve()
+    cur = parent
+    while True:
+        if cur.is_symlink():
+            return False
+        if cur == data_root or cur.parent == cur:
+            break
+        cur = cur.parent
+    return True
 
 
 def _safe_remove(path: Path, *, roots: list[Path]) -> str:
     """删除单个普通文件；返回 outcome 标签。
 
     * ``deleted``：已删除；``missing``：原本就不存在（幂等）；
-    * ``symlink_refused``：路径（含路径上任一级）是符号链接，拒绝跟随；
-    * ``path_refused``：realpath 越出限定数据目录，拒绝删除。
+    * 路径本身或任一级父目录是符号链接、realpath 越出限定数据目录时
+      抛 :class:`UnsafePathError`，绝不跟随链接（链接目标可能属于另一把保留锁
+      保护的作业）。
     """
     if path.is_symlink():
         raise UnsafePathError("symlink")
     if not path.exists():
         return "missing"
-    # 路径上任一级都不得是符号链接（realpath 与逐段 lstat 双重确认）
-    if not _is_within_roots(path, roots):
+    if not _parent_components_safe(path, roots):
         raise UnsafePathError("out_of_tree")
     os.unlink(path)
     return "deleted"
 
 
+def _walk_plain(root: Path, roots: list[Path]):
+    """不跟随符号链接的深度优先遍历，产出 (child, 相对根的 PurePosix 风格路径)。
+
+    遇到符号链接（含指向目录的链接）只作为叶子上报，绝不进入其目标。
+    """
+    results: list[tuple[Path, str]] = []
+
+    def _scan(directory: Path, prefix: str) -> None:
+        try:
+            with os.scandir(directory) as it:
+                entries = list(it)
+        except OSError:
+            return
+        for entry in sorted(entries, key=lambda e: e.name):
+            child = Path(entry.path)
+            rel = f"{prefix}{entry.name}" if not prefix else f"{prefix}/{entry.name}"
+            if entry.is_symlink():
+                results.append((child, rel))
+                continue
+            if not _is_within_roots(child, roots):
+                results.append((child, rel))
+                continue
+            try:
+                is_dir = entry.is_dir(follow_symlinks=False)
+            except OSError:
+                is_dir = False
+            if is_dir:
+                _scan(child, rel)
+            else:
+                results.append((child, rel))
+
+    _scan(root, "")
+    return results
+
+
 def _safe_rmtree(path: Path, *, roots: list[Path]) -> list[dict[str, Any]]:
-    """安全删除诊断包暂存目录；逐文件检查，符号链接/越界只记录不跟随。"""
+    """安全删除诊断包暂存目录：符号链接/越界只记录不跟随，普通文件逐个删除。"""
     outcomes: list[dict[str, Any]] = []
     if not path.exists() and not path.is_symlink():
         return outcomes
-    if path.is_symlink():
-        raise UnsafePathError("symlink")
-    if not _is_within_roots(path, roots):
-        raise UnsafePathError("out_of_tree")
-    for child in sorted(path.rglob("*"), reverse=True):
-        rel = _rel(child)
-        if child.is_symlink() or not _is_within_roots(child, roots):
+    if path.is_symlink() or not _is_within_roots(path, roots):
+        raise UnsafePathError("symlink" if path.is_symlink() else "out_of_tree")
+    for child, rel in _walk_plain(path, roots):
+        full_rel = _rel(child)
+        if child.is_symlink():
             outcomes.append({
-                "category": "bundle_staging", "path": rel,
-                "outcome": "symlink_refused" if child.is_symlink() else "path_refused",
-                "bytes": 0, "error": "符号链接，拒绝删除"
-                if child.is_symlink() else "越界路径，拒绝删除",
+                "category": "bundle_staging", "path": full_rel,
+                "outcome": "symlink_refused", "bytes": 0,
+                "error": "符号链接，拒绝删除",
+            })
+            continue
+        if not _is_within_roots(child, roots):
+            outcomes.append({
+                "category": "bundle_staging", "path": full_rel,
+                "outcome": "path_refused", "bytes": 0,
+                "error": "越界路径，拒绝删除",
             })
             continue
         try:
-            if child.is_file() or child.is_symlink():
-                size = child.stat().st_size if not child.is_symlink() else 0
-                if child.is_symlink():
-                    outcomes.append({
-                        "category": "bundle_staging", "path": rel,
-                        "outcome": "symlink_refused", "bytes": 0,
-                        "error": "符号链接，拒绝删除",
-                    })
-                    continue
-                os.unlink(child)
-                outcomes.append({
-                    "category": "bundle_staging", "path": rel,
-                    "outcome": "deleted", "bytes": size,
-                })
-            elif child.is_dir():
-                # 仅在目录为空（安全文件已删、无符号链接残留）时删除
-                try:
-                    child.rmdir()
-                except OSError:
-                    pass
+            st = child.stat()
+            if stat.S_ISDIR(st.st_mode):
+                continue
+            size = st.st_size
+            os.unlink(child)
+            outcomes.append({
+                "category": "bundle_staging", "path": full_rel,
+                "outcome": "deleted", "bytes": size,
+            })
         except OSError as exc:
             outcomes.append({
-                "category": "bundle_staging", "path": rel,
+                "category": "bundle_staging", "path": full_rel,
                 "outcome": "failed", "bytes": 0, "error": str(exc),
             })
-    # 根目录：无符号链接/越界残留时移除
-    leftovers = [o for o in outcomes if o["outcome"] in
-                 ("symlink_refused", "path_refused", "failed")]
-    if not leftovers:
-        shutil.rmtree(path, ignore_errors=True)
     return outcomes
+
+
+# ---------- 后台执行调度 ----------
+
+
+def start_plan(
+    plan_id: str, get_db: Callable[[], Database], *, retry_failed_only: bool = False
+) -> int:
+    """启动（或挤退旧 worker 后重启）一个计划的后台执行，返回执行代次。
+
+    重试时先递增代次并等待旧 worker 退出，杜绝“旧快照 worker 把复位后的项目
+    重新判失败”的竞争。
+    """
+    with _threads_lock:
+        generation = _plan_generation.get(plan_id, 0) + 1
+        _plan_generation[plan_id] = generation
+        old = _plan_threads.get(plan_id)
+    if old is not None and old.is_alive() and old is not threading.current_thread():
+        old.join(timeout=30)
+
+    def _run() -> None:
+        try:
+            run_cleanup_plan(
+                plan_id, get_db, retry_failed_only=retry_failed_only,
+                generation=generation,
+            )
+        except Exception:
+            # 计划保持 running/pending，重启或重试时继续
+            pass
+        finally:
+            with _threads_lock:
+                if _plan_threads.get(plan_id) is thread:
+                    _plan_threads.pop(plan_id, None)
+
+    thread = threading.Thread(target=_run, name=f"cleanup-plan-{plan_id}", daemon=True)
+    with _threads_lock:
+        _plan_threads[plan_id] = thread
+    thread.start()
+    return generation
+
+
+def _rmtree_checked(root: Path, roots: list[Path]) -> None:
+    """预扫描已确认无符号链接/越界路径后，删除普通文件与空目录（不跟随链接）。"""
+    if root.is_symlink() or not root.exists() or not _is_within_roots(root, roots):
+        return
+    for dirpath, dirnames, filenames in os.walk(root, topdown=False, followlinks=False):
+        dp = Path(dirpath)
+        dirnames[:] = [
+            d for d in dirnames if not (dp / d).is_symlink()
+            and _is_within_roots(dp / d, roots)
+        ]
+        for name in filenames:
+            fp = dp / name
+            if not fp.is_symlink():
+                try:
+                    fp.unlink()
+                except OSError:
+                    pass
+        for d in dirnames:
+            try:
+                (dp / d).rmdir()
+            except OSError:
+                pass
+    try:
+        root.rmdir()
+    except OSError:
+        pass
 
 
 # ---------- 清理 worker ----------
@@ -655,6 +849,54 @@ def _guards_pass(
     return True, None
 
 
+def _prescan_unsafe(planned: list[dict[str, Any]], roots: list[Path]
+                    ) -> list[dict[str, Any]]:
+    """删除前的整体安全预扫描：返回所有不安全条目（不删除任何文件）。
+
+    任意一个规范文件是符号链接/越界路径，或暂存目录内含符号链接/越界路径，
+    整个作业项都必须在删除前失败——否则可能误删链接目标（它也许正被另一把
+    保留锁保护）。
+    """
+    unsafe: list[dict[str, Any]] = []
+    for entry in planned:
+        category = entry["category"]
+        rel = entry["path"]
+        path = config.settings.data_dir / rel.rstrip("/")
+        if category == "bundle_staging":
+            if path.is_symlink():
+                unsafe.append({"category": category, "path": rel,
+                               "outcome": "symlink_refused", "bytes": 0,
+                               "error": "暂存目录本身是符号链接，拒绝删除"})
+                continue
+            if not path.exists():
+                continue
+            if not _is_within_roots(path, roots):
+                unsafe.append({"category": category, "path": rel,
+                               "outcome": "path_refused", "bytes": 0,
+                               "error": "越界路径，拒绝删除"})
+                continue
+            for child, child_rel in _walk_plain(path, roots):
+                full_rel = _rel(child)
+                if child.is_symlink():
+                    unsafe.append({"category": category, "path": full_rel,
+                                   "outcome": "symlink_refused", "bytes": 0,
+                                   "error": "暂存目录内含符号链接，拒绝删除"})
+                elif not _is_within_roots(child, roots):
+                    unsafe.append({"category": category, "path": full_rel,
+                                   "outcome": "path_refused", "bytes": 0,
+                                   "error": "暂存目录内含越界路径，拒绝删除"})
+            continue
+        if path.is_symlink():
+            unsafe.append({"category": category, "path": rel,
+                           "outcome": "symlink_refused", "bytes": 0,
+                           "error": "符号链接，拒绝删除（不跟随到目标）"})
+        elif path.exists() and not _parent_components_safe(path, roots):
+            unsafe.append({"category": category, "path": rel,
+                           "outcome": "path_refused", "bytes": 0,
+                           "error": "越界路径或父路径含符号链接，拒绝删除"})
+    return unsafe
+
+
 def _delete_item(
     db: Database, item_row: sqlite3.Row, *, now: datetime
 ) -> tuple[str, list[dict[str, Any]], int, int]:
@@ -665,6 +907,7 @@ def _delete_item(
     job_kind = item_row["job_kind"]
     job_id = item_row["job_id"]
     planned = json.loads(item_row["planned_files_json"] or "[]")
+    roots = _allowed_roots()
 
     ok, reason = _guards_pass(
         db, job_kind=job_kind, job_id=job_id,
@@ -677,7 +920,17 @@ def _delete_item(
             "bytes": 0, "error": reason,
         }], 0, 0
 
-    roots = _allowed_roots()
+    # 1) 整体预扫描：任何符号链接/越界目标都在删除任何文件之前失败
+    unsafe = _prescan_unsafe(planned, roots)
+    if unsafe:
+        outcomes = [{
+            "category": "guard", "path": None, "outcome": "unsafe_target_refused",
+            "bytes": 0,
+            "error": "存在符号链接或越界路径，整个作业项拒绝删除（链接目标未被触碰）",
+        }] + unsafe
+        return "failed", outcomes, 0, 0
+
+    # 2) 预扫描通过后逐项删除（此时不可能再遇到符号链接；缺失按已删记录）
     outcomes: list[dict[str, Any]] = []
     deleted_bytes = 0
     processed = 0
@@ -696,23 +949,18 @@ def _delete_item(
                     "outcome": "missing", "bytes": 0,
                 })
                 continue
-            try:
-                sub = _safe_rmtree(path, roots=roots)
-            except UnsafePathError as exc:
-                failed = True
-                outcomes.append({
-                    "category": category, "path": rel,
-                    "outcome": "symlink_refused" if str(exc) == "symlink"
-                    else "path_refused", "bytes": 0,
-                    "error": "符号链接，拒绝删除" if str(exc) == "symlink"
-                    else "越界路径，拒绝删除",
-                })
-                continue
+            sub = _safe_rmtree(path, roots=roots)
             if not sub:
-                outcomes.append({
-                    "category": category, "path": rel,
-                    "outcome": "deleted", "bytes": 0,
-                })
+                # 空暂存目录：删除目录本身并记 deleted
+                try:
+                    path.rmdir()
+                    outcomes.append({"category": category, "path": rel,
+                                     "outcome": "deleted", "bytes": 0})
+                except OSError as exc:
+                    failed = True
+                    outcomes.append({"category": category, "path": rel,
+                                     "outcome": "failed", "bytes": 0,
+                                     "error": str(exc)})
             else:
                 outcomes.extend(sub)
                 deleted_bytes += sum(
@@ -721,10 +969,13 @@ def _delete_item(
                 if any(o["outcome"] in ("symlink_refused", "path_refused", "failed")
                        for o in sub):
                     failed = True
+                else:
+                    _rmtree_checked(path, roots)
             continue
 
+        expected_status = entry.get("status", "present")
         try:
-            size = path.stat().st_size if path.exists() and not path.is_symlink() else 0
+            size = path.stat().st_size if path.exists() else 0
             outcome = _safe_remove(path, roots=roots)
         except UnsafePathError as exc:
             failed = True
@@ -745,6 +996,9 @@ def _delete_item(
             continue
         if outcome == "deleted":
             deleted_bytes += size
+        elif outcome == "missing" and expected_status == "present":
+            # 规范集合中的文件缺失：明确记录（结果非空，可查询、可审计）
+            outcome = "missing"
         outcomes.append({
             "category": category, "path": rel, "outcome": outcome,
             "bytes": size if outcome == "deleted" else 0,
@@ -761,28 +1015,28 @@ def run_cleanup_plan(
     plan_id: str, get_db: Callable[[], Database],
     *, retry_failed_only: bool = False,
     now: datetime | None = None,
+    generation: int | None = None,
 ) -> CleanupPlanModel:
     """执行（或继续/重试）一个已持久化的清理计划。进程内串行。
 
-    首次执行沿用提交预览时的评估时刻（持久化在计划摘要里），保证“目标未变化”
-    的判定在异步执行/重启后仍可复现；重试则按当前时刻重新复核安全守卫。
+    安全守卫（保留锁、运行中、保留期限）一律按**服务当前时间**复核，与锁状态
+    查询、预览评估使用同一时间基准；调用方无法用未来时间让作业提前可删。
+    ``generation`` 用于让重试/恢复启动的新执行挤退陈旧 worker。
     """
     with _cleanup_run_lock:
         db = get_db()
+        # 已被更新一代执行取代的陈旧 worker 直接退出（避免它把复位后的项目
+        # 按旧快照重新判失败）
+        if generation is not None and _plan_generation.get(plan_id, 0) > generation:
+            return _plan_model(db, db.get_cleanup_plan_row(plan_id))
         row = db.get_cleanup_plan_row(plan_id)
         if row is None:
             raise KeyError(plan_id)
         if row["status"] == "succeeded":
             return _plan_model(db, row)
-        # 首轮执行使用提交时的评估时刻；重试/重启续跑用当前时刻重新复核
-        if now is None:
-            submitted = json.loads(row["submitted_preview_json"] or "{}")
-            if retry_failed_only or row["started_at"]:
-                current = _now()
-            else:
-                current = parse_iso(submitted.get("evaluated_now")) or _now()
-        else:
-            current = _now(now)
+        current = _now(now)
+        # 锁过期失效在删除前统一处理一次
+        db.expire_due_locks(to_iso(current))
         db.mark_cleanup_plan_running(plan_id)
         db.add_retention_audit(
             "cleanup.plan.retried" if retry_failed_only else "cleanup.plan.started",
@@ -878,7 +1132,7 @@ def persist_plan(
         "job_count": preview["job_count"],
         "file_count": preview["file_count"],
         "bytes_total": preview["bytes_total"],
-        "evaluated_now": preview["generated_at"],
+        "generated_at": preview["generated_at"],
     }
     db.create_cleanup_plan(
         plan_id=plan_id, idempotency_key=idempotency_key,

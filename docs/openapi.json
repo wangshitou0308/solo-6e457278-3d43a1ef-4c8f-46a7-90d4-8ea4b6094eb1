@@ -2,8 +2,8 @@
   "openapi": "3.1.0",
   "info": {
     "title": "本地日志脱敏 API",
-    "description": "供后端团队提交故障样本前使用的本地日志脱敏服务。支持按字段路径/键名/正则/内置识别器（邮箱、手机号、IP、访问令牌、身份证、银行卡）命中，动作包括删除、掩码与基于本地密钥的确定性令牌化；生成不含原值的审计清单，并对残留高风险内容标记需复核。\n\n## 令牌关联域（token_context）\n小批量、流式 NDJSON、诊断包与策略对照入口均可传 `token_context`（最长 128 字符）。服务用主密钥为上下文计算**不可逆域标识**并派生域专属子密钥：同一主密钥下，相同上下文与同一原值恒为同一替身，不同上下文必为不同替身。服务**只持久化域标识**（对外以域指纹 `dom:<hex>` 展示），**不保存上下文原文**；上下文无法从域指纹逆推。未传时沿用全局映射（域指纹 `global`，替身与历史行为完全一致）；`delete`/`mask` 动作与关联域无关。流式作业与诊断包重启续跑自动沿用创建时的关联域。`Idempotency-Key` 同时绑定内容、策略与关联域，同键换域返回 409；策略对照的基线与候选共用同一关联域。\n\n**隐私取舍**：全局域便于跨作业/跨事件做等值关联分析，但替身本身也是跨批次的稳定连接键；隔离域切断跨上下文的等值连接（同一实体在不同事件中的替身不同），代价是失去跨域关联能力，且需要调用方自行记住上下文取值（服务无法替你找回）。\n\n## 策略变更对照（strategies/diff）\n在同一批 JSON/NDJSON 上以同一主密钥分别执行基线与候选策略（纯内存，不落库、不生成文件），按记录、行号、字段路径与内容命中位置（原文内偏移）对齐：汇总候选新增/失去的覆盖、动作变化、胜出规则变化与残留风险增减；仅规则改名且处理一致时不算覆盖改善。调用方可为新增残留风险、失去处理与输出类型变化设置上限，响应返回 pass/fail 与逐项依据供 CI 放行判定。差异项只含位置、规则、动作、识别器与计数，不回显原始值、正则文本或处理后仍含敏感信息的值。\n\n## 大批量 NDJSON 流式作业（stream-jobs）\n通过 multipart/form-data 上传大文件，原始文件以 0600 权限临时落盘，服务逐行解析、脱敏并定期写入安全检查点（字节偏移/记录数/审计数/风险数），不把整包读入内存；支持 Idempotency-Key 内容校验（同键不同内容返回 409）、取消、服务重启后从检查点继续、格式错误记录行号并终止；成功后原子发布结果文件，未完成作业不可下载。\n\n## 诊断包作业（bundle-jobs）\n通过 multipart/form-data 上传 ZIP 诊断包与脱敏策略，逐个处理包内 .json/.ndjson/.log/.txt 文件：结构化文件走字段+内容规则，纯文本按行应用内容规则，输出保留包内相对路径与原换行风格。拒绝路径穿越、符号链接、重复路径、加密条目及超过文件数/单文件/展开总量/压缩比上限的压缩包；二进制与不支持类型不写入结果，只在结果 ZIP 的 redaction-manifest.json 清单列明原因。审计与残留风险带来源路径与行号/记录位置，不含原值；同一 Idempotency-Key 仅在压缩包与策略均一致时回放，否则 409；支持进度查询、取消与重启续跑，终态清理原始包，成功后原子发布结果 ZIP。",
-    "version": "1.4.0"
+    "description": "供后端团队提交故障样本前使用的本地日志脱敏服务。支持按字段路径/键名/正则/内置识别器（邮箱、手机号、IP、访问令牌、身份证、银行卡）命中，动作包括删除、掩码与基于本地密钥的确定性令牌化；生成不含原值的审计清单，并对残留高风险内容标记需复核。\n\n## 令牌关联域（token_context）\n小批量、流式 NDJSON、诊断包与策略对照入口均可传 `token_context`（最长 128 字符）。服务用主密钥为上下文计算**不可逆域标识**并派生域专属子密钥：同一主密钥下，相同上下文与同一原值恒为同一替身，不同上下文必为不同替身。服务**只持久化域标识**（对外以域指纹 `dom:<hex>` 展示），**不保存上下文原文**；上下文无法从域指纹逆推。未传时沿用全局映射（域指纹 `global`，替身与历史行为完全一致）；`delete`/`mask` 动作与关联域无关。流式作业与诊断包重启续跑自动沿用创建时的关联域。`Idempotency-Key` 同时绑定内容、策略与关联域，同键换域返回 409；策略对照的基线与候选共用同一关联域。\n\n**隐私取舍**：全局域便于跨作业/跨事件做等值关联分析，但替身本身也是跨批次的稳定连接键；隔离域切断跨上下文的等值连接（同一实体在不同事件中的替身不同），代价是失去跨域关联能力，且需要调用方自行记住上下文取值（服务无法替你找回）。\n\n## 策略变更对照（strategies/diff）\n在同一批 JSON/NDJSON 上以同一主密钥分别执行基线与候选策略（纯内存，不落库、不生成文件），按记录、行号、字段路径与内容命中位置（原文内偏移）对齐：汇总候选新增/失去的覆盖、动作变化、胜出规则变化与残留风险增减；仅规则改名且处理一致时不算覆盖改善。调用方可为新增残留风险、失去处理与输出类型变化设置上限，响应返回 pass/fail 与逐项依据供 CI 放行判定。差异项只含位置、规则、动作、识别器与计数，不回显原始值、正则文本或处理后仍含敏感信息的值。\n\n## 大批量 NDJSON 流式作业（stream-jobs）\n通过 multipart/form-data 上传大文件，原始文件以 0600 权限临时落盘，服务逐行解析、脱敏并定期写入安全检查点（字节偏移/记录数/审计数/风险数），不把整包读入内存；支持 Idempotency-Key 内容校验（同键不同内容返回 409）、取消、服务重启后从检查点继续、格式错误记录行号并终止；成功后原子发布结果文件，未完成作业不可下载。\n\n## 诊断包作业（bundle-jobs）\n通过 multipart/form-data 上传 ZIP 诊断包与脱敏策略，逐个处理包内 .json/.ndjson/.log/.txt 文件：结构化文件走字段+内容规则，纯文本按行应用内容规则，输出保留包内相对路径与原换行风格。拒绝路径穿越、符号链接、重复路径、加密条目及超过文件数/单文件/展开总量/压缩比上限的压缩包；二进制与不支持类型不写入结果，只在结果 ZIP 的 redaction-manifest.json 清单列明原因。审计与残留风险带来源路径与行号/记录位置，不含原值；同一 Idempotency-Key 仅在压缩包与策略均一致时回放，否则 409；支持进度查询、取消与重启续跑，终态清理原始包，成功后原子发布结果 ZIP。\n\n## 脱敏结果完整性凭证（receipt）\n小批量、流式 NDJSON 与诊断包作业在**成功发布结果**时生成独立 JSON 凭证：记录格式版本、输入与规范化策略摘要、关联域指纹、统计计数与输出文件摘要（诊断包另列结果 ZIP 内各文件的路径与摘要），**不含原始值、处理后值、策略正文或密钥材料**。凭证由主密钥派生的凭证子密钥按固定字段顺序计算 HMAC-SHA256 标签。三类作业均提供凭证查询、下载与校验接口；校验重算标签与现有结果摘要，区分凭证被改动、结果缺失、内容不符、密钥不匹配与格式不支持，**不重新脱敏、不返回文件内容**。取消/失败的异步作业不生成凭证；幂等回放指向同一凭证；重启后仍可校验已发布结果。\n\n## 本地数据保留与安全清理（retention）\n统一管理三类作业（小批量 `batch`、流式 NDJSON `stream`、诊断包 `bundle`）的记录、结果文件与完整性凭证的保留期限：可按**作业类型 × 终态 × 是否需复核**配置保留天数（含永久保留），内置默认策略可覆盖或删除自定义覆盖后回退；可为指定作业设置带原因与到期时间的**保留锁**。清理预览只返回待删作业、文件类别与预计释放空间，**不读取、不返回任何日志或审计内容**。执行清理必须回传预览摘要与目标指纹：目标发生变化（新增/删除文件、锁、期限等）一律拒绝（409）；保留锁未到期、运行中作业与复核期限未满的结果不得删除。执行先持久化清理计划，再仅在限定数据目录内删除文件并随后删除关联数据库记录；文件缺失按已删处理（幂等），符号链接与越界路径拒绝跟随并记录，部分失败可重试，**服务重启后自动继续**。",
+    "version": "1.6.0"
   },
   "paths": {
     "/healthz": {
@@ -1325,6 +1325,1223 @@
           }
         }
       }
+    },
+    "/api/v1/jobs/{job_id}/receipt": {
+      "get": {
+        "tags": [
+          "receipts"
+        ],
+        "summary": "查询小批量作业的完整性凭证",
+        "description": "返回成功发布时生成的 JSON 凭证：格式版本、输入与规范化策略摘要、关联域指纹、统计计数与输出文件摘要及 HMAC-SHA256 标签；不含原始值、处理后值、策略正文或密钥材料。",
+        "operationId": "get_job_receipt_api_v1_jobs__job_id__receipt_get",
+        "parameters": [
+          {
+            "name": "job_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "title": "Job Id"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "additionalProperties": true,
+                  "title": "Response Get Job Receipt Api V1 Jobs  Job Id  Receipt Get"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "作业或凭证不存在"
+          },
+          "410": {
+            "description": "结果与凭证已被清理"
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/jobs/{job_id}/receipt/download": {
+      "get": {
+        "tags": [
+          "receipts"
+        ],
+        "summary": "下载小批量作业的完整性凭证（JSON 文件）",
+        "operationId": "download_job_receipt_api_v1_jobs__job_id__receipt_download_get",
+        "parameters": [
+          {
+            "name": "job_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "title": "Job Id"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            }
+          },
+          "404": {
+            "description": "作业或凭证不存在"
+          },
+          "410": {
+            "description": "结果与凭证已被清理"
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/jobs/{job_id}/receipt/verify": {
+      "post": {
+        "tags": [
+          "receipts"
+        ],
+        "summary": "校验小批量作业凭证（重算标签与现有结果摘要）",
+        "description": "请求体为待校验的凭证 JSON（通常为先前查询/下载得到的凭证）。服务重算凭证标签与**现有结果文件**摘要并给出结论，**不重新脱敏、不返回文件内容**。\n\n`verdict` 取值：`ok`=一致；`unsupported_format`=格式不支持；`key_mismatch`=密钥不匹配；`receipt_tampered`=凭证被改动；`job_mismatch`=凭证与本作业不对应；`result_missing`=结果缺失；`content_mismatch`=内容不符。HTTP 恒为 200，结论看 `verdict`。",
+        "operationId": "verify_job_receipt_api_v1_jobs__job_id__receipt_verify_post",
+        "parameters": [
+          {
+            "name": "job_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "title": "Job Id"
+            }
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "additionalProperties": true,
+                "description": "待校验的完整性凭证 JSON",
+                "title": "Receipt"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ReceiptVerifyResponse"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "作业不存在"
+          },
+          "422": {
+            "description": "请求体不是 JSON 对象"
+          }
+        }
+      }
+    },
+    "/api/v1/stream-jobs/{job_id}/receipt": {
+      "get": {
+        "tags": [
+          "receipts"
+        ],
+        "summary": "查询流式作业的完整性凭证",
+        "description": "仅 succeeded 作业有凭证（成功发布结果时生成）；排队/运行/失败/取消的作业返回 409。",
+        "operationId": "get_stream_job_receipt_api_v1_stream_jobs__job_id__receipt_get",
+        "parameters": [
+          {
+            "name": "job_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "title": "Job Id"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "additionalProperties": true,
+                  "title": "Response Get Stream Job Receipt Api V1 Stream Jobs  Job Id  Receipt Get"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "作业或凭证不存在"
+          },
+          "409": {
+            "description": "作业未完成，尚无凭证"
+          },
+          "410": {
+            "description": "结果与凭证已被清理"
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/stream-jobs/{job_id}/receipt/download": {
+      "get": {
+        "tags": [
+          "receipts"
+        ],
+        "summary": "下载流式作业的完整性凭证（JSON 文件）",
+        "operationId": "download_stream_job_receipt_api_v1_stream_jobs__job_id__receipt_download_get",
+        "parameters": [
+          {
+            "name": "job_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "title": "Job Id"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            }
+          },
+          "404": {
+            "description": "作业或凭证不存在"
+          },
+          "409": {
+            "description": "作业未完成，尚无凭证"
+          },
+          "410": {
+            "description": "结果与凭证已被清理"
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/stream-jobs/{job_id}/receipt/verify": {
+      "post": {
+        "tags": [
+          "receipts"
+        ],
+        "summary": "校验流式作业凭证（重算标签与现有结果摘要）",
+        "description": "请求体为待校验的凭证 JSON；仅 succeeded 作业可校验。判定语义与小批量凭证校验接口一致，不重新脱敏、不返回文件内容。",
+        "operationId": "verify_stream_job_receipt_api_v1_stream_jobs__job_id__receipt_verify_post",
+        "parameters": [
+          {
+            "name": "job_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "title": "Job Id"
+            }
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "additionalProperties": true,
+                "description": "待校验的完整性凭证 JSON",
+                "title": "Receipt"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ReceiptVerifyResponse"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "作业不存在"
+          },
+          "409": {
+            "description": "作业未完成，无法校验"
+          },
+          "422": {
+            "description": "请求体不是 JSON 对象"
+          }
+        }
+      }
+    },
+    "/api/v1/bundle-jobs/{job_id}/receipt": {
+      "get": {
+        "tags": [
+          "receipts"
+        ],
+        "summary": "查询诊断包作业的完整性凭证",
+        "description": "仅 succeeded 作业有凭证；凭证另列结果 ZIP 内各文件的路径与摘要。",
+        "operationId": "get_bundle_job_receipt_api_v1_bundle_jobs__job_id__receipt_get",
+        "parameters": [
+          {
+            "name": "job_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "title": "Job Id"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "additionalProperties": true,
+                  "title": "Response Get Bundle Job Receipt Api V1 Bundle Jobs  Job Id  Receipt Get"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "作业或凭证不存在"
+          },
+          "409": {
+            "description": "作业未完成，尚无凭证"
+          },
+          "410": {
+            "description": "结果与凭证已被清理"
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/bundle-jobs/{job_id}/receipt/download": {
+      "get": {
+        "tags": [
+          "receipts"
+        ],
+        "summary": "下载诊断包作业的完整性凭证（JSON 文件）",
+        "operationId": "download_bundle_job_receipt_api_v1_bundle_jobs__job_id__receipt_download_get",
+        "parameters": [
+          {
+            "name": "job_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "title": "Job Id"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            }
+          },
+          "404": {
+            "description": "作业或凭证不存在"
+          },
+          "409": {
+            "description": "作业未完成，尚无凭证"
+          },
+          "410": {
+            "description": "结果与凭证已被清理"
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/bundle-jobs/{job_id}/receipt/verify": {
+      "post": {
+        "tags": [
+          "receipts"
+        ],
+        "summary": "校验诊断包作业凭证（重算标签、结果 ZIP 与各条目摘要）",
+        "description": "请求体为待校验的凭证 JSON；仅 succeeded 作业可校验。除整体摘要外，还逐一核对结果 ZIP 内各文件的路径与摘要；不重新脱敏、不返回文件内容。",
+        "operationId": "verify_bundle_job_receipt_api_v1_bundle_jobs__job_id__receipt_verify_post",
+        "parameters": [
+          {
+            "name": "job_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "title": "Job Id"
+            }
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "additionalProperties": true,
+                "description": "待校验的完整性凭证 JSON",
+                "title": "Receipt"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ReceiptVerifyResponse"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "作业不存在"
+          },
+          "409": {
+            "description": "作业未完成，无法校验"
+          },
+          "422": {
+            "description": "请求体不是 JSON 对象"
+          }
+        }
+      }
+    },
+    "/api/v1/retention/policy": {
+      "get": {
+        "tags": [
+          "retention"
+        ],
+        "summary": "查询保留策略（内置默认规则 + 自定义覆盖）",
+        "operationId": "get_retention_policy_api_v1_retention_policy_get",
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RetentionPolicyResponse"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/retention/rules": {
+      "put": {
+        "tags": [
+          "retention"
+        ],
+        "summary": "设置保留期限规则（按作业类型×终态×复核状态，幂等 upsert）",
+        "description": "重复提交同一规则键即覆盖；`retention_days=null` 表示永久保留。内置默认规则被覆盖后可通过 DELETE 回退。",
+        "operationId": "put_retention_rule_api_v1_retention_rules_put",
+        "parameters": [
+          {
+            "name": "Idempotency-Key",
+            "in": "header",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Idempotency-Key"
+            }
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/UpsertRetentionRuleRequest"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "additionalProperties": true,
+                  "title": "Response Put Retention Rule Api V1 Retention Rules Put"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/retention/rules/{job_kind}/{terminal_status}/{needs_review}": {
+      "delete": {
+        "tags": [
+          "retention"
+        ],
+        "summary": "删除自定义保留规则（回退到内置默认）",
+        "operationId": "delete_retention_rule_api_v1_retention_rules__job_kind___terminal_status___needs_review__delete",
+        "parameters": [
+          {
+            "name": "job_kind",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "title": "Job Kind"
+            }
+          },
+          {
+            "name": "terminal_status",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "title": "Terminal Status"
+            }
+          },
+          {
+            "name": "needs_review",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "title": "Needs Review"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            }
+          },
+          "404": {
+            "description": "规则不存在，或该键为内置默认规则（无自定义覆盖可删）"
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/retention/locks": {
+      "put": {
+        "tags": [
+          "retention"
+        ],
+        "summary": "为指定作业设置保留锁（带原因与到期时间）",
+        "description": "同一作业已有生效中的锁返回 409（带原因/到期不同也算冲突）；原锁已到期则自动失效后建立新锁。",
+        "operationId": "put_retention_lock_api_v1_retention_locks_put",
+        "parameters": [
+          {
+            "name": "Idempotency-Key",
+            "in": "header",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Idempotency-Key"
+            }
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/CreateRetentionLockRequest"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "保留锁已建立（幂等重放时返回同一把锁）",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "additionalProperties": true,
+                  "title": "Response Put Retention Lock Api V1 Retention Locks Put"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "目标作业不存在"
+          },
+          "409": {
+            "description": "该作业已有生效中的保留锁"
+          },
+          "422": {
+            "description": "到期时间非法（过期/无法解析）"
+          }
+        }
+      },
+      "get": {
+        "tags": [
+          "retention"
+        ],
+        "summary": "查询保留锁（可按状态/作业类型过滤、分页）",
+        "operationId": "list_retention_locks_api_v1_retention_locks_get",
+        "parameters": [
+          {
+            "name": "state",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "description": "active/expired/released",
+              "title": "State"
+            },
+            "description": "active/expired/released"
+          },
+          {
+            "name": "job_kind",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "description": "batch/stream/bundle",
+              "title": "Job Kind"
+            },
+            "description": "batch/stream/bundle"
+          },
+          {
+            "name": "limit",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "integer",
+              "maximum": 200,
+              "minimum": 1,
+              "default": 50,
+              "title": "Limit"
+            }
+          },
+          {
+            "name": "offset",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "integer",
+              "minimum": 0,
+              "default": 0,
+              "title": "Offset"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RetentionLockList"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/retention/locks/{job_kind}/{job_id}": {
+      "delete": {
+        "tags": [
+          "retention"
+        ],
+        "summary": "提前释放保留锁",
+        "operationId": "release_retention_lock_api_v1_retention_locks__job_kind___job_id__delete",
+        "parameters": [
+          {
+            "name": "job_kind",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "title": "Job Kind"
+            }
+          },
+          {
+            "name": "job_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "title": "Job Id"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "additionalProperties": true,
+                  "title": "Response Release Retention Lock Api V1 Retention Locks  Job Kind   Job Id  Delete"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "没有生效中的锁"
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/retention/cleanup/preview": {
+      "post": {
+        "tags": [
+          "retention"
+        ],
+        "summary": "清理预览：待删作业、文件类别与预计释放空间",
+        "description": "只读取作业元数据与文件 stat（类别/相对路径/大小），**绝不打开或返回任何日志、结果或审计内容**。排除：运行中（queued/running）作业、保留锁未到期、期限未满与命中永久保留规则的作业（计数见 `blocked`）。相同数据状态下重复预览幂等（`target_fingerprint` 相同）。",
+        "operationId": "post_cleanup_preview_api_v1_retention_cleanup_preview_post",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/CleanupPreviewRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/CleanupPreviewResponse"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/retention/cleanup/execute": {
+      "post": {
+        "tags": [
+          "retention"
+        ],
+        "summary": "执行清理（须提交预览摘要；目标变化时拒绝，幂等）",
+        "description": "请求体必须原样回传预览摘要（preview_id、target_fingerprint、各计数、job_kinds）。服务以相同参数**重新计算目标**：指纹或任一计数不一致即**409 拒绝**（目标发生变化，请重新预览后提交）。空预览返回 400。\n\n执行先**持久化清理计划**（plan + 逐项），再后台串行删除；同幂等键或同目标指纹的重复提交回放既有计划。文件缺失按已删处理（幂等），符号链接/越界路径拒绝跟随并记录，部分失败可重试，服务重启后自动继续。",
+        "operationId": "post_cleanup_execute_api_v1_retention_cleanup_execute_post",
+        "parameters": [
+          {
+            "name": "Idempotency-Key",
+            "in": "header",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Idempotency-Key"
+            }
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/CleanupExecuteRequest"
+              }
+            }
+          }
+        },
+        "responses": {
+          "202": {
+            "description": "计划已持久化并开始执行",
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            }
+          },
+          "200": {
+            "description": "幂等命中，回放既有清理计划"
+          },
+          "400": {
+            "description": "预览摘要不完整或没有任何待删作业"
+          },
+          "409": {
+            "description": "目标已变化（指纹/计数与当前预览不一致）"
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/retention/cleanup/plans": {
+      "get": {
+        "tags": [
+          "retention"
+        ],
+        "summary": "清理计划列表（可按状态过滤、分页）",
+        "operationId": "list_cleanup_plans_api_v1_retention_cleanup_plans_get",
+        "parameters": [
+          {
+            "name": "status",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "description": "pending/running/succeeded/partial/failed",
+              "title": "Status"
+            },
+            "description": "pending/running/succeeded/partial/failed"
+          },
+          {
+            "name": "limit",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "integer",
+              "maximum": 200,
+              "minimum": 1,
+              "default": 50,
+              "title": "Limit"
+            }
+          },
+          {
+            "name": "offset",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "integer",
+              "minimum": 0,
+              "default": 0,
+              "title": "Offset"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/CleanupPlanList"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/retention/cleanup/plans/{plan_id}": {
+      "get": {
+        "tags": [
+          "retention"
+        ],
+        "summary": "清理计划进度与逐项结果（含逐文件删除结果/错误）",
+        "operationId": "get_cleanup_plan_api_v1_retention_cleanup_plans__plan_id__get",
+        "parameters": [
+          {
+            "name": "plan_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "title": "Plan Id"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/CleanupPlanModel"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "清理计划不存在"
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/retention/cleanup/plans/{plan_id}/retry": {
+      "post": {
+        "tags": [
+          "retention"
+        ],
+        "summary": "重试清理计划中失败/未完成的作业项（幂等）",
+        "description": "只重试状态为 failed 的作业项（文件缺失会按已删处理，其余安全守卫重新复核）。全部成功则计划转为 succeeded；仍有失败转为 partial。",
+        "operationId": "retry_cleanup_plan_api_v1_retention_cleanup_plans__plan_id__retry_post",
+        "parameters": [
+          {
+            "name": "plan_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "title": "Plan Id"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "计划已完成或无失败项，返回当前计划",
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            }
+          },
+          "202": {
+            "description": "已开始重试"
+          },
+          "404": {
+            "description": "清理计划不存在"
+          },
+          "409": {
+            "description": "计划已成功，无需重试"
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/retention/audit": {
+      "get": {
+        "tags": [
+          "retention"
+        ],
+        "summary": "保留/清理审计查询（可按计划/作业/动作过滤、分页）",
+        "description": "审计只含动作、目标标识、结果与计数，**不含任何日志或结果内容**。",
+        "operationId": "get_retention_audit_api_v1_retention_audit_get",
+        "parameters": [
+          {
+            "name": "plan_id",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Plan Id"
+            }
+          },
+          {
+            "name": "job_kind",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Job Kind"
+            }
+          },
+          {
+            "name": "job_id",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Job Id"
+            }
+          },
+          {
+            "name": "action",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "description": "policy.rule.set/policy.rule.deleted/lock.created/lock.released/cleanup.plan.created/cleanup.plan.started/cleanup.item.done/cleanup.item.failed/cleanup.plan.finished/cleanup.plan.retried",
+              "title": "Action"
+            },
+            "description": "policy.rule.set/policy.rule.deleted/lock.created/lock.released/cleanup.plan.created/cleanup.plan.started/cleanup.item.done/cleanup.item.failed/cleanup.plan.finished/cleanup.plan.retried"
+          },
+          {
+            "name": "limit",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "integer",
+              "maximum": 1000,
+              "minimum": 1,
+              "default": 100,
+              "title": "Limit"
+            }
+          },
+          {
+            "name": "offset",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "integer",
+              "minimum": 0,
+              "default": 0,
+              "title": "Offset"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RetentionAuditPage"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
     }
   },
   "components": {
@@ -1555,6 +2772,336 @@
         ],
         "title": "Body_create_stream_job_api_v1_stream_jobs_post"
       },
+      "CleanupExecuteRequest": {
+        "properties": {
+          "preview_id": {
+            "type": "string",
+            "title": "Preview Id",
+            "description": "预览接口返回的 preview_id（等于 target_fingerprint）"
+          },
+          "target_fingerprint": {
+            "type": "string",
+            "title": "Target Fingerprint",
+            "description": "预览接口返回的目标指纹"
+          },
+          "job_count": {
+            "type": "integer",
+            "minimum": 0.0,
+            "title": "Job Count"
+          },
+          "file_count": {
+            "type": "integer",
+            "minimum": 0.0,
+            "title": "File Count"
+          },
+          "bytes_total": {
+            "type": "integer",
+            "minimum": 0.0,
+            "title": "Bytes Total"
+          },
+          "job_kinds": {
+            "anyOf": [
+              {
+                "items": {
+                  "type": "string",
+                  "enum": [
+                    "batch",
+                    "stream",
+                    "bundle"
+                  ]
+                },
+                "type": "array"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Job Kinds",
+            "description": "预览时使用的作业类型过滤；必须与预览一致，默认全部三类"
+          },
+          "now": {
+            "anyOf": [
+              {
+                "type": "string",
+                "format": "date-time"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Now",
+            "description": "评估用当前时间；与预览一致时目标判定才可复现，默认服务当前时间"
+          }
+        },
+        "type": "object",
+        "required": [
+          "preview_id",
+          "target_fingerprint",
+          "job_count",
+          "file_count",
+          "bytes_total"
+        ],
+        "title": "CleanupExecuteRequest",
+        "description": "执行清理必须回传预览摘要；目标发生变化时拒绝执行（409）。"
+      },
+      "CleanupPlanList": {
+        "properties": {
+          "total": {
+            "type": "integer",
+            "title": "Total"
+          },
+          "items": {
+            "items": {
+              "$ref": "#/components/schemas/CleanupPlanModel"
+            },
+            "type": "array",
+            "title": "Items"
+          }
+        },
+        "type": "object",
+        "required": [
+          "total",
+          "items"
+        ],
+        "title": "CleanupPlanList"
+      },
+      "CleanupPlanModel": {
+        "properties": {
+          "plan_id": {
+            "type": "string",
+            "title": "Plan Id"
+          },
+          "idempotency_key": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Idempotency Key"
+          },
+          "status": {
+            "type": "string",
+            "enum": [
+              "pending",
+              "running",
+              "succeeded",
+              "partial",
+              "failed"
+            ],
+            "title": "Status"
+          },
+          "created_at": {
+            "type": "string",
+            "title": "Created At"
+          },
+          "updated_at": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Updated At"
+          },
+          "started_at": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Started At"
+          },
+          "finished_at": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Finished At"
+          },
+          "target_fingerprint": {
+            "type": "string",
+            "title": "Target Fingerprint"
+          },
+          "submitted_preview": {
+            "additionalProperties": true,
+            "type": "object",
+            "title": "Submitted Preview"
+          },
+          "jobs_total": {
+            "type": "integer",
+            "title": "Jobs Total"
+          },
+          "jobs_done": {
+            "type": "integer",
+            "title": "Jobs Done",
+            "default": 0
+          },
+          "jobs_failed": {
+            "type": "integer",
+            "title": "Jobs Failed",
+            "default": 0
+          },
+          "files_processed": {
+            "type": "integer",
+            "title": "Files Processed",
+            "default": 0
+          },
+          "bytes_deleted": {
+            "type": "integer",
+            "title": "Bytes Deleted",
+            "default": 0
+          },
+          "error": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Error"
+          },
+          "items": {
+            "items": {
+              "$ref": "#/components/schemas/PlanItemModel"
+            },
+            "type": "array",
+            "title": "Items"
+          }
+        },
+        "type": "object",
+        "required": [
+          "plan_id",
+          "status",
+          "created_at",
+          "target_fingerprint",
+          "submitted_preview",
+          "jobs_total"
+        ],
+        "title": "CleanupPlanModel",
+        "description": "清理作业（持久化的计划 + 执行进度 + 结果）。"
+      },
+      "CleanupPreviewRequest": {
+        "properties": {
+          "job_kinds": {
+            "anyOf": [
+              {
+                "items": {
+                  "type": "string",
+                  "enum": [
+                    "batch",
+                    "stream",
+                    "bundle"
+                  ]
+                },
+                "type": "array"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Job Kinds",
+            "description": "仅预览这些作业类型；null=全部三类"
+          },
+          "now": {
+            "anyOf": [
+              {
+                "type": "string",
+                "format": "date-time"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Now",
+            "description": "评估用当前时间（UTC ISO 8601），默认服务当前时间；便于复测期限"
+          }
+        },
+        "type": "object",
+        "title": "CleanupPreviewRequest",
+        "description": "清理预览请求；不传任何过滤即按当前策略扫描全部终态作业。"
+      },
+      "CleanupPreviewResponse": {
+        "properties": {
+          "preview_id": {
+            "type": "string",
+            "title": "Preview Id",
+            "description": "本次预览的稳定标识（内容指纹，重复预览幂等）"
+          },
+          "generated_at": {
+            "type": "string",
+            "title": "Generated At"
+          },
+          "target_fingerprint": {
+            "type": "string",
+            "title": "Target Fingerprint",
+            "description": "待删目标摘要：作业三元组 + 文件(类别,路径,大小) 规范化哈希"
+          },
+          "items": {
+            "items": {
+              "$ref": "#/components/schemas/PreviewItem"
+            },
+            "type": "array",
+            "title": "Items"
+          },
+          "job_count": {
+            "type": "integer",
+            "title": "Job Count"
+          },
+          "file_count": {
+            "type": "integer",
+            "title": "File Count"
+          },
+          "bytes_total": {
+            "type": "integer",
+            "title": "Bytes Total",
+            "description": "预计释放字节数合计"
+          },
+          "by_category": {
+            "additionalProperties": {
+              "type": "integer"
+            },
+            "type": "object",
+            "title": "By Category",
+            "description": "各文件类别的预计释放字节数"
+          },
+          "blocked": {
+            "additionalProperties": {
+              "type": "integer"
+            },
+            "type": "object",
+            "title": "Blocked",
+            "description": "未入选计数：locked=保留锁拦截；retained=期限未满；running=仍在运行；permanent=命中永久保留规则"
+          }
+        },
+        "type": "object",
+        "required": [
+          "preview_id",
+          "generated_at",
+          "target_fingerprint",
+          "items",
+          "job_count",
+          "file_count",
+          "bytes_total",
+          "by_category",
+          "blocked"
+        ],
+        "title": "CleanupPreviewResponse",
+        "description": "清理预览：待删作业、文件类别与预计释放空间；不读取或返回任何日志内容。"
+      },
       "CoverageDiffItem": {
         "properties": {
           "location": {
@@ -1644,6 +3191,44 @@
           "strategy"
         ],
         "title": "CreateJobRequest"
+      },
+      "CreateRetentionLockRequest": {
+        "properties": {
+          "job_kind": {
+            "type": "string",
+            "enum": [
+              "batch",
+              "stream",
+              "bundle"
+            ],
+            "title": "Job Kind"
+          },
+          "job_id": {
+            "type": "string",
+            "maxLength": 128,
+            "minLength": 1,
+            "title": "Job Id"
+          },
+          "reason": {
+            "type": "string",
+            "maxLength": 512,
+            "minLength": 1,
+            "title": "Reason"
+          },
+          "expires_at": {
+            "type": "string",
+            "format": "date-time",
+            "title": "Expires At"
+          }
+        },
+        "type": "object",
+        "required": [
+          "job_kind",
+          "job_id",
+          "reason",
+          "expires_at"
+        ],
+        "title": "CreateRetentionLockRequest"
       },
       "DiffCheck": {
         "properties": {
@@ -1857,6 +3442,12 @@
             "description": "令牌关联域指纹：global=全局映射；dom:<hex>=隔离域",
             "default": "global"
           },
+          "receipt_url": {
+            "type": "string",
+            "title": "Receipt Url",
+            "description": "完整性凭证查询地址（成功发布的作业必有凭证）",
+            "default": ""
+          },
           "audit": {
             "items": {
               "$ref": "#/components/schemas/AuditEntry"
@@ -2004,6 +3595,513 @@
         "type": "object",
         "title": "MatchSpec",
         "description": "规则的命中条件。\n\n各维度之间是 AND；同一维度内多个值是 OR。\n\n* 含字段/键名维度、但不含 value_patterns/detectors 的规则为**整字段规则**，\n  动作作用于整个标量值。\n* 含 value_patterns/detectors 的规则为**内容规则**，动作只替换字符串中\n  命中的片段，可用字段/键名维度缩小作用范围。"
+      },
+      "PlanItemModel": {
+        "properties": {
+          "job_kind": {
+            "type": "string",
+            "enum": [
+              "batch",
+              "stream",
+              "bundle"
+            ],
+            "title": "Job Kind"
+          },
+          "job_id": {
+            "type": "string",
+            "title": "Job Id"
+          },
+          "status": {
+            "type": "string",
+            "enum": [
+              "pending",
+              "done",
+              "failed",
+              "skipped"
+            ],
+            "title": "Status"
+          },
+          "planned_files": {
+            "items": {
+              "$ref": "#/components/schemas/PreviewFileEntry"
+            },
+            "type": "array",
+            "title": "Planned Files"
+          },
+          "processed": {
+            "type": "integer",
+            "title": "Processed",
+            "default": 0
+          },
+          "deleted_bytes": {
+            "type": "integer",
+            "title": "Deleted Bytes",
+            "default": 0
+          },
+          "outcomes": {
+            "items": {
+              "additionalProperties": true,
+              "type": "object"
+            },
+            "type": "array",
+            "title": "Outcomes",
+            "description": "逐文件结果：category/path/outcome(deleted|missing|symlink_refused|path_refused|failed)/bytes/error"
+          }
+        },
+        "type": "object",
+        "required": [
+          "job_kind",
+          "job_id",
+          "status",
+          "planned_files"
+        ],
+        "title": "PlanItemModel",
+        "description": "清理计划中单个作业项的执行结果（计划先持久化，删除逐项推进、可重试）。"
+      },
+      "PreviewFileEntry": {
+        "properties": {
+          "category": {
+            "type": "string",
+            "title": "Category",
+            "description": "result/receipt/raw_input/partial_output/bundle_staging 等类别"
+          },
+          "path": {
+            "type": "string",
+            "title": "Path",
+            "description": "相对数据目录的路径（仅用于核对，不返回任何日志内容）"
+          },
+          "bytes": {
+            "type": "integer",
+            "title": "Bytes"
+          },
+          "status": {
+            "type": "string",
+            "enum": [
+              "present",
+              "missing"
+            ],
+            "title": "Status",
+            "description": "present=现存（计释放空间）；missing=规范集合中本应存在但已缺失，执行时记录为 missing，不影响关联记录删除",
+            "default": "present"
+          },
+          "note": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Note",
+            "description": "symlink=该路径是符号链接（执行时拒绝）；out_of_tree=越界路径；contains_symlink=暂存目录内含符号链接；null=普通文件"
+          }
+        },
+        "type": "object",
+        "required": [
+          "category",
+          "path",
+          "bytes"
+        ],
+        "title": "PreviewFileEntry",
+        "description": "预览中的单个待删文件类别条目（只有相对路径/类别/大小，绝不读取内容）。"
+      },
+      "PreviewItem": {
+        "properties": {
+          "job_kind": {
+            "type": "string",
+            "enum": [
+              "batch",
+              "stream",
+              "bundle"
+            ],
+            "title": "Job Kind"
+          },
+          "job_id": {
+            "type": "string",
+            "title": "Job Id"
+          },
+          "terminal_status": {
+            "type": "string",
+            "enum": [
+              "succeeded",
+              "failed",
+              "cancelled"
+            ],
+            "title": "Terminal Status"
+          },
+          "needs_review": {
+            "type": "boolean",
+            "title": "Needs Review"
+          },
+          "completed_at": {
+            "type": "string",
+            "title": "Completed At"
+          },
+          "retention_days": {
+            "anyOf": [
+              {
+                "type": "number"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Retention Days"
+          },
+          "rule_source": {
+            "type": "string",
+            "enum": [
+              "builtin",
+              "custom"
+            ],
+            "title": "Rule Source",
+            "description": "命中的期限规则来源；null 期限表示永久保留，不会出现在预览中"
+          },
+          "expired": {
+            "type": "boolean",
+            "title": "Expired"
+          },
+          "files": {
+            "items": {
+              "$ref": "#/components/schemas/PreviewFileEntry"
+            },
+            "type": "array",
+            "title": "Files"
+          },
+          "bytes_total": {
+            "type": "integer",
+            "title": "Bytes Total",
+            "description": "预计释放字节数（现存文件大小之和）"
+          }
+        },
+        "type": "object",
+        "required": [
+          "job_kind",
+          "job_id",
+          "terminal_status",
+          "needs_review",
+          "completed_at",
+          "retention_days",
+          "rule_source",
+          "expired",
+          "files",
+          "bytes_total"
+        ],
+        "title": "PreviewItem",
+        "description": "预览中的单个待删作业（不含日志内容、审计内容）。"
+      },
+      "ReceiptVerifyResponse": {
+        "properties": {
+          "job_id": {
+            "type": "string",
+            "title": "Job Id"
+          },
+          "job_kind": {
+            "type": "string",
+            "enum": [
+              "batch",
+              "stream",
+              "bundle"
+            ],
+            "title": "Job Kind"
+          },
+          "ok": {
+            "type": "boolean",
+            "title": "Ok",
+            "description": "凭证标签与结果摘要均一致时为 true"
+          },
+          "verdict": {
+            "type": "string",
+            "enum": [
+              "ok",
+              "unsupported_format",
+              "key_mismatch",
+              "receipt_tampered",
+              "job_mismatch",
+              "result_missing",
+              "content_mismatch"
+            ],
+            "title": "Verdict",
+            "description": "ok=一致；unsupported_format=格式不支持；key_mismatch=密钥不匹配；receipt_tampered=凭证被改动；job_mismatch=凭证与本作业不对应；result_missing=结果缺失；content_mismatch=内容不符"
+          },
+          "detail": {
+            "type": "string",
+            "title": "Detail",
+            "description": "结论说明（不含原始值/处理后值）"
+          },
+          "checks": {
+            "additionalProperties": {
+              "type": "string"
+            },
+            "type": "object",
+            "title": "Checks",
+            "description": "各校验阶段结果（ok/failed/skipped）：format/binding/structure/key/tag/result/content"
+          }
+        },
+        "type": "object",
+        "required": [
+          "job_id",
+          "job_kind",
+          "ok",
+          "verdict",
+          "detail",
+          "checks"
+        ],
+        "title": "ReceiptVerifyResponse",
+        "description": "凭证校验结论。HTTP 恒为 200，结论看 ``verdict``；不返回任何文件内容。"
+      },
+      "RetentionAuditEntry": {
+        "properties": {
+          "id": {
+            "type": "integer",
+            "title": "Id"
+          },
+          "ts": {
+            "type": "string",
+            "title": "Ts"
+          },
+          "action": {
+            "type": "string",
+            "title": "Action",
+            "description": "policy.rule.set / policy.rule.deleted / lock.created / lock.released / cleanup.plan.created / cleanup.plan.started / cleanup.item.done / cleanup.item.failed / cleanup.plan.finished / cleanup.plan.retried"
+          },
+          "job_kind": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Job Kind"
+          },
+          "job_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Job Id"
+          },
+          "plan_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Plan Id"
+          },
+          "detail": {
+            "additionalProperties": true,
+            "type": "object",
+            "title": "Detail"
+          }
+        },
+        "type": "object",
+        "required": [
+          "id",
+          "ts",
+          "action"
+        ],
+        "title": "RetentionAuditEntry",
+        "description": "保留/清理审计条目（只含动作、目标与计数，绝不含日志内容）。"
+      },
+      "RetentionAuditPage": {
+        "properties": {
+          "total": {
+            "type": "integer",
+            "title": "Total"
+          },
+          "limit": {
+            "type": "integer",
+            "title": "Limit"
+          },
+          "offset": {
+            "type": "integer",
+            "title": "Offset"
+          },
+          "items": {
+            "items": {
+              "$ref": "#/components/schemas/RetentionAuditEntry"
+            },
+            "type": "array",
+            "title": "Items"
+          }
+        },
+        "type": "object",
+        "required": [
+          "total",
+          "limit",
+          "offset",
+          "items"
+        ],
+        "title": "RetentionAuditPage"
+      },
+      "RetentionLockList": {
+        "properties": {
+          "total": {
+            "type": "integer",
+            "title": "Total"
+          },
+          "items": {
+            "items": {
+              "$ref": "#/components/schemas/RetentionLockModel"
+            },
+            "type": "array",
+            "title": "Items"
+          }
+        },
+        "type": "object",
+        "required": [
+          "total",
+          "items"
+        ],
+        "title": "RetentionLockList"
+      },
+      "RetentionLockModel": {
+        "properties": {
+          "job_kind": {
+            "type": "string",
+            "enum": [
+              "batch",
+              "stream",
+              "bundle"
+            ],
+            "title": "Job Kind"
+          },
+          "job_id": {
+            "type": "string",
+            "title": "Job Id"
+          },
+          "reason": {
+            "type": "string",
+            "maxLength": 512,
+            "minLength": 1,
+            "title": "Reason",
+            "description": "加锁原因（不含敏感值）"
+          },
+          "expires_at": {
+            "type": "string",
+            "format": "date-time",
+            "title": "Expires At",
+            "description": "到期时间（UTC ISO 8601）；到期后自动失效"
+          },
+          "created_at": {
+            "type": "string",
+            "title": "Created At"
+          },
+          "state": {
+            "type": "string",
+            "enum": [
+              "active",
+              "expired",
+              "released"
+            ],
+            "title": "State",
+            "description": "active=生效中；expired=已到期；released=已释放"
+          }
+        },
+        "type": "object",
+        "required": [
+          "job_kind",
+          "job_id",
+          "reason",
+          "expires_at",
+          "created_at",
+          "state"
+        ],
+        "title": "RetentionLockModel",
+        "description": "作业保留锁：带原因与到期时间；到期前该作业不得被清理。"
+      },
+      "RetentionPolicyResponse": {
+        "properties": {
+          "rules": {
+            "items": {
+              "$ref": "#/components/schemas/RetentionRuleModel"
+            },
+            "type": "array",
+            "title": "Rules"
+          }
+        },
+        "type": "object",
+        "required": [
+          "rules"
+        ],
+        "title": "RetentionPolicyResponse",
+        "description": "生效中的保留策略：内置默认规则 + 调用方覆盖（含永久保留）。"
+      },
+      "RetentionRuleModel": {
+        "properties": {
+          "job_kind": {
+            "type": "string",
+            "enum": [
+              "batch",
+              "stream",
+              "bundle"
+            ],
+            "title": "Job Kind"
+          },
+          "terminal_status": {
+            "type": "string",
+            "enum": [
+              "succeeded",
+              "failed",
+              "cancelled"
+            ],
+            "title": "Terminal Status"
+          },
+          "needs_review": {
+            "type": "string",
+            "enum": [
+              "true",
+              "false",
+              "any"
+            ],
+            "title": "Needs Review",
+            "description": "true/false=仅匹配对应复核状态；any=两者皆适用"
+          },
+          "retention_days": {
+            "anyOf": [
+              {
+                "type": "number",
+                "minimum": 0.0
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Retention Days",
+            "description": "自终态时间起的保留天数（小数可用，如 0.5=12 小时）；null=永久保留"
+          },
+          "builtin": {
+            "type": "boolean",
+            "title": "Builtin",
+            "description": "内置默认规则不可删除，只能覆盖",
+            "default": false
+          },
+          "updated_at": {
+            "type": "string",
+            "title": "Updated At"
+          }
+        },
+        "type": "object",
+        "required": [
+          "job_kind",
+          "terminal_status",
+          "needs_review",
+          "retention_days",
+          "updated_at"
+        ],
+        "title": "RetentionRuleModel",
+        "description": "单条保留期限规则：(作业类型, 终态, 需复核) 三元组唯一。"
       },
       "RiskDiffItem": {
         "properties": {
@@ -2511,6 +4609,57 @@
         ],
         "title": "TypeChangeItem",
         "description": "同一叶子输出值的 JSON 类型变化（只记录类型名，不记录值）。"
+      },
+      "UpsertRetentionRuleRequest": {
+        "properties": {
+          "job_kind": {
+            "type": "string",
+            "enum": [
+              "batch",
+              "stream",
+              "bundle"
+            ],
+            "title": "Job Kind"
+          },
+          "terminal_status": {
+            "type": "string",
+            "enum": [
+              "succeeded",
+              "failed",
+              "cancelled"
+            ],
+            "title": "Terminal Status"
+          },
+          "needs_review": {
+            "type": "string",
+            "enum": [
+              "true",
+              "false",
+              "any"
+            ],
+            "title": "Needs Review",
+            "default": "any"
+          },
+          "retention_days": {
+            "anyOf": [
+              {
+                "type": "number",
+                "minimum": 0.0
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Retention Days",
+            "description": "保留天数；null=永久保留（覆盖内置期限）"
+          }
+        },
+        "type": "object",
+        "required": [
+          "job_kind",
+          "terminal_status"
+        ],
+        "title": "UpsertRetentionRuleRequest"
       },
       "ValidationError": {
         "properties": {

@@ -734,6 +734,11 @@ class PreviewFileEntry(BaseModel):
     )
     path: str = Field(description="相对数据目录的路径（仅用于核对，不返回任何日志内容）")
     bytes: int
+    status: Literal["present", "missing"] = Field(
+        default="present",
+        description="present=现存（计释放空间）；missing=规范集合中本应存在但已缺失，"
+                    "执行时记录为 missing，不影响关联记录删除",
+    )
     note: str | None = Field(
         default=None,
         description="symlink=该路径是符号链接（执行时拒绝）；out_of_tree=越界路径；"

@@ -283,6 +283,9 @@ CREATE INDEX IF NOT EXISTS idx_retention_audit_plan ON retention_audit(plan_id);
 """
 
 
+_RULE_NOT_BUILTIN = object()
+
+
 def utcnow_iso() -> str:
     return datetime.now(timezone.utc).isoformat(timespec="seconds")
 
@@ -367,6 +370,22 @@ class Database:
                     "ALTER TABLE cleanup_plan_items ADD COLUMN "
                     "needs_review INTEGER NOT NULL DEFAULT 0"
                 )
+            # 保留锁释放原因（''=生效中 / released=提前释放 / expired=到期失效），
+            # 让状态判定只依赖落库列，不再与查询时刻的时间耦合
+            lock_cols = {
+                r["name"] for r in conn.execute("PRAGMA table_info(retention_locks)")
+            }
+            if "release_reason" not in lock_cols:
+                conn.execute(
+                    "ALTER TABLE retention_locks ADD COLUMN "
+                    "release_reason TEXT NOT NULL DEFAULT ''"
+                )
+            # 历史遗留：未释放但已到期的锁一次性补登为到期失效
+            conn.execute(
+                "UPDATE retention_locks SET release_reason='expired', released_at=? "
+                "WHERE released_at='' AND expires_at<=?",
+                (utcnow_iso(), utcnow_iso()),
+            )
 
     # ---------- 写入 ----------
 
@@ -1319,14 +1338,43 @@ class Database:
     def delete_retention_rule(
         self, *, job_kind: str, terminal_status: str, needs_review: str
     ) -> bool:
-        """删除调用方自定义规则；内置规则与不存在的键返回 False。"""
+        """删除自定义覆盖并回退内置默认：
+
+        * 键上只有自定义规则 → 删除后补回内置默认行（内置期限不会消失）；
+        * 键上本来就是内置默认（无覆盖）→ 返回 False。
+        """
+        from .retention import DEFAULT_RETENTION_RULES
+
+        builtin_default = next(
+            (days for k, s, rv, days in DEFAULT_RETENTION_RULES
+             if (k, s, rv) == (job_kind, terminal_status, needs_review)),
+            _RULE_NOT_BUILTIN,
+        )
         with self._lock, self._conn() as conn:
-            cur = conn.execute(
+            row = conn.execute(
+                "SELECT builtin FROM retention_rules WHERE job_kind=? "
+                "AND terminal_status=? AND needs_review=?",
+                (job_kind, terminal_status, needs_review),
+            ).fetchone()
+            if row is None:
+                return False
+            if row["builtin"]:
+                return False
+            conn.execute(
                 "DELETE FROM retention_rules WHERE job_kind=? AND terminal_status=? "
-                "AND needs_review=? AND builtin=0",
+                "AND needs_review=?",
                 (job_kind, terminal_status, needs_review),
             )
-            return cur.rowcount > 0
+            # 该键存在内置默认时补回；否则保持“无规则=永久保留”
+            if builtin_default is not _RULE_NOT_BUILTIN:
+                conn.execute(
+                    """INSERT INTO retention_rules
+                       (job_kind, terminal_status, needs_review, retention_days,
+                        builtin, updated_at) VALUES (?,?,?,?,1,?)""",
+                    (job_kind, terminal_status, needs_review, builtin_default,
+                     utcnow_iso()),
+                )
+        return True
 
     def get_retention_rule(
         self, *, job_kind: str, terminal_status: str, needs_review: str
@@ -1367,10 +1415,11 @@ class Database:
         return row
 
     def expire_retention_lock(self, lock_id: int) -> None:
-        """既有未释放锁已过期：标记失效（released_at 记录失效时间）。"""
+        """既有未释放锁已过期：标记到期失效（released_at/release_reason 同事务落库）。"""
         with self._lock, self._conn() as conn:
             conn.execute(
-                "UPDATE retention_locks SET released_at=? WHERE id=? AND released_at=''",
+                "UPDATE retention_locks SET released_at=?, release_reason='expired' "
+                "WHERE id=? AND released_at=''",
                 (utcnow_iso(), lock_id),
             )
 
@@ -1378,7 +1427,7 @@ class Database:
         """主动释放未到期的锁；没有未释放锁时返回 None。"""
         with self._lock, self._conn() as conn:
             cur = conn.execute(
-                "UPDATE retention_locks SET released_at=? "
+                "UPDATE retention_locks SET released_at=?, release_reason='released' "
                 "WHERE job_kind=? AND job_id=? AND released_at=''",
                 (utcnow_iso(), job_kind, job_id),
             )
@@ -1390,20 +1439,33 @@ class Database:
                 (job_kind, job_id),
             ).fetchone()
 
+    def expire_due_locks(self, now_iso: str | None = None) -> int:
+        """把所有已到期但尚未标记的未释放锁统一置为到期失效。
+
+        列表查询与清理评估共用同一时间基准（服务当前时间）调用本方法，
+        消除“同一把锁一边已到期、一边无法按 expired 查到”的不一致。
+        """
+        stamp = now_iso or utcnow_iso()
+        with self._lock, self._conn() as conn:
+            cur = conn.execute(
+                "UPDATE retention_locks SET released_at=?, release_reason='expired' "
+                "WHERE released_at='' AND expires_at<=?",
+                (stamp, stamp),
+            )
+            return cur.rowcount
+
     def list_retention_locks(
         self, *, state: str | None, job_kind: str | None, limit: int, offset: int
     ) -> tuple[list[sqlite3.Row], int]:
+        # 状态只依据落库列判定：active=未释放；expired/released=已释放且有对应原因。
+        # 未释放但已到期的锁先由保留模块统一惰性失效，调用方看到的状态与清理评估一致。
         where: list[str] = []
         params: list[Any] = []
-        if state in ("active", "expired", "released"):
-            where.append(
-                "released_at=''" if state == "active"
-                else "released_at<>'' AND (expires_at < ?)"
-                if state == "expired"
-                else "released_at<>'' AND (expires_at >= ?)"
-            )
-            if state in ("expired", "released"):
-                params.append(utcnow_iso())
+        if state == "active":
+            where.append("released_at=''")
+        elif state in ("expired", "released"):
+            where.append("release_reason=?")
+            params.append(state)
         if job_kind is not None:
             where.append("job_kind=?")
             params.append(job_kind)
@@ -1423,7 +1485,7 @@ class Database:
         """作业被删除时，其保留锁随之失效，避免悬挂的 active 锁。"""
         with self._lock, self._conn() as conn:
             conn.execute(
-                "UPDATE retention_locks SET released_at=? "
+                "UPDATE retention_locks SET released_at=?, release_reason='expired' "
                 "WHERE job_kind=? AND job_id=? AND released_at=''",
                 (utcnow_iso(), job_kind, job_id),
             )
@@ -1644,7 +1706,7 @@ class Database:
                 col = "id" if table in job_tables else "job_id"
                 conn.execute(f"DELETE FROM {table} WHERE {col}=?", (job_id,))
             conn.execute(
-                "UPDATE retention_locks SET released_at=? "
+                "UPDATE retention_locks SET released_at=?, release_reason='expired' "
                 "WHERE job_kind=? AND job_id=? AND released_at=''",
                 (utcnow_iso(), job_kind, job_id),
             )

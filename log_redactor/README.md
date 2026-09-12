@@ -29,6 +29,7 @@
 | 幂等 | 请求头 `Idempotency-Key` 相同的重复提交直接回放首个作业；回放要求**内容、规范化策略与令牌关联域三者均一致**，任一不同返回 409 |
 | 大批量流式作业 | `POST /api/v1/stream-jobs` 以 multipart 上传 NDJSON 大文件：原始文件 **0600 临时落盘**、逐行脱敏（不读入整包）、安全检查点记录字节/记录/审计/风险进度，可取消、可在**重启后从检查点继续**，成功后原子发布结果；幂等键同时校验文件内容**与策略**摘要 |
 | 试运行 | `POST /strategies/validate` 即时返回脱敏结果，不写库、不落文件 |
+| 数据保留与安全清理 | 策略/锁/预览/执行/进度/审计全套接口（见下节）；预览不返回任何日志内容，目标变化拒绝执行，符号链接/越界路径拒绝删除，可重试、可在重启后续跑 |
 
 ## 快速开始
 
@@ -296,6 +297,55 @@ curl -sS -X POST http://127.0.0.1:8080/api/v1/stream-jobs \
   （`T-XXXX`），数值从 HMAC 数字流构造等宽替身；不可逆推原值，映射与规则无关。
 - 审计的 `hit_by` 只记录维度名（`field_match`、`detector:<名称>`、`value_pattern#<序号>`），
   不写入原始正则文本或任何命中的原文。
+
+## 本地数据保留与安全清理
+
+统一管理三类作业（小批量 `batch`、流式 NDJSON `stream`、诊断包 `bundle`）的作业记录、结果文件与
+完整性凭证的本地保留期限，离线运行、数据不出本机。
+
+- **保留策略**：按「作业类型 × 终态（succeeded/failed/cancelled）× 是否需复核（true/false/any）」
+  配置保留天数；`null` 表示永久保留。服务首次启动播种内置默认（如小批量成功结果无需复核 30 天、
+  需复核 90 天，流式失败 7 天、取消 3 天）。PUT 覆盖自定义期限；DELETE 删除自定义覆盖并**回退到
+  内置默认**（内置规则不会消失；内置没有的键则回到“无规则=永久保留”）。
+- **保留锁**：可为指定作业设置带原因与到期时间的锁。到期前该作业不会被删除；同一作业至多一把
+  生效中的锁（重复请求幂等，原因/到期不同返回 409）；可提前释放，到期后按服务当前时间自动失效。
+- **预览不读内容**：`POST /api/v1/retention/cleanup/preview` 只返回待删作业、文件类别
+  （result/receipt/raw_input/partial_output/bundle_staging）、相对路径、状态与大小，**绝不打开或
+  返回任何日志/结果/审计内容**。规范集合中已缺失的文件标记为 `missing`（不计释放空间，但执行时
+  留痕）。运行中作业、保留锁未到期、期限未满、永久保留分别计入 `blocked` 计数。
+- **时间基准唯一**：保留期限、锁失效与清理守卫全部按**服务当前时间**评估；请求体可传 `now` 但
+  只允许 ±5 分钟时钟偏差，明显的未来/过去时间返回 400，无法用未来时间让刚完成、仍在保留期内的
+  作业被提前清理。
+- **执行须提交预览摘要**：执行请求原样回传 `target_fingerprint` 与计数；服务重新计算目标，
+  任何变化（文件增减、加锁、改期限）都返回 **409**，要求重新预览。支持 `Idempotency-Key`，
+  同键/同目标指纹的重复提交回放同一计划。
+- **计划先持久化、再删除**：计划头与逐作业项先落库（pending），后台串行执行；服务重启后自动
+  继续未完成计划。文件全部安全删除后才删除该作业的数据库记录（审计/风险/作业行/锁）。
+- **安全删除边界**：只删除服务按 job_id 派生、词法路径位于 `jobs/`、`streams/`、`bundles/`
+  之内的目标。删除前整体预扫描：**符号链接（含父目录为链接、暂存目录内含链接）与越界路径让整个
+  作业项在删除任何文件之前失败**，绝不跟随链接（因此链接指向的、可能被另一把锁保护的文件不会被
+  误删）。文件缺失按已删处理（幂等）；部分失败标记 `partial` 并可调用 retry 只重试失败项。
+- **进度与审计**：`GET .../cleanup/plans[/{id}]` 查计划与逐文件结果（deleted/missing/
+  symlink_refused/path_refused/failed）；`GET .../audit` 按计划/作业/动作过滤审计，内容只含
+  动作、目标标识、结果与计数。
+
+| 方法 & 路径 | 说明 |
+| --- | --- |
+| `GET /api/v1/retention/policy` | 查询生效策略（内置默认 + 自定义覆盖） |
+| `PUT /api/v1/retention/rules` | upsert 单条期限规则（幂等；`retention_days=null` 永久保留） |
+| `DELETE /api/v1/retention/rules/{kind}/{status}/{review}` | 删除自定义覆盖，回退内置默认 |
+| `PUT /api/v1/retention/locks` | 为作业加保留锁（原因 + 到期时间）；重复请求幂等 |
+| `DELETE /api/v1/retention/locks/{kind}/{job_id}` | 提前释放保留锁 |
+| `GET /api/v1/retention/locks` | 锁列表（state=active/expired/released，可按类型过滤、分页） |
+| `POST /api/v1/retention/cleanup/preview` | 清理预览：待删作业、文件类别、预计释放空间（不读内容） |
+| `POST /api/v1/retention/cleanup/execute` | 提交预览摘要执行；目标变化 409；支持幂等键 |
+| `GET /api/v1/retention/cleanup/plans[/{id}]` | 计划列表 / 计划进度与逐文件结果 |
+| `POST /api/v1/retention/cleanup/plans/{id}/retry` | 重试失败/未完成作业项 |
+| `GET /api/v1/retention/audit` | 保留/清理审计（可按计划/作业/动作过滤、分页） |
+
+```bash
+bash examples/retention-cleanup.sh   # 策略→加锁→预览→执行→进度→审计 的完整本地流程
+```
 
 ## 数据与配置
 

@@ -28,6 +28,8 @@
 * ``GET  /api/v1/{jobs,stream-jobs,bundle-jobs}/{job_id}/receipt`` 完整性凭证查询
 * ``GET  /api/v1/{jobs,stream-jobs,bundle-jobs}/{job_id}/receipt/download`` 凭证下载
 * ``POST /api/v1/{jobs,stream-jobs,bundle-jobs}/{job_id}/receipt/verify`` 凭证校验
+* ``GET/PUT/DELETE /api/v1/retention/...``  本地数据保留策略、保留锁、清理预览/执行/
+  计划进度/重试与审计（预览不返回日志内容；目标变化拒绝执行；符号链接/越界拒绝删除）
 * ``GET  /api/v1/sample/strategy``、``/sample/logs.ndjson``  可直接启动的示例
 * ``GET  /healthz``                     健康检查（含主密钥指纹）
 
@@ -1410,17 +1412,10 @@ def _preview_dict_to_response(preview: dict[str, Any]) -> CleanupPreviewResponse
                                      if k != "job_kinds"})
 
 
-def _start_cleanup_plan(plan_id: str) -> None:
-    """后台执行已持久化的清理计划；同步快速完成也在同一线程串行删除。"""
-    def _run() -> None:
-        try:
-            retention.run_cleanup_plan(plan_id, get_db)
-        except Exception:
-            # 计划保持 running/pending，重启或重试时继续
-            pass
-
-    thread = threading.Thread(target=_run, name=f"cleanup-plan-{plan_id}", daemon=True)
-    thread.start()
+def _start_cleanup_plan(plan_id: str, *, retry_failed_only: bool = False) -> None:
+    """后台执行已持久化的清理计划（代次调度，重试会挤退陈旧 worker）。"""
+    retention.start_plan(
+        plan_id, get_db, retry_failed_only=retry_failed_only)
 
 
 @app.get(
@@ -1571,7 +1566,10 @@ def list_retention_locks(
         raise HTTPException(status_code=400, detail="非法 state 过滤值")
     if job_kind is not None and job_kind not in retention.JOB_KINDS:
         raise HTTPException(status_code=400, detail="非法 job_kind 过滤值")
-    rows, total = get_db().list_retention_locks(
+    db = get_db()
+    # 与清理评估同一时间基准：查询前统一把到期锁置为 expired
+    db.expire_due_locks()
+    rows, total = db.list_retention_locks(
         state=state, job_kind=job_kind, limit=limit, offset=offset
     )
     current = retention._now()  # noqa: SLF001
@@ -1598,11 +1596,14 @@ def post_cleanup_preview(req: CleanupPreviewRequest) -> CleanupPreviewResponse:
         bad = [k for k in req.job_kinds if k not in retention.JOB_KINDS]
         if bad:
             raise HTTPException(status_code=400, detail=f"非法作业类型: {bad}")
-    preview = retention.build_preview(
-        get_db(),
-        job_kinds=tuple(req.job_kinds) if req.job_kinds else None,
-        now=req.now,
-    )
+    try:
+        preview = retention.build_preview(
+            get_db(),
+            job_kinds=tuple(req.job_kinds) if req.job_kinds else None,
+            now=req.now,
+        )
+    except retention.InvalidNowError as exc:
+        raise HTTPException(status_code=400, detail={"message": str(exc)}) from exc
     return _preview_dict_to_response(preview)
 
 
@@ -1653,7 +1654,10 @@ def post_cleanup_execute(
                 content={"replayed": True, "plan": plan.model_dump(mode="json")},
             )
 
-    current = retention.build_preview(get_db(), job_kinds=kinds, now=req.now)
+    try:
+        current = retention.build_preview(get_db(), job_kinds=kinds, now=req.now)
+    except retention.InvalidNowError as exc:
+        raise HTTPException(status_code=400, detail={"message": str(exc)}) from exc
 
     # 首次执行：目标发生变化（文件增减、加锁、期限调整等）一律拒绝，要求重新预览
     if current["target_fingerprint"] != req.target_fingerprint:
@@ -1756,11 +1760,13 @@ def retry_cleanup_plan(plan_id: str) -> JSONResponse:
     if plan.status == "succeeded":
         raise HTTPException(status_code=409, detail="清理计划已成功完成，无需重试")
     reset = get_db().reset_failed_plan_items(plan_id)
-    if reset == 0 and plan.status != "failed":
-        # 没有失败项可重试（可能全部 pending 等待重启续跑）：直接继续执行
+    if reset == 0 and plan.status not in ("failed", "partial"):
+        # 没有失败项（如 pending 等待重启续跑）：直接继续执行
         _start_cleanup_plan(plan_id)
         return JSONResponse(status_code=202,
-                            content={"retried": 0, "plan": _require_plan(plan_id).model_dump(mode="json")})
+                            content={"retried": 0,
+                                     "plan": _require_plan(plan_id).model_dump(mode="json")})
+    # 失败项已复位为 pending：以普通续跑模式处理（覆盖 pending+failed）
     _start_cleanup_plan(plan_id)
     return JSONResponse(
         status_code=202,
