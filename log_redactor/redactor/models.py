@@ -12,8 +12,16 @@ from .detectors import DETECTOR_NAMES
 
 ActionType = Literal["delete", "mask", "tokenize"]
 InputFormat = Literal["json", "ndjson"]
+DecoderKind = Literal["json_string", "url_query", "form_urlencoded"]
+DECODER_KINDS: tuple[str, ...] = ("json_string", "url_query", "form_urlencoded")
 
 _RULE_ID = re.compile(r"^[a-z0-9][a-z0-9_-]{0,63}$")
+
+# 内嵌解码的硬上限：策略配置只能在此范围内收紧，不能放大
+MAX_DECODE_DEPTH_LIMIT = 8
+MAX_DECODE_BYTES_LIMIT = 4 * 1024 * 1024
+DEFAULT_MAX_DECODE_DEPTH = 2
+DEFAULT_MAX_DECODE_BYTES = 256 * 1024
 
 
 class MatchSpec(BaseModel):
@@ -117,11 +125,75 @@ class Rule(BaseModel):
         return self
 
 
+class EmbeddedDecoder(BaseModel):
+    """为指定字段声明的内嵌结构解码器。
+
+    命中字段的字符串值先按声明格式解码成内部结构，内部键和值继续走
+    现有字段路径/键名/识别器规则与 delete/mask/tokenize 动作，处理完
+    再编码回写外层字段。匹配维度之间是 AND，同一维度内多个值是 OR
+    （与规则匹配的字段/键名维度同语义）。
+    """
+
+    decoder: DecoderKind = Field(
+        description="解码器：json_string=字段值是 JSON 文本；"
+                    "url_query=解析 URL 查询串；form_urlencoded=解析表单体",
+    )
+    field_paths: list[str] = Field(
+        default_factory=list,
+        description="JSONPath 风格路径通配，如 $.payload、**.callback_url",
+    )
+    key_names: list[str] = Field(
+        default_factory=list, description="按键名精确匹配，如 payload、form_body"
+    )
+    key_globs: list[str] = Field(
+        default_factory=list, description="键名通配，如 *_payload、*url"
+    )
+    key_patterns: list[str] = Field(
+        default_factory=list, description="键名正则（任一命中即可）"
+    )
+
+    @field_validator("key_patterns")
+    @classmethod
+    def _check_regex(cls, v: list[str]) -> list[str]:
+        for p in v:
+            try:
+                re.compile(p)
+            except re.error as exc:
+                raise ValueError(f"非法正则 {p!r}: {exc}") from exc
+        return v
+
+    @model_validator(mode="after")
+    def _check_match_nonempty(self) -> "EmbeddedDecoder":
+        if not (self.field_paths or self.key_names
+                or self.key_globs or self.key_patterns):
+            raise ValueError("解码器声明至少需要一个字段/键名匹配维度")
+        return self
+
+
 class Strategy(BaseModel):
     name: str
     version: str = "1"
     description: str = ""
     rules: list[Rule]
+    decoders: list[EmbeddedDecoder] = Field(
+        default_factory=list,
+        description="内嵌结构解码器声明（按声明顺序，首个命中的解码器生效）；"
+                    "解码失败的字段保持原值并记录待复核原因",
+    )
+    max_decode_depth: int = Field(
+        default=DEFAULT_MAX_DECODE_DEPTH,
+        ge=1,
+        le=MAX_DECODE_DEPTH_LIMIT,
+        description=f"内嵌解码最大嵌套层级（1-{MAX_DECODE_DEPTH_LIMIT}，默认 "
+                    f"{DEFAULT_MAX_DECODE_DEPTH}）；超限保持原值并记录待复核",
+    )
+    max_decode_bytes: int = Field(
+        default=DEFAULT_MAX_DECODE_BYTES,
+        ge=1024,
+        le=MAX_DECODE_BYTES_LIMIT,
+        description=f"单字段内嵌展开字节上限（1024-{MAX_DECODE_BYTES_LIMIT}，默认 "
+                    f"{DEFAULT_MAX_DECODE_BYTES}）；超限保持原值并记录待复核",
+    )
     risk_detectors: list[str] = Field(
         default_factory=lambda: ["email", "phone", "ipv4", "access_token",
                                  "id_card", "bank_card"],
@@ -355,6 +427,16 @@ class AuditEntry(BaseModel):
     match_type: Literal["field", "content"]
     hit_by: list[str] = Field(description="命中维度/识别器/正则名称")
     occurrences: int = Field(default=1, description="该位置内容动作的替换次数")
+    decode_depth: int = Field(
+        default=0,
+        description="内嵌解码层级：0=记录顶层字段；1=第一层解码结构内；以此类推",
+    )
+    outer_field_path: str | None = Field(
+        default=None, description="本层级解码发生处的外层字段路径（未在解码结构内为 null）"
+    )
+    inner_path: str | None = Field(
+        default=None, description="相对本层解码根的内部路径（未在解码结构内为 null）"
+    )
     source_path: str | None = Field(
         default=None, description="诊断包作业中来源文件在压缩包内的相对路径"
     )
@@ -368,6 +450,37 @@ class RiskFinding(BaseModel):
     field_path: str
     detector: str
     length: int = Field(description="命中片段长度，便于人工判断")
+    decode_depth: int = Field(
+        default=0,
+        description="内嵌解码层级：0=记录顶层字段；1=第一层解码结构内；以此类推",
+    )
+    outer_field_path: str | None = Field(
+        default=None, description="本层级解码发生处的外层字段路径（未在解码结构内为 null）"
+    )
+    inner_path: str | None = Field(
+        default=None, description="相对本层解码根的内部路径（未在解码结构内为 null）"
+    )
+    source_path: str | None = Field(
+        default=None, description="诊断包作业中来源文件在压缩包内的相对路径"
+    )
+
+
+DecodeIssueReason = Literal["decode_failed", "depth_exceeded", "bytes_exceeded"]
+
+
+class DecodeIssue(BaseModel):
+    """内嵌结构解码未执行（字段保持原值）的待复核原因。按设计不含任何原始值。"""
+
+    record_index: int = Field(description="记录在批次/来源文件中的序号（从 0 开始）")
+    line_no: int | None = Field(default=None, description="NDJSON/文本输入时的行号（从 1 开始）")
+    field_path: str = Field(description="声明了解码器的外层字段路径")
+    decoder: str = Field(description="声明的解码器：json_string/url_query/form_urlencoded")
+    reason: DecodeIssueReason = Field(
+        description="decode_failed=解码失败；depth_exceeded=嵌套层级超限；"
+                    "bytes_exceeded=展开字节超限"
+    )
+    decode_depth: int = Field(description="尝试解码时目标层级（记录顶层字段为 1）")
+    detail: str = Field(default="", description="原因说明（不含原值）")
     source_path: str | None = Field(
         default=None, description="诊断包作业中来源文件在压缩包内的相对路径"
     )
@@ -384,6 +497,7 @@ class RunStats(BaseModel):
     fields_scanned: int
     audit_entries: int
     risk_findings: int
+    decode_issues: int = Field(default=0, description="内嵌解码待复核条数")
     by_action: dict[str, int]
     by_rule: dict[str, int]
 
@@ -392,6 +506,7 @@ class RunResult(BaseModel):
     records: list[Any]
     audit: list[AuditEntry]
     risks: list[RiskFinding]
+    decode_issues: list[DecodeIssue] = Field(default_factory=list)
     stats: RunStats
     needs_review: bool
     key_fingerprint: str
@@ -426,6 +541,7 @@ class JobModel(BaseModel):
 class JobDetail(JobModel):
     audit: list[AuditEntry]
     risks: list[RiskFinding]
+    decode_issues: list[DecodeIssue] = Field(default_factory=list)
 
 
 class JobSummary(BaseModel):
@@ -474,6 +590,7 @@ class StreamJobModel(BaseModel):
     records_processed: int = 0
     audit_count: int = 0
     risk_count: int = 0
+    decode_issue_count: int = Field(default=0, description="内嵌解码待复核条数")
     fields_scanned: int = 0
     by_action: dict[str, int] = Field(default_factory=dict)
     by_rule: dict[str, int] = Field(default_factory=dict)
@@ -528,6 +645,14 @@ class RiskPage(BaseModel):
     items: list[RiskFinding]
 
 
+class DecodeIssuePage(BaseModel):
+    job_id: str
+    total: int
+    limit: int
+    offset: int
+    items: list[DecodeIssue]
+
+
 # ---------- 诊断包（ZIP）作业 ----------
 
 BundleJobStatus = Literal["queued", "running", "succeeded", "failed", "cancelled"]
@@ -550,6 +675,7 @@ class BundleFileInfo(BaseModel):
     lines: int = Field(default=0, description="文本/NDJSON 文件的物理行数")
     audit_entries: int = 0
     risk_findings: int = 0
+    decode_issues: int = Field(default=0, description="该文件的内嵌解码待复核条数")
     output_path: str | None = Field(
         default=None, description="结果 ZIP 内的相对路径（skipped/failed 为 null）"
     )
@@ -591,6 +717,7 @@ class BundleJobModel(BaseModel):
     records_processed: int = 0
     audit_count: int = 0
     risk_count: int = 0
+    decode_issue_count: int = Field(default=0, description="内嵌解码待复核条数")
     fields_scanned: int = 0
     by_action: dict[str, int] = Field(default_factory=dict)
     by_rule: dict[str, int] = Field(default_factory=dict)

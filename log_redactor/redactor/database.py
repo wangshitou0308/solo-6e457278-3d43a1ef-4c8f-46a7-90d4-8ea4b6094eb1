@@ -19,6 +19,8 @@ from .models import (
     BundleFileInfo,
     BundleJobModel,
     BundleJobSummary,
+    DecodeIssue,
+    DecodeIssuePage,
     JobDetail,
     JobModel,
     JobSummary,
@@ -71,8 +73,20 @@ CREATE TABLE IF NOT EXISTS risks (
     detector TEXT NOT NULL,
     length INTEGER NOT NULL
 );
+-- 内嵌结构解码未执行（保持原值）的待复核原因，同样不含原值
+CREATE TABLE IF NOT EXISTS decode_issues (
+    job_id TEXT NOT NULL,
+    record_index INTEGER NOT NULL,
+    line_no INTEGER,
+    field_path TEXT NOT NULL,
+    decoder TEXT NOT NULL,
+    reason TEXT NOT NULL,
+    decode_depth INTEGER NOT NULL,
+    detail TEXT NOT NULL DEFAULT ''
+);
 CREATE INDEX IF NOT EXISTS idx_audit_job ON audit(job_id);
 CREATE INDEX IF NOT EXISTS idx_risks_job ON risks(job_id);
+CREATE INDEX IF NOT EXISTS idx_decode_issues_job ON decode_issues(job_id);
 
 -- 大批量 NDJSON 流式作业：逐行处理、安全检查点、可取消、可恢复
 CREATE TABLE IF NOT EXISTS stream_jobs (
@@ -93,6 +107,7 @@ CREATE TABLE IF NOT EXISTS stream_jobs (
     records_processed INTEGER NOT NULL DEFAULT 0,
     audit_count INTEGER NOT NULL DEFAULT 0,
     risk_count INTEGER NOT NULL DEFAULT 0,
+    decode_issue_count INTEGER NOT NULL DEFAULT 0,
     fields_scanned INTEGER NOT NULL DEFAULT 0,
     by_action_json TEXT NOT NULL DEFAULT '{}',
     by_rule_json TEXT NOT NULL DEFAULT '{}',
@@ -130,8 +145,20 @@ CREATE TABLE IF NOT EXISTS stream_risks (
     detector TEXT NOT NULL,
     length INTEGER NOT NULL
 );
+CREATE TABLE IF NOT EXISTS stream_decode_issues (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    job_id TEXT NOT NULL,
+    record_index INTEGER NOT NULL,
+    line_no INTEGER,
+    field_path TEXT NOT NULL,
+    decoder TEXT NOT NULL,
+    reason TEXT NOT NULL,
+    decode_depth INTEGER NOT NULL,
+    detail TEXT NOT NULL DEFAULT ''
+);
 CREATE INDEX IF NOT EXISTS idx_stream_audit_job ON stream_audit(job_id);
 CREATE INDEX IF NOT EXISTS idx_stream_risks_job ON stream_risks(job_id);
+CREATE INDEX IF NOT EXISTS idx_stream_decode_issues_job ON stream_decode_issues(job_id);
 
 -- 诊断包（ZIP）作业：逐文件处理、文件级安全检查点、可取消、可恢复
 CREATE TABLE IF NOT EXISTS bundle_jobs (
@@ -152,6 +179,7 @@ CREATE TABLE IF NOT EXISTS bundle_jobs (
     records_processed INTEGER NOT NULL DEFAULT 0,
     audit_count INTEGER NOT NULL DEFAULT 0,
     risk_count INTEGER NOT NULL DEFAULT 0,
+    decode_issue_count INTEGER NOT NULL DEFAULT 0,
     fields_scanned INTEGER NOT NULL DEFAULT 0,
     by_action_json TEXT NOT NULL DEFAULT '{}',
     by_rule_json TEXT NOT NULL DEFAULT '{}',
@@ -176,6 +204,7 @@ CREATE TABLE IF NOT EXISTS bundle_files (
     lines INTEGER NOT NULL DEFAULT 0,
     audit_entries INTEGER NOT NULL DEFAULT 0,
     risk_findings INTEGER NOT NULL DEFAULT 0,
+    decode_issues INTEGER NOT NULL DEFAULT 0,
     output_path TEXT,
     size_in INTEGER NOT NULL DEFAULT 0,
     size_out INTEGER NOT NULL DEFAULT 0,
@@ -208,8 +237,21 @@ CREATE TABLE IF NOT EXISTS bundle_risks (
     detector TEXT NOT NULL,
     length INTEGER NOT NULL
 );
+CREATE TABLE IF NOT EXISTS bundle_decode_issues (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    job_id TEXT NOT NULL,
+    source_path TEXT NOT NULL,
+    record_index INTEGER NOT NULL,
+    line_no INTEGER,
+    field_path TEXT NOT NULL,
+    decoder TEXT NOT NULL,
+    reason TEXT NOT NULL,
+    decode_depth INTEGER NOT NULL,
+    detail TEXT NOT NULL DEFAULT ''
+);
 CREATE INDEX IF NOT EXISTS idx_bundle_audit_job ON bundle_audit(job_id);
 CREATE INDEX IF NOT EXISTS idx_bundle_risks_job ON bundle_risks(job_id);
+CREATE INDEX IF NOT EXISTS idx_bundle_decode_issues_job ON bundle_decode_issues(job_id);
 
 -- 本地数据保留与安全清理：策略规则、保留锁、清理计划与审计
 CREATE TABLE IF NOT EXISTS retention_rules (
@@ -374,6 +416,20 @@ class Database:
                 conn.execute(
                     "ALTER TABLE jobs ADD COLUMN content_bytes INTEGER NOT NULL DEFAULT 0"
                 )
+            # 内嵌结构解码：流式/诊断包作业的待复核计数（既有库补齐默认值）
+            for table in ("stream_jobs", "bundle_jobs"):
+                tcols = {r["name"] for r in conn.execute(f"PRAGMA table_info({table})")}
+                if "decode_issue_count" not in tcols:
+                    conn.execute(
+                        f"ALTER TABLE {table} ADD COLUMN "
+                        "decode_issue_count INTEGER NOT NULL DEFAULT 0"
+                    )
+            fcols = {r["name"] for r in conn.execute("PRAGMA table_info(bundle_files)")}
+            if "decode_issues" not in fcols:
+                conn.execute(
+                    "ALTER TABLE bundle_files ADD COLUMN "
+                    "decode_issues INTEGER NOT NULL DEFAULT 0"
+                )
             # 保留策略：首次初始化内置默认期限（仅当规则表为空时，不覆盖既有配置）
             from .retention import DEFAULT_RETENTION_RULES
 
@@ -438,6 +494,7 @@ class Database:
         key_fingerprint: str,
         audit: list[AuditEntry],
         risks: list[RiskFinding],
+        decode_issues: list[DecodeIssue] | None = None,
         content_sha256: str = "",
         strategy_sha256: str = "",
         content_bytes: int = 0,
@@ -501,6 +558,17 @@ class Database:
                     for r in risks
                 ],
             )
+            if decode_issues:
+                conn.executemany(
+                    """INSERT INTO decode_issues (job_id, record_index, line_no,
+                       field_path, decoder, reason, decode_depth, detail)
+                       VALUES (?,?,?,?,?,?,?,?)""",
+                    [
+                        (job_id, d.record_index, d.line_no, d.field_path,
+                         d.decoder, d.reason, d.decode_depth, d.detail)
+                        for d in decode_issues
+                    ],
+                )
         return self.get_job(job_id)  # type: ignore[return-value]
 
     # ---------- 读取 ----------
@@ -560,6 +628,24 @@ class Database:
             for r in rows
         ]
 
+    def _load_decode_issues(self, conn: sqlite3.Connection,
+                            job_id: str) -> list[DecodeIssue]:
+        rows = conn.execute(
+            "SELECT * FROM decode_issues WHERE job_id = ? ORDER BY rowid", (job_id,)
+        ).fetchall()
+        return [
+            DecodeIssue(
+                record_index=r["record_index"],
+                line_no=r["line_no"],
+                field_path=r["field_path"],
+                decoder=r["decoder"],
+                reason=r["reason"],
+                decode_depth=r["decode_depth"],
+                detail=r["detail"],
+            )
+            for r in rows
+        ]
+
     @staticmethod
     def _row_to_model(row: sqlite3.Row) -> JobModel:
         return JobModel(
@@ -594,8 +680,10 @@ class Database:
                 return None
             audit = self._load_audit(conn, job_id)
             risks = self._load_risks(conn, job_id)
+            decode_issues = self._load_decode_issues(conn, job_id)
         model = self._row_to_model(row)
-        return JobDetail(**model.model_dump(), audit=audit, risks=risks)
+        return JobDetail(**model.model_dump(), audit=audit, risks=risks,
+                         decode_issues=decode_issues)
 
     def list_jobs(self, limit: int = 50, offset: int = 0,
                   needs_review: bool | None = None) -> tuple[list[JobSummary], int]:
@@ -650,6 +738,10 @@ class Database:
             records_processed=row["records_processed"],
             audit_count=row["audit_count"],
             risk_count=row["risk_count"],
+            decode_issue_count=(
+                row["decode_issue_count"]
+                if row.keys().count("decode_issue_count") else 0
+            ),
             fields_scanned=row["fields_scanned"],
             by_action=json.loads(row["by_action_json"] or "{}"),
             by_rule=json.loads(row["by_rule_json"] or "{}"),
@@ -751,6 +843,8 @@ class Database:
         output_bytes: int,
         audit: list[AuditEntry],
         risks: list[RiskFinding],
+        decode_issues: list[DecodeIssue] | None = None,
+        decode_issue_count: int = 0,
     ) -> None:
         """安全检查点：进度、统计与本批审计/风险在同一事务落库。
 
@@ -761,12 +855,12 @@ class Database:
             conn.execute(
                 """UPDATE stream_jobs SET updated_at=?, status='running',
                    bytes_processed=?, records_processed=?, audit_count=?,
-                   risk_count=?, fields_scanned=?, by_action_json=?,
-                   by_rule_json=?, last_line_no=?, output_bytes=?
+                   risk_count=?, decode_issue_count=?, fields_scanned=?,
+                   by_action_json=?, by_rule_json=?, last_line_no=?, output_bytes=?
                    WHERE id=?""",
                 (
                     utcnow_iso(), bytes_processed, records_processed, audit_count,
-                    risk_count, fields_scanned,
+                    risk_count, decode_issue_count, fields_scanned,
                     json.dumps(by_action, ensure_ascii=False),
                     json.dumps(by_rule, ensure_ascii=False),
                     last_line_no, output_bytes, job_id,
@@ -795,6 +889,17 @@ class Database:
                         (job_id, r.record_index, r.line_no, r.field_path,
                          r.detector, r.length)
                         for r in risks
+                    ],
+                )
+            if decode_issues:
+                conn.executemany(
+                    """INSERT INTO stream_decode_issues (job_id, record_index,
+                       line_no, field_path, decoder, reason, decode_depth, detail)
+                       VALUES (?,?,?,?,?,?,?,?)""",
+                    [
+                        (job_id, d.record_index, d.line_no, d.field_path,
+                         d.decoder, d.reason, d.decode_depth, d.detail)
+                        for d in decode_issues
                     ],
                 )
 
@@ -950,6 +1055,34 @@ class Database:
             items=[self._risk_row(r) for r in rows],
         )
 
+    @staticmethod
+    def _decode_issue_row(r: sqlite3.Row, *, with_source: bool = False) -> DecodeIssue:
+        return DecodeIssue(
+            record_index=r["record_index"], line_no=r["line_no"],
+            field_path=r["field_path"], decoder=r["decoder"],
+            reason=r["reason"], decode_depth=r["decode_depth"],
+            detail=r["detail"],
+            source_path=r["source_path"] if with_source else None,
+        )
+
+    def paginate_stream_decode_issues(
+        self, job_id: str, *, limit: int, offset: int
+    ) -> DecodeIssuePage:
+        with self._conn() as conn:
+            total = conn.execute(
+                "SELECT COUNT(*) AS c FROM stream_decode_issues WHERE job_id=?",
+                (job_id,),
+            ).fetchone()["c"]
+            rows = conn.execute(
+                """SELECT * FROM stream_decode_issues WHERE job_id=?
+                   ORDER BY id ASC LIMIT ? OFFSET ?""",
+                (job_id, limit, offset),
+            ).fetchall()
+        return DecodeIssuePage(
+            job_id=job_id, total=total, limit=limit, offset=offset,
+            items=[self._decode_issue_row(r) for r in rows],
+        )
+
     def resumable_stream_jobs(self) -> list[sqlite3.Row]:
         """服务重启后需要恢复的作业：已排队/运行中（含重启前请求取消的）。"""
         with self._conn() as conn:
@@ -985,6 +1118,10 @@ class Database:
             records_processed=row["records_processed"],
             audit_count=row["audit_count"],
             risk_count=row["risk_count"],
+            decode_issue_count=(
+                row["decode_issue_count"]
+                if row.keys().count("decode_issue_count") else 0
+            ),
             fields_scanned=row["fields_scanned"],
             by_action=json.loads(row["by_action_json"] or "{}"),
             by_rule=json.loads(row["by_rule_json"] or "{}"),
